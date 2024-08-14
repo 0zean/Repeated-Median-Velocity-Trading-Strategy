@@ -83,7 +83,6 @@ def backtest(data, n, vup, vdn):
 if __name__ == "__main__":
     # Load your data here (ensure it has 'datetime' and 'close' columns)
     
-    # For demonstration, let's create some dummy data
     data = pd.DataFrame({
         'datetime': price.index,
         'close': price
