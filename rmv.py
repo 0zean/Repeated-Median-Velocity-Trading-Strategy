@@ -1,42 +1,14 @@
-import os
-from datetime import datetime
-
 import numpy as np
 import pandas as pd
+import vectorbt as vbt
 import yaml
 from scipy.stats import siegelslopes
 
-from avapi import AlphaVantage as av
+with open("alpaca_api.yaml", 'r') as stream:
+    alpaca_api = yaml.safe_load(stream)
 
-api = os.getcwd() + "/api-key.yaml"
-
-with open(api, "r") as file:
-    key = yaml.safe_load(file)
-
-# Retrieve stock data via Alpha Vantage API
-data = av(function='TIME_SERIES_INTRADAY',
-          symbol='SPY',
-          adjusted='true',
-          interval='5min',
-          extended_hours='false',
-          outputsize='full',
-          apikey=key['key'])
-
-
-# Check if stored data is up to date
-current_date = datetime.now()
-
-if os.path.exists("data/data.csv"):
-    stock = pd.read_csv("data/data.csv", index_col=0, parse_dates=True)
-    print(stock.index[-1])
-    
-    if stock.index[-1].strftime("%Y-%m") != current_date.strftime("%Y-%m"):
-        stock = data.get_extended_data(start_date='2024-03', end_date=current_date.strftime("%Y-%m"))
-else:
-    stock = data.get_extended_data(start_date='2024-03', end_date=current_date.strftime("%Y-%m"))
-
-dates = stock.index
-price = stock["4. close"]
+data = vbt.AlpacaData.download('SPY', start='2024-05-06', end='2024-07-27', timeframe='5m', limit=10000)
+price = data.get('Close')
 
 
 def calculate_rmv(prices, n):
@@ -113,7 +85,7 @@ if __name__ == "__main__":
     
     # For demonstration, let's create some dummy data
     data = pd.DataFrame({
-        'datetime': dates,
+        'datetime': price.index,
         'close': price
     })
     
