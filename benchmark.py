@@ -1,7 +1,8 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from rmv import rmv_trading_system, calculate_returns  # Assuming these are in a separate file
+from rmv import rmv_trading_system, calculate_returns
+
 
 def benchmark_strategy(data, wfo_results):
     """
@@ -33,6 +34,7 @@ def benchmark_strategy(data, wfo_results):
     # Concatenate all results
     return pd.concat(combined_results)
 
+
 def calculate_performance_metrics(results):
     """Calculate various performance metrics for the strategy."""
     total_return = results['strategy_returns'].sum()
@@ -44,6 +46,7 @@ def calculate_performance_metrics(results):
         'Sharpe Ratio': sharpe_ratio,
         'Max Drawdown': max_drawdown
     }
+
 
 # Example usage
 if __name__ == "__main__":
@@ -86,3 +89,4 @@ if __name__ == "__main__":
     plt.xlabel('Date')
     plt.ylabel('Cumulative Return')
     plt.show()
+
