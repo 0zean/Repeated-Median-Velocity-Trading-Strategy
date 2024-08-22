@@ -8,7 +8,6 @@ The **Repeated-Median-Velocity-Trading-Strategy** is a quantitative trading stra
 - [Setup](#setup)
 - [Usage](#usage)
 - [Configuration](#configuration)
-- [License](#license)
 
 ## Introduction
 
