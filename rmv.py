@@ -7,7 +7,7 @@ from scipy.stats import siegelslopes
 with open("alpaca_api.yaml", 'r') as stream:
     alpaca_api = yaml.safe_load(stream)
 
-data = vbt.AlpacaData.download('SPY', start='2024-05-06', end='2024-07-27', timeframe='5m', limit=10000)
+data = vbt.AlpacaData.download('SPY', start='2025-09-01', end='2026-02-13', timeframe='5m', limit=10000, api_key=alpaca_api['key'], secret_key=alpaca_api['secret_key'])
 price = data.get('Close')
 
 
@@ -80,16 +80,16 @@ def backtest(data, n, vup, vdn):
 
 
 # Example usage
-if __name__ == "__main__":
-    # Load your data here (ensure it has 'datetime' and 'close' columns)
-    
+if __name__ == "__main__": 
+    timestamp = price.index.to_series().apply(lambda x: x[1])  # type: ignore
+ 
     data = pd.DataFrame({
-        'datetime': price.index,
+        'datetime': timestamp,
         'close': price
     })
     
     # Set parameters
-    n, vup, vdn = 20, 0.02, 0.12
+    n, vup, vdn = 22, 0.01, 0.19
     
     # Run backtest
     results, total_return, sharpe_ratio = backtest(data, n, vup, vdn)
