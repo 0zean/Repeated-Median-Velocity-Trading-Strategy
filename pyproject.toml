@@ -1,15 +1,19 @@
 [project]
 name = "rmv"
 version = "0.1.0"
-description = "Add your description here"
+description = "Repeated Median Velocity intraday strategy for SPY 5-minute bars"
 readme = "README.md"
 requires-python = "==3.10.18"
 dependencies = [
-    "alpaca-py>=0.43.2",
+    "alpaca-py>=0.43.4",
+    "numba>=0.65.1",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
-    "plotly>=6.5.2",
-    "pyyaml>=6.0.3",
     "scipy>=1.15.3",
-    "vectorbt>=0.28.4",
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10",
+    "ruff>=0.15.18",
 ]
