@@ -211,19 +211,76 @@ there straddles the session boundary for every **N ≥ 8** — **17 of the 22 N-
 RTH-spliced series would produce a near-daily gap-continuation entry at 10:00 and the backtest
 would be measuring an overnight-gap strategy.
 
-For `N=24` at a 10:00 first trade, bars are needed back to **08:05 ET**.
+#### The session window — measured in Unit 1, not assumed
+
+Rev 1 proposed the whole 04:00–20:00 extended-hours range. **Measurement narrowed it to
+08:00–15:55.** Bucket completeness over 2024 SIP (fraction of the 252 sessions having a bar
+in each 5-minute bucket):
+
+| ET range | min | median |
+|---|---|---|
+| 04:00–06:00 | 0.849 | 0.901 |
+| 06:00–08:00 | 0.885 | 0.978 |
+| **08:00–09:30** | **1.000** | **1.000** |
+| **09:30–16:00** | **0.996** | **1.000** |
+| 16:00–18:00 | 0.921 | 0.986 |
+| 18:00–20:00 | 0.889 | 0.942 |
+
+A missing bucket is not a cosmetic hole: RMedV's slope is measured against an implied
+x-spacing of one bar, so a gap silently rescales it. **The series must stop where it stops
+being contiguous**, and that is 08:00.
+
+**The window is near-contiguous, not perfectly contiguous.** Per-year minimum completeness
+inside 08:00–16:00: 0.996 (2016), 0.996, 0.992, 0.992, **0.988 (2020)**, 0.996, 0.996, 0.992,
+0.996, 1.000 (2025), 1.000 (2026). Pre-market coverage improved markedly over the decade
+(04:00–06:00 median 0.590 in 2017 → 1.000 in 2026), so 2024 is representative of neither end;
+08:00 is chosen to be safe in the *worst* years, and a 07:00 start would take 2017's minimum
+to 0.936.
+
+Over the full sample, 2016-01-04 to 2026-08-31: **257,217 bars / 2,680 sessions = 95.98 per
+session.** Not every session is complete:
+
+| bars in session | 96 | 95 | 94 | 93 | 91 | 90 | 84 |
+|---|---|---|---|---|---|---|---|
+| sessions | 2,652 | 14 | 7 | 4 | 1 | 1 | 1 |
+
+**28 sessions carry holes** (none has *more* than 96 bars — no duplicates, no DST artifacts),
+including all four 2020 circuit-breaker days. The `max_n` post-gap blackout covers them: a
+holed session's gated-bar count drops from 71 to as low as 45. **Downstream must not assume a
+constant session length.**
+
+**Why 08:00 specifically — and note this is *not* the reason Rev 1 gave.** Rev 1 claimed
+extended hours shrinks the overnight jump. Measured, it barely does:
+
+Full sample, 2016-01-04 to 2026-08-31 (~2,720 session boundaries):
+
+| series | median jump | p95 | median bar move | ratio |
+|---|---|---|---|---|
+| RTH-only, 16:00 → 09:30 | $1.060 | $5.536 | $0.130 | 8.15× |
+| this window, 16:00 → 08:00 | $0.980 | $4.840 | $0.125 | 7.86× |
+
+The gap is essentially as large either way. The actual benefit is **distance**: 08:00 is
+`MAX_N = 24` bars before the 10:00 gate, so the first tradeable bar's lookback (08:05 → 10:00,
+24 bars) lies wholly inside its own session and no gated bar's window ever contains the gap.
+There is exactly **one bar of margin** — 08:00 itself is never in that window — which is why
+the post-gap blackout runs to `i + max_n` inclusive rather than `i + max_n`: SPEC §2's
+crossing rule reads `RMedV[t-1]`, so the previous bar's window must be gap-free too. The two
+gate rules — the 10:00 trading window and the blackout — therefore land on the same bar, and
+a test asserts they continue to agree.
 
 ### 3.2 Other transfers
 
 | Item | Decision | Reason |
 |---|---|---|
 | **Bar timestamp** | a bar is labelled by its **open** (Alpaca convention). All gate comparisons use the open timestamp. | Undefined, this is worth one bar. Under open-labelling the last gated bar opens 15:50 and closes 15:55; 10:00 is the 7th RTH bar. |
-| Trading gate | `gate[t] = 1` iff `10:00 <= t_open < 15:55` ET | §2 |
-| **Data feed** | backtest on **historical SIP** (free tier, the 15-min delay is irrelevant offline). Live feed **TBD — Unit 1 gate**. | IEX is ~2–3% of SPY volume with cent-level error on every print. The repeated median resists outliers, not noise on every point. [PLAN §8-D] |
-| **Sample range** | SPY 5-min, **TBD — Unit 1** (Alpaca equity data starts 2016; ~9 years available) | [PLAN §8-A] |
+| Session | **08:00–15:55 ET, 96 bars/session** | The measured contiguous range (§3.1). RMedV is computed on all 96 bars; only trading is gated. |
+| Trading gate | `gate[t] = 1` iff `10:00 <= t_open < 15:55` ET | §2. Coincides with the `max_n` post-gap blackout by construction. |
+| **Data feed** | **SIP for both backtest and live. IEX is not usable — measured, Unit 1.** Live therefore requires a paid SIP subscription before go-live. | Measured over June 2024 **inside the 08:00–15:55 window** (comparing over 04:00–20:00 would overstate the gap). Two independent failures. **(1) No warmup:** IEX supplies **117 bars in 08:00–10:00 against SIP's 456** — ~6 of the 24 buckets per session — so it cannot feed the pre-gate lookback §3.1 exists for; overall session coverage is 81.4%. **(2) Noise on every print:** where both feeds print, IEX closes differ from SIP by a **median 2.50¢ = 15% of a median 17¢ bar move**, with **76.3% of bars off by ≥1¢**. A repeated median resists outliers, not error on every point. (Inside RTH alone IEX coverage is ~99.9%, so the coverage failure is specifically pre-market — but the 2.50¢ noise persists everywhere.) [PLAN §8-D, resolved] |
+| **Sample range** | SPY 5-min SIP, **2016-01-04 → 2026-08-31**: 257,217 bars over 2,680 sessions, 10.7 years | Alpaca equity history starts 2016. [PLAN §8-A, resolved] |
 | Price adjustment | **`adjustment="split"`** | Dividend adjustment retroactively rescales all prior bars, so the cache can never be immutable, `xmult` drifts ~10% over 9 years, and live (raw prices) stops matching backtest. SPY has not split since 2005 and Alpaca data starts 2016, so `"split"` is a no-op. The ex-div gap is ~0.28% — smaller than the ordinary overnight gap already in the series. |
 | Costs | $0.01/share round-trip slippage **+ SEC/TAF ≈ $0.017/share on sells** | SPY spread is a penny. TAF/SEC exceeds the slippage term at SPY $600 and scales with notional, so it is not constant across a sample where SPY went $180→$650. |
 | Share size | **100 shares**; all backtest figures reported **per share** | Sizing is then a pure multiplier and the per-share edge vs fixed costs is directly readable. |
+| **Early closes** | the EOD exit is **`session_close − 5 min`**, from the exchange calendar — 15:55 normally, **12:55 on a 13:00 close** | NYSE closes at 13:00 on ~2 sessions a year (**21 in this sample**) and SPY keeps printing afterwards, so a fixed 15:55 leaves the gate open across ~3 hours of thin post-close prints. Measured before the fix: **589 gated bars after 13:00**, on volume ~3% of the morning's. Also a hard live-parity failure — Alpaca rejects market orders outside RTH. Calendar cached at `cache/nyse_calendar.json`. |
 | Intraday halts | any inter-bar gap > 5 min zeroes the gate for the next `max(N)` bars | Circuit breakers (2020-03-09/12/16/18) splice an intraday price gap into the window — the same failure as §3.1. |
 | Direction | long/short | [M25]. Requires a margin account; SPY is trivially shortable. |
 | Minimum live capital | **$25,000** | PDT: ~8 round trips/week trips the rule in week one, and the consequence is closing-only for 90 days. |
@@ -535,11 +592,16 @@ Three rules. Two were latent bugs caught in review before implementation.
 Alpaca keys come from the environment: `API_KEY`, `SECRET_KEY` (plus `APCA_API_BASE_URL` for
 paper vs live). Never a file in the repo, never a literal in source.
 
-**There is no `.env` loader and none is planned.** `python-dotenv` is not a dependency and the
-Unit 0 guard test pins `[project].dependencies` to exactly five packages. Variables are
-exported by the shell (dev) or set on the Task Scheduler job (Unit 12b). `.env.example` is
-**documentation of the variable names only** — nothing reads it, and nothing reads `.env`
-either; `.env` is gitignored so that a developer who keeps one locally cannot commit it.
+`data.load_dotenv()` reads `.env` if present, and `_credentials()` calls it. It is **six lines
+of stdlib, not `python-dotenv`** — no new dependency, and the Unit 0 guard still pins
+`[project].dependencies` to exactly five packages. Real environment variables take precedence
+over the file, and **only `API_KEY`, `SECRET_KEY` and `APCA_API_BASE_URL` are honoured**, so a
+stray line in `.env` cannot alter the process environment.
+
+`.env` is gitignored, and the Unit 0 secret scan deliberately skips gitignored files — `.env`
+is where credentials are *supposed* to live locally, and the scan's job is to catch key
+material in files that could actually be committed. In production, variables are exported by
+the shell or set on the Task Scheduler job (Unit 12b); `.env` is a development convenience.
 
 Note that `alpaca-py` will auto-read `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` if a client is
 constructed with no arguments. We use the shorter `API_KEY` / `SECRET_KEY` names and pass them

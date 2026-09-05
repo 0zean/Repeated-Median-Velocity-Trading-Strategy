@@ -97,7 +97,7 @@ both fidelity and correctness:
 
 | Item | Decision | Why |
 |---|---|---|
-| Bar series ⚑ | **full extended-hours contiguous series**, no RTH filter | Matches the paper; avoids gap contamination. Also *less* code. For N=24 at a 10:00 first trade you need bars back to 08:05; SPY prints in essentially every 5-min bucket from 08:00. |
+| Bar series ⚑ | **08:00–15:55 ET, 96 bars/session** — measured in Unit 1, narrowed from Rev 2's 04:00–20:00 | Bucket completeness is 100% only from 08:00 to 16:00; outside it 85–98%, and a missing bucket rescales RMedV's slope. 08:00 is also exactly `MAX_N` bars before the 10:00 gate. Full sample: 96.0 bars/session over 2,680 sessions. See SPEC §3.1. |
 | Bar timestamp ⚑ | a bar is labelled by its **open** (Alpaca convention) | Undefined, this is worth one bar: 10:00 is the 7th RTH bar and the last gated bar opens 15:50 |
 | Trading gate | `gate[t] = 1` iff `10:00 <= t_open < 15:55` ET | Trading window only; RMedV is computed everywhere |
 | Price ⚑ | `adjustment="split"`, **not** `"all"` | See below |
@@ -308,11 +308,14 @@ exactly; `uv sync` clean; `uv.lock` relocked with no vectorbt entry; no credenti
 **Do**
 
 - `load_bars(symbol, start, end, feed) -> (ts int64[T], close float32[T], gate int8[T])`
-- Alpaca `StockBarsRequest`, `TimeFrame(5, Minute)`, `adjustment="split"`, **extended hours
-  included** (no RTH filter — §1.3).
-- Cache to `cache/{symbol}_5min_{feed}.npy` + `.json`; append-only refresh.
-- `gate[t] = 1` iff `10:00 <= time(t) < 15:55` ET, zeroed for `max(N)` bars after any
-  inter-bar gap > 5 min.
+- Alpaca `StockBarsRequest`, `TimeFrame(5, Minute)`, `adjustment="split"`, extended hours
+  included at fetch; the series is then cut to the **measured-contiguous 08:00–15:55 window**
+  (§1.3). Not an RTH filter — a contiguity boundary, chosen from data.
+- Cache to `cache/{symbol}_5min_{feed}.npz` + `.json`; append-only, union-merging, written
+  atomically, and validated before write. Exchange calendar cached beside it.
+- `gate[t] = 1` iff `10:00 <= t_open < session_close − 5 min` ET — 15:55 normally, **12:55 on
+  the 21 early closes in the sample**, from the exchange calendar — zeroed for `max(N)` bars
+  after any inter-bar gap > 5 min.
 - ⚑ **Feed gate, not a measurement.** Compare IEX vs SIP **close prices** on one month.
   Historical SIP is free (the 15-min delay is irrelevant to a backtest), so backtest on SIP
   regardless; the only live question is whether IEX bars are tradeable. IEX is ~2–3% of SPY
@@ -695,9 +698,9 @@ Adding any of these requires a reason written down first.
 
 | # | Question | Recommendation |
 |---|---|---|
-| A | History depth: 5 or 9 years? | 9 years (Alpaca SIP starts 2016). Meyers notes 10 yr is his own bias and shorter may do better. ⚑ Cheap to run, **not** cheap to look at — each look increments the comparison counter. |
+| A | History depth | ✅ **Resolved (Unit 1): 2016-01-04 → 2026-08-31 — 257,217 bars / 2,680 sessions / 10.7 yr.** Meyers notes 10 yr is his own bias and shorter may do better; each re-look increments the comparison counter, so testing a shorter span is a deliberate spend. |
 | B | `mLTr` sign convention (§1.5) | Evidence points to negative storage → "smallest" = deepest. Run both in Unit 8. |
 | C | ⚑ `r2` vs `r` in the CL4 screen (§1.5) | Unresolvable from the papers. Run both; decisive for CL4. |
-| D | **Data feed** | Backtest on historical SIP (free). Live is the open question: if Unit 1 shows IEX 5-min closes diverge materially, live requires paid SIP. **Gate, not a measurement.** |
+| D | **Data feed** | ✅ **Resolved (Unit 1): SIP only; IEX is unusable.** 57% of 5-min buckets missing, and where present a median 2.50¢ error = 13.9% of an 18¢ bar move, 76.5% of bars off by ≥1¢. **Live needs a paid SIP subscription — budget for it before go-live.** |
 | E | Long-only or long/short? | Long/short per the paper. Needs a margin account; SPY is trivially shortable. |
 | F | ⚑ The 2025 erratum (§1.2) — include overnight trades? | Not in v1. Under §1.3 the RMedV series already spans the full session, so this is a gate change later, not a rewrite. |
