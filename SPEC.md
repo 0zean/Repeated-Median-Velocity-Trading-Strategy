@@ -268,6 +268,15 @@ crossing rule reads `RMedV[t-1]`, so the previous bar's window must be gap-free 
 gate rules — the 10:00 trading window and the blackout — therefore land on the same bar, and
 a test asserts they continue to agree.
 
+> ⚠ **The blackout margin is exactly zero.** Measured over the full sample: the distance from
+> each gap to the first gated bar after it is **25 bars = `MAX_N` + 1, the precise minimum**,
+> at all 2,681 session boundaries; and the first gated index of a full-sample load is 24, also
+> the exact minimum for n=24's `RMedV[t-1]` read. It holds — no gated bar's `t` or `t-1`
+> window contains a gap, for any n in 3..24, across all 189,373 gated bars — but with no
+> slack. Raising `MAX_N`, moving the session start later, narrowing the blackout, or adding an
+> `RMedV[t-2]` term each break it silently. `test_unit2_gate_never_exposes_an_invalid_rmv`
+> checks the invariant directly against real data; keep it.
+
 ### 3.2 Other transfers
 
 | Item | Decision | Reason |
@@ -584,6 +593,23 @@ Three rules. Two were latent bugs caught in review before implementation.
    Equity regressions therefore run on **zero-based, mean-centered** trade equity with float64
    accumulators; only the stored result is float32. [M25 Table 1]'s `EQ`/`NetEq` reach
    $233,000 — exactly the exploding regime.
+
+   **Corollary for tolerances (Unit 2).** RMedV is stored float32 and |RMedV| ≈ 0.05, where
+   float32 eps is **3.7e-9**. Any acceptance threshold tighter than that is unachievable by
+   construction, so the kernel is checked for **bit-exactness** against
+   `float32(scipy_float64)` rather than against a tolerance — a stronger test that cannot be
+   quietly satisfied by loosening an epsilon.
+
+   **What is *not* load-bearing:** promoting the price window to float64 before differencing
+   changes nothing for price data. Sterbenz's lemma makes float32 subtraction exact whenever
+   the two values lie within a factor of 2. Over the full sample a 24-bar SPY window spans a
+   price ratio of 1.0039 median and **1.1336 worst case** (2020-03-16) — far inside the bound,
+   so the float32 and float64 variants are bit-identical on all 5.7M real outputs. The float64
+   buffer is kept so the guarantee holds for any input range, but no test can distinguish it
+   and none claims to.
+
+   The float64 **median accumulators** (`pairs`/`inner`) *are* load-bearing: a float32 variant
+   changes 19.9% of real outputs by up to 1 ulp, and the scipy-oracle test catches it.
 
 ---
 

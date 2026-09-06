@@ -269,7 +269,8 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 
 | Stage | Budget | Measured |
 |---|---|---|
-| RMV, 22 N × 196k bars | < 5 s, < 50 MB | **1.95 s, 34 MB** |
+| RMV, 22 N × 196k bars | < 5 s, < 50 MB | **1.95 s, 34 MB** (prototype) |
+| ⚑ RMV, 22 N × 257k bars, shipped kernel, no fastmath | < 5 s, < 50 MB | **1.91 s, 23 MB** |
 | Same via `scipy.siegelslopes` (oracle only) | — | ~27–47 s |
 | Grid, one IS window (4312 × 1638) | < 60 ms | **43 ms** |
 | Full PWFO, 546 windows, IS+OOS | < 60 s, peak RSS < 1 GB | **~32 s, 226 MB** |
@@ -345,8 +346,11 @@ extended-hours bars are actually present back to 08:00 for the whole sample.
 
 **Done when**
 
-- Matches `scipy.stats.siegelslopes(..., method="hierarchical")` to 1e-9 for N in {3,5,10,24}
-  at several offsets on random-walk data. *(Prototype already passes.)*
+- ⚑ **Bit-exact** against `scipy.stats.siegelslopes(..., method="hierarchical")`: the
+  kernel's float32 output equals `float32(scipy_float64)` exactly, for N in {3,4,5,10,23,24}
+  at several offsets. Rev 2's "to 1e-9" was **unachievable by construction** — output is
+  float32 and |rmv| ≈ 0.05, where float32 eps is 3.7e-9. Bit-exactness is strictly stronger
+  than any tolerance and is what actually holds (24/24).
 - Reproduces both papers' worked toy examples (each has a known answer of exactly 1.0).
 - Every consumer starts at index `N-1`; a test asserts warmup values are never read.
 - Budget: **< 5 s** for 22 N × 196k bars.
@@ -363,6 +367,19 @@ scipy, float32 vs float64 accumulation.
 - On a **fixed early calibration slice** (first ~2 years), compute `sd(RMedV_N)` for
   ⚑ **N = 3..20** (matching the Appendix method).
 - Verify `1/sqrt(N)` proportionality; compute `xmult = mean(1 / sd(RMedV_N * sqrt(N)))`.
+- ⚑ Advance measurement from Unit 2, on the full sample. **Calibrate on gated bars only** —
+  the basis matters more than expected:
+
+  | basis | sd(N=3) | sd(N=24) | ratio |
+  |---|---|---|---|
+  | all bars (warmup + gap-contaminated) | 0.3115 | 0.0891 | **3.49** |
+  | gated bars only | 0.2537 | 0.0834 | **3.04** |
+  | `1/sqrt(N)` law predicts | — | — | 2.83 |
+
+  Both are steeper than the law, the same way Meyers' were (his N=4:N=20 was 2.51 vs 2.24),
+  but the all-bars figure is inflated by the 25% of bars that are post-gap contaminated.
+  Gap contamination moves `sd` by 6.8% at N=24 and 22.8% at N=3; warmup zeros (0.004%) and
+  float32 storage (~1e-8) are both negligible.
 - Freeze into `norm.json` keyed by `{symbol, timeframe, session, calibration range}`.
 - ⚑ **Saturation diagnostic, per year**: fraction of the 4312 combos producing (a) zero trades,
   (b) saturated signal (`|RMedV_norm|` routinely > 3.5).
@@ -671,8 +688,10 @@ Adding any of these requires a reason written down first.
    can never trigger on SPY 5-min slopes.
 7. ⚑ `xmult = 4.00512` is unsourced — but it **is** used, at `rmv.py:44` whenever
    `normalize=True`. (Rev 1 said "unused".)
-8. `benchmark.py:24` re-derives the OOS window as `oos_end - 7 days` instead of using the
-   recorded dates.
+8. ~~`benchmark.py` re-derived the OOS window as `oos_end - 7 days`~~ — **file deleted in
+   Unit 2**: it imported `calculate_returns`/`rmv_trading_system` from the old `rmv.py`, so
+   the rewrite made it an unconditional `ImportError`. Nothing in it is needed; its Sharpe
+   and max-drawdown are superseded by SPEC §6, and Unit 9 owns the reporting.
 9. `get_data` hardcodes dates and sets no adjustment policy.
 10. `alpaca_api.yaml` — plaintext credentials in the working tree.
 

@@ -162,6 +162,12 @@ def build_gate(
     for i in np.flatnonzero(np.diff(ts) > BAR_NS):
         gate[i + 1 : i + 1 + max_n] = 0
 
+    # The start of the array is a gap too -- there is simply no earlier bar to diff
+    # against. Without this, a slice beginning mid-session gates bars whose RMedV is still
+    # warmup: measured 275 such bars across the n grid on an 11:00 ET start. Harmless on a
+    # normal 08:00 load, where these bars are outside the trading window anyway.
+    gate[:max_n] = 0
+
     return gate
 
 

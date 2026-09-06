@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 import data
+import rmv
 
 ROOT = Path(__file__).parent
 
@@ -589,6 +590,377 @@ def test_unit1_dotenv_precedence_and_scope() -> None:
             else:
                 os.environ[k] = v
         shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+
+# ========================================================= Unit 2: the RMedV kernel
+
+
+def _lower_median_reference(y: np.ndarray) -> float:
+    """What the repeated median would give if even-length medians picked the lower middle
+    value instead of averaging the two. Only used to prove the kernel does not do that."""
+    def lower_median(values):
+        s = sorted(values)
+        return s[len(s) // 2 - 1] if len(s) % 2 == 0 else s[len(s) // 2]
+
+    n = y.size
+    inner = [lower_median([(y[j] - y[i]) / (j - i) for j in range(n) if j != i])
+             for i in range(n)]
+    return lower_median(inner)
+
+def test_unit2_matches_paper_worked_examples() -> None:
+    """Both papers publish a worked example whose repeated median slope is exactly 1.0,
+    with outliers planted to show the estimator ignoring them (SPEC §1.1)."""
+    for label, y in (
+        ("M05 p.2", [1, 2, 3, 4, 5, 15, 12, 8, 9, 10]),
+        ("M25 p.2", [1, 2, 10, 4, 5, 6, 7, 8, 9, 18, 11, 12, 13, 18, 15, 20]),
+    ):
+        series = np.asarray(y, dtype=np.float32)
+        got = float(rmv.rmv_all_n(series, np.array([len(y)]))[0, -1])
+        assert got == 1.0, f"{label} gave {got}, paper says exactly 1.0"
+
+    # A clean ramp of slope 3 must come back as 3 for every n -- catches a scale error
+    # that both 1.0 examples would miss, since 1.0 is a fixed point of many mistakes.
+    ramp = (np.arange(40) * 3.0 + 17.0).astype(np.float32)
+    out = rmv.rmv_all_n(ramp, rmv.N_VALUES)
+    for a, n in enumerate(rmv.N_VALUES):
+        assert np.allclose(out[a, n - 1 :], 3.0, atol=1e-5), f"n={n} lost the slope"
+
+    # And a falling ramp must be negative -- catches an inverted (j-i) sign, which 1.0
+    # and a positive ramp both survive.
+    down = (100.0 - np.arange(40) * 3.0).astype(np.float32)
+    out = rmv.rmv_all_n(down, rmv.N_VALUES)
+    for a, n in enumerate(rmv.N_VALUES):
+        assert np.allclose(out[a, n - 1 :], -3.0, atol=1e-5), f"n={n} has the sign inverted"
+
+
+def test_unit2_matches_scipy_oracle() -> None:
+    """SPEC §1.1: scipy.stats.siegelslopes(method='hierarchical') is the reference.
+
+    Random-walk data at SPY's actual price and volatility, so float32 storage is exercised
+    where it is weakest -- differencing ~$600 values to resolve ~$0.17 moves.
+    """
+    from scipy.stats import siegelslopes
+
+    rng = np.random.default_rng(7)
+    close = (600 + np.cumsum(rng.normal(0, 0.17, 3000))).astype(np.float32)
+    out = rmv.rmv_all_n(close, rmv.N_VALUES)
+
+    # Bit-exactness, not a tolerance. Output is float32 and |rmv| ~ 0.05, where float32
+    # eps is 3.7e-9 -- so PLAN's original "matches to 1e-9" was below the storage
+    # resolution and unachievable by construction. Requiring the kernel's float32 output
+    # to equal float32(scipy's float64 answer) exactly is strictly stronger than any
+    # tolerance, and it is what actually holds.
+    checked = 0
+    for n in (3, 4, 5, 10, 23, 24):  # 3 and 4 are where the estimator is most fragile
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        for t in (n - 1, 137, 1500, 2999):  # includes the very first computable bar
+            window = close[t - n + 1 : t + 1].astype(np.float64)
+            ref = siegelslopes(window, np.arange(n, dtype=float))[0]
+            assert out[a, t] == np.float32(ref), (
+                f"n={n} t={t}: kernel {out[a, t]!r} != float32(scipy) {np.float32(ref)!r}"
+            )
+            assert abs(float(out[a, t]) - ref) <= 8e-9, "beyond float32 resolution"
+            checked += 1
+    assert checked == 24, f"only {checked} oracle comparisons ran"
+
+
+def test_unit2_median_tie_breaking_matches_numpy() -> None:
+    """Even-length medians must average the two middle values, as numpy and scipy do.
+
+    n is even for half the grid, and the inner medians run over n-1 points, so both
+    parities occur at every n. A 'lower median' shortcut passes odd n and fails here.
+    """
+    from scipy.stats import siegelslopes
+
+    # y chosen so the two middle values differ: averaging gives 2.25, picking the lower
+    # middle gives 2.00. Most 4-point series give the same answer either way, so this
+    # exact series is doing the work -- the guard below fails if it stops discriminating.
+    y = np.array([0.0, 1.0, 5.0, 6.0], dtype=np.float32)  # n=4 -> even outer median
+    got = float(rmv.rmv_all_n(y, np.array([4]))[0, -1])
+    ref = float(siegelslopes(y.astype(np.float64), np.arange(4, dtype=float))[0])
+
+    lower_middle = _lower_median_reference(y.astype(np.float64))
+    assert abs(ref - lower_middle) > 1e-9, "test series no longer distinguishes the two rules"
+    assert got == np.float32(ref), f"n=4 gave {got}, numpy/scipy averaging gives {ref}"
+    assert abs(got - lower_middle) > 1e-9, "kernel is picking a middle value, not averaging"
+
+
+def test_unit2_warmup_is_zero_never_nan() -> None:
+    """SPEC §7 rules 1-2: warmup is exactly the first n-1 entries and is 0.0, not NaN.
+
+    NaN would be the obvious sentinel and is banned, because `fastmath` compiles np.isnan
+    away and every guard written against it becomes dead code.
+    """
+    close = (600 + np.cumsum(np.random.default_rng(1).normal(0, 0.17, 400))).astype(np.float32)
+    out = rmv.rmv_all_n(close, rmv.N_VALUES)
+
+    assert not np.isnan(out).any(), "NaN in the output -- SPEC §7 forbids NaN sentinels"
+    for a, n in enumerate(rmv.N_VALUES):
+        assert np.all(out[a, : n - 1] == 0.0), f"n={n}: warmup is not all zero"
+        # Not "!= 0.0": a genuinely flat window computes exactly 0.0, which is the
+        # accepted cost of SPEC §7 rule 2. Assert the row is populated instead.
+        assert np.any(out[a, n - 1 :] != 0.0), f"n={n}: nothing computed past warmup"
+
+
+def test_unit2_reproducible_and_rows_independent() -> None:
+    """Checks the two properties that MAKE thread-count independence true, since a single
+    process cannot change NUMBA_NUM_THREADS after import: recomputation is bit-exact, and
+    each output row depends only on its own n. Cross-thread equality itself is verified
+    out of process by test_unit2_thread_count_invariance."""
+    close = (600 + np.cumsum(np.random.default_rng(5).normal(0, 0.17, 800))).astype(np.float32)
+    first = rmv.rmv_all_n(close, rmv.N_VALUES)
+    second = rmv.rmv_all_n(close, rmv.N_VALUES)
+    assert np.array_equal(first, second), "kernel is not reproducible run to run"
+
+    # A row computed alone must equal the same row computed alongside the others.
+    for n in (3, 11, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        alone = rmv.rmv_all_n(close, np.array([n]))[0]
+        assert np.array_equal(alone, first[a]), f"n={n} depends on which other n ran"
+
+
+def test_unit2_contract_and_buffer_reuse() -> None:
+    """The output contract Units 3-7 depend on, and the preallocated-buffer path."""
+    close = (600 + np.cumsum(np.random.default_rng(2).normal(0, 0.17, 300))).astype(np.float32)
+
+    out = rmv.rmv_all_n(close, rmv.N_VALUES)
+    assert out.dtype == np.float32 and out.shape == (rmv.N_VALUES.size, close.size)
+    assert out.flags["C_CONTIGUOUS"], "rows must be contiguous -- Unit 6 keeps one in L1"
+
+    buf = np.empty_like(out)
+    same = rmv.rmv_all_n(close, rmv.N_VALUES, out=buf)
+    assert same is buf, "out= did not write into the caller's buffer"
+    assert np.array_equal(buf, out)
+
+    for bad, why in (
+        (np.empty((2, close.size), np.float32), "wrong shape"),
+        (np.empty(out.shape, np.float64), "wrong dtype"),
+    ):
+        try:
+            rmv.rmv_all_n(close, rmv.N_VALUES, out=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted an out buffer with the {why}")
+
+    # A repeated median is undefined below 3 points.
+    for bad_ns in (np.array([2]), np.array([3, 1])):
+        try:
+            rmv.rmv_all_n(close, bad_ns)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted n={bad_ns}")
+
+    # float64 input must be accepted and give the same answer as float32 input.
+    assert np.array_equal(rmv.rmv_all_n(close.astype(np.float64), rmv.N_VALUES), out)
+
+
+def test_unit2_live_path_reuses_the_same_kernel() -> None:
+    """Unit 12a needs backtest and live to share one code path. Live holds a ring buffer
+    of the last n bars and reads [:, -1]; that must equal the full-series value at the
+    same bar, or parity fails for a reason no amount of live testing would explain."""
+    close = (600 + np.cumsum(np.random.default_rng(9).normal(0, 0.17, 500))).astype(np.float32)
+    full = rmv.rmv_all_n(close, rmv.N_VALUES)
+
+    for n in (3, 12, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        for t in (n - 1, 250, 499):
+            ring = close[t - n + 1 : t + 1]
+            live = rmv.rmv_all_n(ring, np.array([n]))[0, -1]
+            assert live == full[a, t], f"n={n} t={t}: live {live} != backtest {full[a, t]}"
+
+
+def test_unit2_budget_on_real_data() -> None:
+    """SPEC §2.4 budget: < 5s for the full grid over the whole sample. Skips without cache."""
+    npz, _ = data._cache_paths("SPY", "sip")
+    if not npz.exists():
+        print("       (skipped: no cache)")
+        return
+
+    import time
+    from datetime import datetime, timezone
+
+    bars = data.load_bars(
+        "SPY", datetime(2016, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc), refresh=False,
+    )
+    out = np.empty((rmv.N_VALUES.size, len(bars)), np.float32)
+    rmv.rmv_all_n(bars.close[:200], rmv.N_VALUES)  # warm the JIT
+
+    start = time.perf_counter()
+    rmv.rmv_all_n(bars.close, rmv.N_VALUES, out=out)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 5.0, f"{elapsed:.2f}s for {rmv.N_VALUES.size}x{len(bars):,}, budget 5s"
+    assert not np.isnan(out).any()
+    # The old `nbytes < 50e6` was true by arithmetic and measured nothing. tracemalloc is
+    # no better -- numba allocates through its own C runtime, which Python never sees.
+    # The honest cheap check is that out= is written in place, so the 22.6 MB buffer is
+    # the whole footprint; the timing assertion above is the real budget.
+    assert rmv.rmv_all_n(bars.close, rmv.N_VALUES, out=out) is out
+
+
+
+def test_unit2_rejects_bad_input() -> None:
+    """The kernel is on the live order path, so a wrong-shaped call must raise, not return
+    a plausible number. Each of these silently produced garbage before Unit 2's review."""
+    close = (600 + np.cumsum(np.random.default_rng(4).normal(0, 0.17, 200))).astype(np.float32)
+
+    def rejects(why, **kw):
+        try:
+            rmv.rmv_all_n(**kw)
+        except ValueError:
+            return
+        raise AssertionError(f"accepted {why}")
+
+    # A NaN comes back as a finite, plausible slope 61% of the time: numba's np.median is
+    # partition-based and does not propagate NaN the way numpy's does.
+    nan_close = close.copy()
+    nan_close[50] = np.nan
+    rejects("NaN in close", close=nan_close, ns=np.array([10]))
+    inf_close = close.copy()
+    inf_close[50] = np.inf
+    rejects("inf in close", close=inf_close, ns=np.array([10]))
+
+    # Too few bars silently zeroed that whole row -- the likeliest live failure, a short
+    # ring buffer after a restart or a data hole.
+    rejects("close shorter than max(n)", close=close[:10], ns=rmv.N_VALUES)
+    rejects("2-D close", close=close.reshape(2, 100), ns=np.array([10]))
+    rejects("empty ns", close=close, ns=np.array([], dtype=np.int64))
+    rejects("2-D ns", close=close, ns=np.array([[3, 4]]))
+
+    # out= aliasing its own input would have the kernel overwrite the prices it is reading.
+    buf = np.empty((1, close.size), np.float32)
+    rejects("out aliasing close", close=buf[0], ns=np.array([10]), out=buf)
+    rejects("Fortran-ordered out", close=close, ns=np.array([3, 4]),
+            out=np.asfortranarray(np.empty((2, close.size), np.float32)))
+
+    # N_VALUES is a module global handed to every caller; an in-place edit would redefine
+    # the grid process-wide.
+    assert not rmv.N_VALUES.flags.writeable, "N_VALUES is mutable"
+
+
+def test_unit2_live_ring_reproduces_the_crossing_rule() -> None:
+    """SPEC §2's rule is a crossing, so live needs RMedV at t AND t-1.
+
+    A ring of exactly n makes [:, -2] a warmup 0.0, so `RMedV[t-1] < vup` is always true
+    and the crossing rule degrades into a level rule. Measured on a 4000-bar walk at
+    n=24: 71 real buy signals become 1294. The ring must hold max(ns) + 1 bars.
+    """
+    close = (600 + np.cumsum(np.random.default_rng(11).normal(0, 0.17, 1200))).astype(np.float32)
+    full = rmv.rmv_all_n(close, rmv.N_VALUES)
+
+    for n in (3, 12, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        for t in (n, 600, 1199):  # t >= n so the ring has a real previous bar
+            ring = close[t - n : t + 1]  # n + 1 bars
+            live = rmv.rmv_all_n(ring, np.array([n]))
+            assert live[0, -1] == full[a, t], f"n={n} t={t}: live current != backtest"
+            assert live[0, -2] == full[a, t - 1], (
+                f"n={n} t={t}: live previous {live[0, -2]} != backtest {full[a, t - 1]} "
+                "-- the crossing rule needs a genuine RMedV[t-1], not a warmup zero"
+            )
+            assert live[0, -2] != 0.0 or full[a, t - 1] == 0.0
+
+    # Demonstrate the hazard the +1 exists to avoid. A ring of exactly n is a perfectly
+    # legal call -- the kernel cannot know the caller wanted a crossing -- so this is not
+    # a rejection, it is the reason the docstring mandates max(ns) + 1.
+    short = rmv.rmv_all_n(close[:24], np.array([24]))
+    assert short[0, -1] != 0.0, "the current bar should still be computed"
+    assert short[0, -2] == 0.0, (
+        "a ring of exactly n must expose [:, -2] as a warmup zero -- if this ever stops "
+        "being true the docstring's +1 rationale needs rewriting, not deleting"
+    )
+
+
+def test_unit2_inner_median_tie_breaking() -> None:
+    """n=4's inner medians run over 3 points (odd), so the n=4 test above only pins the
+    OUTER median. n=5 runs its inner medians over 4 points and pins the inner rule too --
+    both lower- and upper-middle inner variants pass the n=4 test."""
+    from scipy.stats import siegelslopes
+
+    rng = np.random.default_rng(21)
+    found = 0
+    for _ in range(400):
+        y = np.round(rng.uniform(0, 20, 5), 2).astype(np.float32)
+        ref = float(siegelslopes(y.astype(np.float64), np.arange(5, dtype=float))[0])
+        lower = _lower_median_reference(y.astype(np.float64))
+        if abs(ref - lower) < 1e-9:
+            continue  # this series does not discriminate; try another
+        found += 1
+        got = float(rmv.rmv_all_n(y, np.array([5]))[0, -1])
+        assert got == np.float32(ref), f"n=5 inner tie-break: {got} vs numpy {ref} on {y}"
+    assert found > 50, f"only {found} discriminating n=5 series found -- test is toothless"
+
+
+def test_unit2_gate_never_exposes_an_invalid_rmv() -> None:
+    """The integration invariant between Unit 1 and Unit 2, on real data.
+
+    The kernel is deliberately gap-unaware: it computes straight across session
+    boundaries and holes, and `gate` is what keeps those values from being traded. That
+    contract is only worth anything if it actually holds for every n in the grid -- and
+    SPEC §2's crossing rule reads RMedV[t-1], so bar t-1's window must be clean too.
+
+    The margin here is exactly zero (the gap-to-first-gated-bar distance is MAX_N+1, the
+    precise minimum), so this test is what stops a later change to MAX_N, the session
+    start, or the blackout width from silently trading gap-contaminated signals.
+    """
+    npz, _ = data._cache_paths("SPY", "sip")
+    if not npz.exists():
+        print("       (skipped: no cache)")
+        return
+
+    from datetime import datetime, timezone
+
+    # Whole sample: the check is a few cumsums, so there is no reason to subset it.
+    bars = data.load_bars(
+        "SPY", datetime(2016, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc), refresh=False,
+    )
+    gaps = np.flatnonzero(np.diff(bars.ts) > data.BAR_NS) + 1  # index of each post-gap bar
+    is_break = np.zeros(len(bars), bool)
+    is_break[gaps] = True
+    gated = np.flatnonzero(bars.gate == 1)
+    assert gated.size > 150_000, f"only {gated.size} gated bars -- fixture too small"
+
+    for n in rmv.N_VALUES:
+        # A window ending at t covers t-n+1..t; it is contaminated if any bar strictly
+        # inside it starts a new session. Check bar t and bar t-1 (the crossing rule).
+        for offset in (0, 1):
+            ends = gated - offset
+            assert ends.min() >= n - 1, (
+                f"n={n}: a gated bar at index {ends.min()} has no full window "
+                "(the array start is not being treated as a gap)"
+            )
+            starts = ends - n + 1
+            # cumulative count of breaks in (start, end] must be zero
+            cum = np.concatenate([[0], np.cumsum(is_break)])
+            bad = int(np.count_nonzero(cum[ends + 1] - cum[starts + 1]))
+            assert bad == 0, f"n={n}, t-{offset}: {bad} gated bars whose window spans a gap"
+
+
+def test_unit2_intra_session_slice_is_gated_off() -> None:
+    """A slice that begins mid-session has no earlier bar to diff against, so nothing
+    marks its start as a gap. Before the fix an 11:00 ET start left gate[0] == 1 and 275
+    gated bars across the grid reading warmup zeros."""
+    npz, _ = data._cache_paths("SPY", "sip")
+    if not npz.exists():
+        print("       (skipped: no cache)")
+        return
+
+    from datetime import datetime, timezone
+
+    for hour_utc, label in ((15, "11:00 ET"), (19, "15:00 ET")):
+        bars = data.load_bars(
+            "SPY", datetime(2019, 6, 3, hour_utc, tzinfo=timezone.utc),
+            datetime(2019, 6, 10, tzinfo=timezone.utc), refresh=False,
+        )
+        assert bars.gate[: data.MAX_N].sum() == 0, f"{label}: gate open during warmup"
+        exposed = sum(
+            int(((np.arange(len(bars)) < n - 1) & (bars.gate == 1)).sum())
+            for n in rmv.N_VALUES
+        )
+        assert exposed == 0, f"{label}: {exposed} gated bars read a warmup value"
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
