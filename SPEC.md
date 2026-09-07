@@ -134,8 +134,140 @@ reported separately is the achievable target.
 > See §9-A.
 
 `xmult` is symbol- and timeframe-specific. [M25 p.28]: *"different futures and different time
-bars give different multipliers."* SPY's value is measured in Unit 3; the `4.00512` in the
-pre-revamp `rmv.py` is unsourced.
+bars give different multipliers."* The `4.00512` in the pre-revamp `rmv.py` was unsourced and
+is gone.
+
+### 1.2.1 SPY — measured, and refitted per window (Unit 3)
+
+**Table C — SPY 5 min, gated bars only, 2016-01-04..2017-12-29, 35,573 values.** Same Appendix
+method as Table B: `xmult = mean over N=3..20 of 1/sd(RMedV_N * sqrt(N))`. Produced by
+`rmv.xmult`; `test_unit3_frozen_xmult_does_not_transfer` re-derives the headline figure.
+
+| N | sd | 1/sd | sd*sqrt(N) | 1/(sd*sqrt(N)) | | N | sd | 1/sd | sd*sqrt(N) | 1/(sd*sqrt(N)) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 3 | 0.083323 | 12.001493 | 0.144320 | 6.929065 | | 14 | 0.037053 | 26.988653 | 0.138638 | 7.213021 |
+| 4 | 0.074268 | 13.464691 | 0.148537 | 6.732346 | | 15 | 0.035619 | 28.074740 | 0.137953 | 7.248867 |
+| 5 | 0.063295 | 15.798965 | 0.141533 | 7.065512 | | 16 | 0.034325 | 29.133457 | 0.137299 | 7.283364 |
+| 6 | 0.057823 | 17.294023 | 0.141638 | 7.060255 | | 17 | 0.033089 | 30.221589 | 0.136429 | 7.329812 |
+| 7 | 0.052602 | 19.010569 | 0.139173 | 7.185320 | | 18 | 0.032001 | 31.248689 | 0.135770 | 7.365387 |
+| 8 | 0.049549 | 20.182184 | 0.140145 | 7.135480 | | 19 | 0.030976 | 32.283261 | 0.135020 | 7.406288 |
+| 9 | 0.046390 | 21.556141 | 0.139171 | 7.185380 | | 20 | 0.030040 | 33.288672 | 0.134344 | 7.443573 |
+| 10 | 0.044203 | 22.622962 | 0.139782 | 7.154009 | | 21 | 0.029198 | 34.249331 | 0.133800 | 7.473817 |
+| 11 | 0.041998 | 23.810922 | 0.139290 | 7.179263 | | 22 | 0.028420 | 35.186533 | 0.133301 | 7.501794 |
+| 12 | 0.040230 | 24.857298 | 0.139360 | 7.175684 | | 23 | 0.027674 | 36.134547 | 0.132722 | 7.534574 |
+| 13 | 0.038484 | 25.984791 | 0.138756 | 7.206884 | | 24 | 0.026998 | 37.039663 | 0.132263 | 7.560690 |
+
+```
+xmult_SPY_5min_2016_17 = 7.183306
+```
+
+Averaging the whole 3..24 grid instead of the published 3..20 gives **7.244108** — 0.85% out,
+small enough to pass unnoticed and not the published method. `rmv.CAL_N_MAX` pins the range.
+
+**Calibrated on gated bars, not on every bar.** Warmup zeros and the bars whose window
+straddles a session gap are not RMedV values; including them inflates `sd` by 22.8% at N=3 and
+6.8% at N=24. This is a deliberate departure from [M25 p.27]'s `Start Time=0 EndTime=0` run,
+which had no session gaps to contend with — CL trades nearly around the clock. `rmv.xmult`
+therefore takes the mask as a required argument.
+
+**The `1/sqrt(N)` law holds, with the same bias Meyers' own data shows.** The log-log slope of
+`sd` against `N` over N=3..20 is **-0.5386** for SPY and **-0.5668** for [M25 Table A]'s CL —
+both steeper than the law's -0.5, SPY less so. `sd(4)/sd(20)` is 2.472 for SPY against Meyers'
+2.513 and the law's 2.236. On the calibration slice normalized `sd` lands in **0.950..1.017 for
+N>=5**, inside the ±0.15 target; N=21..24 are genuine extrapolation, since `xmult` only averages
+to 20. N=3 and N=4 come in at 1.037 and 1.067 — the same break below N≈5 that Table B shows.
+
+#### `xmult` is refitted per IS window, never frozen
+
+PLAN Unit 3 planned a frozen constant in `norm.json` and pre-registered the condition for
+abandoning it: a saturation swing wider than ~2x across years. **Measured, the swing is 6.45x.**
+The constant is not shipped, `norm.json` does not exist, and Unit 7 calls `rmv.xmult` once per
+IS window, applying the result to that window's IS *and* OOS grid runs. That is not look-ahead —
+the IS window strictly precedes its OOS by construction (§4).
+
+*The statistic behind "6.45x" is the per-year mean of normalized `sd`, not PLAN's literal
+"fraction of the 4312 combos", which is degenerate at annual granularity — over a whole year
+essentially every combo trades at least once, so the zero-trade fraction is 0.00% in all
+eleven years and no ratio exists. The combo-level form is reported per window below, where it
+is not degenerate. On the same per-year data the tail statistic `P(|z| > 3.5)` swings **234.6x**,
+so the choice of statistic is conservative, not favourable.*
+
+Why the frozen version fails: RMedV is **dollars per bar**. SPY ran $210 -> $690 across the
+sample through a 6x range of realized volatility, so a multiplier fitted to the 2016-17 low-vol
+regime lands 3.2x off over 2018-25. Per year under the frozen 7.183306 (withheld tail excluded,
+so 2026 is January-February only):
+
+| year | median SPY | mean normalized sd | bars beyond the grid, P(abs(z) > 3.5) |
+|---|---|---|---|
+| 2016 | 210 | 1.187 | 1.61% |
+| 2017 | 244 | **0.747** | 0.15% |
+| 2018 | 274 | 2.088 | 8.65% |
+| 2019 | 292 | 1.523 | 3.66% |
+| 2020 | 327 | 3.514 | 19.59% |
+| 2021 | 428 | 2.473 | 12.53% |
+| 2022 | 404 | 4.350 | 34.80% |
+| 2023 | 428 | 2.612 | 14.63% |
+| 2024 | 543 | 2.964 | 17.44% |
+| 2025 | 620 | **4.819** | 28.92% |
+| 2026 | 689 | 4.407 | 30.60% |
+
+At 34.8% of bars beyond `vup = 3.50`, the top of the grid is no longer a rare event and the
+4312 combos collapse toward clones of each other — which is precisely the failure PLAN Unit 3
+named: *"the filter then picks arbitrarily among 4312 near-clones."*
+
+**Price level is not the main driver, which forecloses the obvious alternative fix.** Dividing
+each year's normalized `sd` by that year's median SPY price leaves a **3.51x** swing against
+the price level's own 3.28x span. Realized volatility dominates, so re-expressing RMedV in
+log-returns or percent-per-bar would still trip the >2x trigger. Refitting is the fix; changing
+the units is not.
+
+Refitting per window removes it. Over **506** rolling 21-session windows stepping 5 sessions
+(Unit 7's IS/OOS shape in bar space, withheld tail excluded):
+
+| | frozen 2016-17 | frozen, best case | refitted per IS window |
+|---|---|---|---|
+| windows with every N>=5 within ±0.15 | 9.9% | 15.6% | **100%** (worst 0.142) |
+| worst normalized-sd deviation | 10.369 | 2.847 | **0.142** |
+| cross-N spread over N>=5, median | 0.161 | — | **0.078** |
+| P(abs(z) > 3.5) on IS bars, median / worst | 11.5% / 69.0% | 0.09% / 20.4% | **0.59% / 2.08%** |
+| saturated combos (threshold beaten on >50% of bars), worst window | 31.8% | — | 4.9% |
+| combos that cannot trade at all, worst window | 19.6% | — | 7.1% |
+
+"Frozen, best case" is `xmult = 2.430574` fitted on the *whole* pre-tail sample — the most
+favourable frozen constant that exists, and it is quoted because it is the stronger form of the
+argument: the failure is not an artifact of having calibrated on the two calmest years. No
+frozen constant clears 16% of windows; refitting clears 100%.
+
+The refitted multiplier itself ranges **0.679 to 13.830** across the 506 windows (20.4x, median
+3.063). At the quiet extreme the bottom of the grid, `vup = 0.25` at `n = 3`, is a raw slope of
+**$0.0104 per bar** — at or under SPY's spread, so those combos are resolving tick noise. That
+is a live input to Unit 6's "distinct trade sets" diagnostic and to Unit 9's effective grid
+size, and it means the stored `xmult` is *the scale*, not a nuisance parameter: Units 11 and
+12b step their live thresholds discontinuously every Monday, by up to a large factor.
+
+**What refitting does not fix, and Units 8 and 9 need to know.** It makes the *in-sample* scale
+exact by construction; next week's is still a forecast.
+
+- PLAN Unit 3's done-when was written as ±0.15 for N>=5 **on a held-out slice**. That form is
+  **not met and is not achievable**: applied as written (max over N>=5) to the following OOS
+  week it holds in **17.2%** of windows — median 0.320, p90 0.652, worst 3.936. What is met is
+  the in-sample form, in 100% of windows. The criterion moved; this is that stated plainly.
+- Median over N of `abs(sd - 1)` on the OOS week is **0.258** (p90 0.577) against frozen's
+  1.031 — a `vup` chosen on IS lands on a week whose scale differs by about a quarter.
+- The tail is what will show up in the P&L, not the median: p99 **1.436**, worst **3.717**, and
+  **12 of 506** OOS weeks come in at more than 2x their IS scale — the same saturation regime
+  the frozen constant was rejected for, now confined to ~2.4% of weeks instead of most of them.
+
+That residual is ordinary walk-forward risk — the thing the PWFO exists to measure — not a
+normalization defect, and it is not tunable away: the estimation length is flat at median 0.246
+to 0.261 from 10 through 42 sessions and degrades beyond, so the IS window already sits on the
+plateau and a second parameter would buy nothing.
+
+**The withheld tail was touched once, here.** The first version of the comparison table above
+was computed over all 2,680 sessions rather than the 2,553 before 2026-03-01, and the review
+caught it. The figures are now pre-tail. What the tail saw was a second-moment property of the
+indicator — `sd(RMedV)` — never an OOS return, a trade, or a filter. It is recorded rather than
+argued away, and PLAN Unit 9's comparison counter carries it.
 
 ---
 
@@ -653,3 +785,4 @@ question.
 | **I** | Formula index base: both papers write `i,j = 1..N` over `price(t-i)`, literally excluding bar `t`. | **Resolved by reinterpretation** to `0..N-1` inclusive of bar `t` (§1.1). Supported by the p.2 worked example and the `RMedV[1]` prior-bar term. Worth one bar of lag if wrong. |
 | **J** | [M25 p.10] says *"Row 3 is the filter chosen, `b10mLb\|lr≤3r2≤80`"*; pp.8–9 say **Row 4**, and the `$176932 / 57 / 45` figures p.10 quotes are Row 4's (Row 3's `toNP` is 179322). The stray `r2≤80` also collides with `CL2`'s screen. | **Resolved: Row 4**, `b10mLb\|lr≤3 r2≤50-mLTr`, which is the row highlighted in Fig 2. p.8 explains the choice: *"we choose row 4 instead of row 3 because the largest losing week (LLP) was much lower."* |
 | **K** | Significance denominator: [M25 p.9] writes `176932/501 = 396.7`, but `176932/501 = 353.2`. The divisor that reproduces 396.7 is Col G = **446** (periods actually traded); 501 is Col D (`aoGP`). Meanwhile the bootstrap null is defined over **517** (all periods). | **Resolved against the paper.** Mixing denominators is what makes the published result significant — same data, consistent denominator, `K·p` goes 0.049 → 2.23. **We use all OOS periods on both sides**, zero-trade weeks counted as zero (§6.5). |
+| **L** | [M25]'s two Appendix tables claim to be the same run under an identical header, but p.28 is a uniform **+1.38%** above `sqrt(N)` x p.27 at every one of the 18 N (range 1.327-1.613%). | **Recorded, not resolvable.** A scale offset, not a formula difference — the two pages saw slightly different value sets. It matters because re-deriving `xmult` from Table A gives **9.8266**, not the published 9.6931. Table B governs; `test_unit3_paper_tables_disagree` pins both numbers. |

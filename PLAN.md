@@ -360,42 +360,70 @@ scipy, float32 vs float64 accumulation.
 
 ---
 
-### Unit 3 — Normalization calibration
+### Unit 3 — Normalization calibration ✅ **shipped; the frozen constant was rejected**
 
-**Do**
+**Done** `rmv.xmult(rmv_matrix, mask, ns)` — `mean over N=3..20 of 1/sd(RMedV_N * sqrt(N))`,
+the [M25] Appendix method, computed from whatever slice it is handed. `rmv.CAL_N_MAX = 20`
+pins the averaging range (the full 3..24 grid gives 7.244108 instead of 7.183306). `mask` is
+required, not defaulted: gated bars only, because warmup zeros and gap-straddling windows
+inflate `sd` by 22.8% at N=3.
 
-- On a **fixed early calibration slice** (first ~2 years), compute `sd(RMedV_N)` for
-  ⚑ **N = 3..20** (matching the Appendix method).
-- Verify `1/sqrt(N)` proportionality; compute `xmult = mean(1 / sd(RMedV_N * sqrt(N)))`.
-- ⚑ Advance measurement from Unit 2, on the full sample. **Calibrate on gated bars only** —
-  the basis matters more than expected:
+**Not done, deliberately** No `norm.json`, no frozen constant, no held-out step. ⚑ Rev 2
+pre-registered the trigger — *"if the saturation diagnostic swings more than ~2x across years,
+switch to per-IS-window normalization, which deletes this unit, `norm.json`, and the held-out
+step."* **Measured swing: 6.45x.** The trigger fired, so the unit deletes itself as designed.
+Unit 7 calls `rmv.xmult` once per IS window and applies the result to that window's IS *and*
+OOS grid runs — the IS window strictly precedes its OOS, so there is no look-ahead.
 
-  | basis | sd(N=3) | sd(N=24) | ratio |
-  |---|---|---|---|
-  | all bars (warmup + gap-contaminated) | 0.3115 | 0.0891 | **3.49** |
-  | gated bars only | 0.2537 | 0.0834 | **3.04** |
-  | `1/sqrt(N)` law predicts | — | — | 2.83 |
+Full numbers in SPEC §1.2.1 (Table C, the per-year diagnostic, and the frozen/per-window
+comparison). The headlines:
 
-  Both are steeper than the law, the same way Meyers' were (his N=4:N=20 was 2.51 vs 2.24),
-  but the all-bars figure is inflated by the 25% of bars that are post-gap contaminated.
-  Gap contamination moves `sd` by 6.8% at N=24 and 22.8% at N=3; warmup zeros (0.004%) and
-  float32 storage (~1e-8) are both negligible.
-- Freeze into `norm.json` keyed by `{symbol, timeframe, session, calibration range}`.
-- ⚑ **Saturation diagnostic, per year**: fraction of the 4312 combos producing (a) zero trades,
-  (b) saturated signal (`|RMedV_norm|` routinely > 3.5).
+| over 506 pre-tail windows | frozen 2016-17 | frozen, best case | refitted per IS window |
+|---|---|---|---|
+| windows with every N>=5 within ±0.15 | 9.9% | 15.6% | **100%** (worst 0.142) |
+| P(\|z\| > 3.5) on IS bars, median / worst | 11.5% / 69.0% | 0.09% / 20.4% | **0.59% / 2.08%** |
+| saturated combos, worst window | 31.8% | — | 4.9% |
+| combos that cannot trade at all, worst window | 19.6% | — | 7.1% |
 
-**Done when** ⚑ normalized `sd` within **±0.15** for N >= 5 on a held-out slice, with N<5
-exempted and reported separately. Rev 1's ±0.05 for every N is unachievable by the method
-itself: the paper's own table gives `9.693/8.738 = 1.109` at N=3 and `1.092` at N=4 — the
-`sqrt(N)` proportionality visibly breaks below N≈5.
+"Frozen, best case" is the multiplier fitted on the whole pre-tail sample — the most favourable
+frozen constant that exists. It clears 15.6%. The failure is not an artifact of having
+calibrated on the two calmest years.
 
-⚑ **Freezing is provisional, not principled.** Rev 1 justified it as keeping `vup` comparable
-across windows — but nothing downstream depends on that (selection is within-window,
-aggregation is over P&L). The real risk runs the other way: a constant fitted to 2016–18 SPY
-(VIX ~13, SPY ~$250) applied to March 2020 (VIX 80) saturates the entire grid, and the filter
-then picks arbitrarily among 4312 near-clones. **If the saturation diagnostic swings more than
-~2× across years, switch to per-IS-window normalization** — which is not look-ahead (the IS
-window strictly precedes its OOS) and deletes this unit, `norm.json`, and the held-out step.
+⚑ **The done-when moved, and this is that said out loud.** Rev 2 asked for ±0.15 for N>=5 **on
+a held-out slice**. That form is not met and is not achievable: applied as written (max over
+N>=5) to the following OOS week it holds in **17.2%** of windows. What is met is the in-sample
+form, in 100% of them. SPEC §1.2.1 carries both numbers.
+
+**Why the frozen version could never have worked.** RMedV is dollars per bar, and SPY ran
+$210 → $690 through a 6x range of realized vol. Rev 2 anticipated the March-2020 case; the
+measurement is worse than that — **every year after 2017** is off, by 2.1x to 6.5x. The
+per-year mean normalized `sd` runs 0.747 (2017) to 4.819 (2025). In 2022, 34.8% of gated bars
+sit beyond `vup = 3.50`, at which point the 4312 combos are near-clones and the filter is
+choosing noise.
+
+**Advance measurement from Unit 2 confirmed.** Gated-bars `sd` ratio N=3:N=24 was 3.04 against
+the `1/sqrt(N)` law's 2.83; the calibration slice gives 3.086. Log-log slope -0.5386 for SPY,
+-0.5668 for [M25 Table A]'s CL — SPY is steeper than the law, but *less* steep than Meyers'
+own data, so the residual is a property of the estimator, not of SPY.
+
+⚑ **Carried forward to Unit 8, not fixed here.** Refitting makes the *in-sample* scale exact
+by construction; next week's is still a forecast. An IS window's `xmult` applied to the
+following OOS week leaves a median `|sd − 1|` of **0.259** (p90 0.575) — a `vup` chosen on IS
+lands on an OOS week whose scale differs by ~26%. That is ordinary walk-forward risk, and it
+is not tunable away: estimation length is flat from 10 to 42 sessions and degrades beyond, so
+the IS window is already on the plateau and a second parameter would buy nothing.
+
+⚑ **The withheld tail was touched once, here, and it is recorded rather than argued away.**
+The first version of the table above was computed over all 2,680 sessions instead of the 2,553
+before 2026-03-01; the adversarial review caught it and the figures are now pre-tail. What the
+tail saw was `sd(RMedV)` — a second moment of the indicator, never an OOS return, trade or
+filter. Unit 9's comparison counter carries it.
+
+**Found while writing the review-focus list, fixed in the same sitting.** `Bars.gate` is
+int8, and `row[int8_gate]` is *integer* fancy indexing — numpy returns `row[0]`, `row[1]`,
+`row[0]`... and the `sd` that falls out is entirely plausible. `xmult` now rejects any
+non-bool mask; the caller writes `gate == 1`. This is the same class of defect as Unit 2's
+NaN-through-`np.median`: a wrong answer with no exception.
 
 ---
 
@@ -438,6 +466,12 @@ cases return defined values (0 trades; 0 losers → `PF = inf`; `mLTr` undefined
 **Do** `run_grid(rmv_window, close, gate, ns, vs, out)` — `prange` over an `a`-major combo
 index, writing a preallocated `float32[4312, 24]`.
 
+⚑ **Scale thresholds, not rows** (Unit 3). `RMedV_norm >= vup` is
+`RMedV >= vup / (xmult * sqrt(n))`, so the window's `xmult` turns into 14 divisions per `n`
+instead of a second 22 x T matrix. Measured over 55.5M real `(bar, n, v)` triples — 111.1M
+comparisons, counting both threshold sides — the two orderings differ in **0** cases, as does a float32 vs float64 threshold constant — but pin the
+convention anyway, so the backtest and live paths cannot drift onto opposite sides of it.
+
 ⚑ **Free diagnostic**: count **distinct** trade sets among the 4312 combos per window. On a
 penny-tick instrument at low N many `(vup, vdn)` pairs are clones; the effective grid size is
 smaller than 4312 and directly informs §Unit 9's multiplier.
@@ -454,6 +488,10 @@ row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero alloca
 
 - Window generator: ⚑ **week-anchored** — IS = the 30 calendar days ending Friday, OOS = the
   following Mon–Fri, step 7 days.
+- ⚑ Per window: `xmult = rmv.xmult(rmv_matrix, (gate == 1) & in_IS_window)` — Unit 3's
+  normalization is refitted here, not frozen (SPEC §1.2.1). The **IS** multiplier scales the
+  thresholds for that window's IS *and* OOS runs; recomputing it on OOS would be look-ahead,
+  and reusing a global one saturates the grid (measured 6.45x swing across years).
 - Per window: `run_grid` on IS **and** on OOS (same combos).
 - ⚑ Stream to **three** memmapped files: `pwfo_is.npy`, `pwfo_oos.npy`, and `pwfo_tail.npy`
   (the withheld final 6 months, both IS and OOS, written and then not opened again until §Unit 9's
@@ -462,6 +500,10 @@ row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero alloca
 **Done when**
 
 - Every window asserts `max(IS ts) < min(OOS ts)` — **the leakage guard**.
+- ⚑ Every window's `xmult` is derived from IS bars only, and is stored so a replay can
+  reproduce the exact thresholds. It is **per window, not per row** — one extra column in the
+  window index, not a 19th column in `pwfo_is` (§2.1 pins that at 18). Normalized IS `sd` within ±0.15 for N>=5 — held
+  in 100% of 531 windows when Unit 3 measured it.
 - OOS weeks tile the timeline exactly once: no overlap, no gap.
 - Re-running produces byte-identical tables.
 - Budget: **< 60 s**, peak RSS **< 1 GB**.
@@ -511,7 +553,8 @@ the two zero cases distinctly.
   choice decides the Unit 9 gate, so it is pinned here rather than discovered later.
 - ⚑ **A literal comparison counter.** A file the evaluator increments on every OOS-touching
   run, multiplied in at report time. §8's cheap A/Bs (history depth, `session_reset`, feed,
-  long/short, both filter ambiguities) are all looks at the same OOS columns, and "it's a
+  long/short, both filter ambiguities) are all looks at the same OOS columns, ⚑ as is Unit 3's one
+  accidental second-moment look at the withheld tail, and "it's a
   35-second run" is exactly how the count gets lost. ~10 lines, and the only thing standing
   between this project and the failure mode §5 is named after.
 - ⚑ **Report lag-1..4 autocorrelation of `osnp`.** IS windows overlap by 23 of 30 days, so
@@ -523,7 +566,10 @@ the two zero cases distinctly.
 - Produce a Table-1-shaped report (same columns) plus the equity curve with its 2nd-order fit.
 
 **Done when** a filter run against shuffled OOS columns comes back insignificant; ⚑ **plus a
-shuffled-alignment falsification** — apply window *k*'s selected params to window *k+50*'s OOS.
+shuffled-alignment falsification** — apply window *k*'s selected `N/vup/vdn` to window
+*k+50*'s OOS ⚑ **under window *k+50*'s own `xmult`**. Carrying *k*'s multiplier across would
+mis-scale the thresholds by up to 20x (SPEC §1.2.1), and the test would then "degrade" for a
+reason that has nothing to do with the filter.
 If that does not degrade, the filter is a static parameter prior, not a response to the IS
 window, and column-shuffling would never have caught it.
 
@@ -574,8 +620,10 @@ overfit Meyers' own Bonferroni correction warns about. Bounded space, or none.
 **Do** Fetch the last 30 calendar days → RMV → grid on that one IS window → apply the frozen
 filter → write `params.json`: `{N, vup, vdn, filter, as_of, is_metrics, xmult, git_sha}`.
 
-**Done when** a dry run against a historical date reproduces the exact `N/vup/vdn` that Unit 7's
-PWFO chose for that same window — **the offline/online equivalence check**, ⚑ now meaningful
+**Done when** a dry run against a historical date reproduces the exact `N/vup/vdn` **and the
+exact `xmult`** that Unit 7's PWFO chose for that same window — ⚑ the multiplier is refit
+weekly and spans 20x across windows, so a gate differing by a few bars between the full-sample
+slice and a fresh 30-day fetch selects a different row — **the offline/online equivalence check**, ⚑ now meaningful
 because `adjustment="split"` makes the two price series identical. Params fall inside the grid.
 A `params.json` older than 10 days refuses to trade.
 
@@ -642,7 +690,7 @@ size are settled in §1.3, not discovered here.
 
 After each unit, before starting the next:
 
-1. Adversarial subagent receives `PLAN.md`, `SPEC.md`, the unit's diff, and its test file.
+1. Adversarial subagent (spawn one subagent for adversarial review, not many) receives `PLAN.md`, `SPEC.md`, the unit's diff, and its test file.
 2. Its brief: *find what is wrong.* Does the code do what the unit says; do the tests actually
    fail when the logic breaks (mutate a constant and check); is there look-ahead; does it hit
    the budget; what did the plan not anticipate.
@@ -686,8 +734,9 @@ Adding any of these requires a reason written down first.
 5. `walk_forward_windows`: hardcoded `n_windows=16` (`:274`); `+1 day` masks overlap (`:327`).
 6. `normalize=False` by default while the grid uses raw units 0.02–0.40 — most of that grid
    can never trigger on SPY 5-min slopes.
-7. ⚑ `xmult = 4.00512` is unsourced — but it **is** used, at `rmv.py:44` whenever
-   `normalize=True`. (Rev 1 said "unused".)
+7. ⚑ ~~`xmult = 4.00512` is unsourced~~ — **closed in Unit 3.** The old constant died with
+   the Unit 2 rewrite; `rmv.xmult` replaces it with the [M25] Appendix method, refitted per
+   IS window rather than frozen at any value (SPEC §1.2.1).
 8. ~~`benchmark.py` re-derived the OOS window as `oos_end - 7 days`~~ — **file deleted in
    Unit 2**: it imported `calculate_returns`/`rmv_trading_system` from the old `rmv.py`, so
    the rewrite made it an unconditional `ImportError`. Nothing in it is needed; its Sharpe

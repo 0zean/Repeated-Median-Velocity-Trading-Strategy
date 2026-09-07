@@ -5,11 +5,13 @@ One test function per unit of work (see PLAN.md §3).
 
 from __future__ import annotations
 
+import functools
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -961,6 +963,295 @@ def test_unit2_intra_session_slice_is_gated_off() -> None:
             for n in rmv.N_VALUES
         )
         assert exposed == 0, f"{label}: {exposed} gated bars read a warmup value"
+
+# ------------------------------------------------------------------ unit 3: normalization
+
+# [M25 p.28] Table B, sd(RMedV * sqrt(N)) for CL 5min, N=3..20 (SPEC §1.2). The paper's own
+# `1/Std Mult Ave` for these rows is 9.693120, which is what makes them self-checking: a
+# mistyped digit does not reproduce it.
+CL_TABLE_B = np.array([
+    0.114441, 0.112604, 0.107389, 0.106082, 0.103985, 0.103547, 0.102365, 0.102245,
+    0.101559, 0.101442, 0.100930, 0.100853, 0.100549, 0.100603, 0.100329, 0.100422,
+    0.100210, 0.100223,
+])
+CL_XMULT = 9.693120
+
+# [M25 p.27] Table A, raw sd(RMedV) over the same N and the same stated run. Kept because it
+# is the only source evidence for the 1/sqrt(N) law itself (SPEC §1.2), and because it
+# disagrees with Table B -- see test_unit3_paper_tables_disagree.
+CL_TABLE_A = np.array([
+    0.065024, 0.055546, 0.047342, 0.042738, 0.038771, 0.036130, 0.033673, 0.031903,
+    0.030213, 0.028895, 0.027620, 0.026593, 0.025612, 0.024809, 0.024003, 0.023349,
+    0.022674, 0.022103,
+])
+CL_NS = np.arange(3, 21)
+
+# SPY, measured over 2016-01-04..2017-12-29 on gated bars (PLAN Unit 3). This was meant to be
+# the shipped constant; it is a test fixture instead, because
+# test_unit3_frozen_xmult_does_not_transfer is what happened when it was measured.
+XMULT_FROZEN_2016_17 = 7.183306
+
+# PLAN §3 Unit 9: the final 6 months are written once and not opened until the project's last
+# action. Unit 3 stops here even though sd(RMedV) is a property of the data rather than an OOS
+# result -- the tail is cheap to respect and expensive to un-spend.
+TAIL_START = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+
+@functools.cache
+def _real_series():
+    """Full-sample RMedV, restricted to gated bars before the withheld tail.
+
+    Returns `(rows float64[22, G], session_start int64[S+1], et)` or None when there is no
+    cache. ponytail: a missing cache makes the three real-data tests print "(skipped)" and
+    still count as PASS, so the empirical basis of Unit 3's whole conclusion can evaporate
+    quietly. Deferred, not accepted -- it is the pattern Units 1 and 2 already use, and the
+    fix (a skip count in `main`) belongs to all three units at once, not to this one. ~5 s, so the Unit 3 tests share one copy. Gated bars are gathered once into a
+    contiguous matrix; every window below is then a slice, not a mask over 257k booleans.
+    """
+    npz, _ = data._cache_paths("SPY", "sip")
+    if not npz.exists():
+        return None
+    bars = data.load_bars(
+        "SPY", datetime(2016, 1, 1, tzinfo=timezone.utc),
+        datetime(2026, 9, 1, tzinfo=timezone.utc), refresh=False,
+    )
+    matrix = rmv.rmv_all_n(bars.close)
+    keep = np.flatnonzero((bars.gate == 1) & (bars.ts < data._to_ns(TAIL_START)))
+    et = data.to_et(bars.ts[keep])
+    day = et.normalize().asi8
+    # First position of each session, plus a terminating bound, so sessions s..e are
+    # rows[:, starts[s]:starts[e]].
+    starts = np.concatenate([np.searchsorted(day, np.unique(day)), [keep.size]])
+    return np.ascontiguousarray(matrix[:, keep], dtype=np.float64), starts, et
+
+
+def _norm_sd(rows: np.ndarray, ns: np.ndarray, mult: float) -> np.ndarray:
+    """sd(RMedV_N * mult * sqrt(N)) per N -- 1.0 everywhere is a perfectly normalized slice."""
+    return np.std(rows, axis=1, ddof=1) * np.sqrt(ns) * mult
+
+
+def test_unit3_xmult_reproduces_the_paper_appendix() -> None:
+    """[M25 p.28]'s own published multiplier, 9.693120, out of `rmv.xmult`.
+
+    The only external oracle the formula has. Table B is sd(RMedV * sqrt(N)), so the rows
+    handed to `xmult` are synthesised to have sample sd exactly `table_b / sqrt(N)`; the
+    function then has to put the sqrt(N) back, average 1/sd rather than sd, and stop at
+    N=20. Dropping any one of those three does not land on 9.6931.
+    """
+    rng = np.random.default_rng(0)
+    length = 4096
+    rows = np.empty((CL_NS.size, length), dtype=np.float32)
+    for i, target in enumerate(CL_TABLE_B / np.sqrt(CL_NS)):
+        x = rng.standard_normal(length)
+        rows[i] = (x - x.mean()) / x.std(ddof=1) * target
+    got = rmv.xmult(rows, np.ones(length, bool), CL_NS)
+    assert abs(got - CL_XMULT) < 1e-4, f"{got} != {CL_XMULT}"
+
+    # The N=3..20 range is load-bearing, not decoration: [M25]'s table also lists N=2 with
+    # sd=0, and the CL grid runs to N=24. Averaging a different range is a different number.
+    wide = rmv.xmult(rows[:12], np.ones(length, bool), CL_NS[:12])
+    assert abs(wide - CL_XMULT) > 0.1, "xmult is insensitive to which N it averages"
+
+    # A gappy `ns`, because every other fixture here is 3,4,5,... and a row *index* would
+    # pass all of them. `xmult` advertises an arbitrary ns and PLAN §8's cheap A/Bs would
+    # hand it a sub-grid; `sqrt(ns[a])` must read the value, never the position.
+    odd = np.arange(3, 21, 2)
+    got_odd = rmv.xmult(rows[::2], np.ones(length, bool), odd)
+    assert abs(got_odd - np.mean(1.0 / CL_TABLE_B[::2])) < 1e-4, got_odd
+
+
+def test_unit3_paper_tables_disagree() -> None:
+    """SPEC §9-L. [M25]'s p.27 and p.28 tables claim to be the same run, and are not.
+
+    Table B is a uniform +1.38% above sqrt(N) * Table A at every one of the 18 N -- a scale
+    offset, not a formula difference, so the two pages saw slightly different value sets. It
+    matters only because re-deriving xmult from Table A gives 9.8266, not the published
+    9.6931, and someone will eventually try.
+    """
+    ratio = CL_TABLE_B / (CL_TABLE_A * np.sqrt(CL_NS))
+    assert ratio.min() > 1.013 and ratio.max() < 1.017, (ratio.min(), ratio.max())
+    from_a = float(np.mean(1.0 / (CL_TABLE_A * np.sqrt(CL_NS))))
+    assert abs(from_a - 9.8266) < 1e-3, from_a
+    assert abs(from_a - CL_XMULT) > 0.1, "the two tables would have to agree for this to pass"
+
+
+def test_unit3_xmult_rejects_bad_input() -> None:
+    """Every guard, each for something a caller can actually hit."""
+    rows = np.ones((3, 100), np.float32) * np.arange(100, dtype=np.float32)
+    ns = np.array([3, 4, 5])
+    ok = np.ones(100, bool)
+
+    def rejects(fragment: str, *args) -> None:
+        try:
+            rmv.xmult(*args)
+        except ValueError as exc:
+            assert fragment in str(exc), f"wrong message for {fragment!r}: {exc}"
+        else:
+            raise AssertionError(f"accepted input that should raise {fragment!r}")
+
+    rejects("one row per n", rows, ok, np.array([3, 4]))       # ns/matrix length mismatch
+    rejects("one row per n", rows[0], ok, ns)                  # 1-D matrix
+    rejects("mask must be", rows, np.ones(99, bool), ns)       # mask/series length mismatch
+    # The one a caller will actually write: `Bars.gate` is int8, and numpy reads an integer
+    # array as fancy indexing, not as a mask -- row[gate] returns row[0]/row[1] repeatedly and
+    # the resulting sd looks perfectly reasonable. Must raise, never guess.
+    rejects("mask must be", rows, np.ones(100, np.int8), ns)
+    rejects("mask must be", rows, np.arange(100), ns)
+    rejects("fewer than 2 bars", rows, np.zeros(100, bool), ns)
+    one = np.zeros(100, bool)
+    one[7] = True                                          # ddof=1 on one sample is NaN
+    rejects("fewer than 2 bars", rows, one, ns)
+    rejects("not finite", np.full((3, 100), np.nan, np.float32), ok, ns)
+    rejects("nothing to average", rows, ok, np.array([21, 22, 23]))  # every n > CAL_N_MAX
+    rejects("is 0.0 at n=3", np.zeros((3, 100), np.float32), ok, ns)  # constant slice
+
+    # The mask is honoured, and it is not optional: leaving warmup zeros in alone moves the
+    # answer by more than 1%, which is the whole reason there is no default.
+    warm = rows.copy()
+    warm[:, :20] = 0.0
+    unmasked = rmv.xmult(warm, ok, ns)
+    masked = rmv.xmult(warm, np.arange(100) >= 20, ns)
+    assert abs(masked - unmasked) > 0.01 * unmasked, (masked, unmasked)
+
+
+def test_unit3_sqrt_n_law_holds_for_spy() -> None:
+    """SPEC §1.2's premise: sd(RMedV) falls as 1/sqrt(N). Verified on SPY, not assumed.
+
+    SPY's log-log slope is -0.539 against the law's -0.5; [M25]'s own CL table is -0.567, so
+    SPY is steeper than the law by *less* than his data is. The whole normalization rests on
+    this being approximately true, and the residual is exactly why the done-when is +-0.15
+    for N>=5 rather than +-0.05 everywhere.
+    """
+    real = _real_series()
+    if real is None:
+        print("       (skipped: no cache)")
+        return
+    rows, _, _ = real
+    ns = rmv.N_VALUES
+    sd = np.std(rows, axis=1, ddof=1)
+
+    assert np.all(np.diff(sd) < 0), "sd(RMedV) is not monotonically falling in N"
+    slope = float(np.polyfit(np.log(ns[ns <= 20]), np.log(sd[ns <= 20]), 1)[0])
+    assert -0.60 < slope < -0.50, f"log-log slope {slope:.4f} is not near the -0.5 law"
+
+    cl_slope = float(np.polyfit(np.log(CL_NS), np.log(CL_TABLE_A), 1)[0])
+    assert slope > cl_slope, f"SPY {slope:.4f} should be shallower than CL {cl_slope:.4f}"
+
+    # [M25 p.27] leads with sd(4)/sd(20) = 2.51 as the spread one vup range cannot cover.
+    ratio = float(sd[1] / sd[17])
+    assert 2.3 < ratio < 2.7, f"sd(4)/sd(20) = {ratio:.3f}, expected ~2.47"
+
+
+def test_unit3_frozen_xmult_does_not_transfer() -> None:
+    """The measurement that killed `norm.json`, kept re-runnable (PLAN Unit 3).
+
+    A single frozen multiplier was the planned deliverable. Calibrated on 2016-17 it is
+    ~3.2x off over 2018-25 -- RMedV is dollars per bar, and SPY went $210 -> $690 through a
+    6x range of realized vol. PLAN Unit 3 pre-registered the trigger as a ~2x swing in the
+    per-year diagnostic; the measured swing is 6.45x, and in the worst year 34.8% of gated
+    bars sit beyond the top of the 0.25..3.50 grid, where every combo is a clone of every
+    other.
+
+    This asserts the *failure*, so it is a watch on the decision rather than on the code: if
+    SPY ever stops behaving this way, this test fails and the frozen option reopens.
+    """
+    real = _real_series()
+    if real is None:
+        print("       (skipped: no cache)")
+        return
+    rows, _, et = real
+    ns = rmv.N_VALUES
+    years = et.year.to_numpy()
+
+    calibrated = rmv.xmult(rows, years <= 2017, ns)
+    assert abs(calibrated - XMULT_FROZEN_2016_17) < 1e-3, calibrated
+
+    held_out = _norm_sd(rows[:, years >= 2018], ns, calibrated)
+    off = np.abs(held_out - 1.0)[ns >= 5]
+    assert off.min() > 1.0, (
+        f"frozen xmult is within {off.min():.2f} of 1.0 on held-out data -- PLAN Unit 3's "
+        "+-0.15 done-when may now be reachable, so revisit norm.json"
+    )
+
+    per_year = np.array([
+        _norm_sd(rows[:, years == y], ns, calibrated).mean()
+        for y in range(2016, 2027) if (years == y).sum() > 1000
+    ])
+    swing = per_year.max() / per_year.min()
+    assert swing > 2.0, f"per-year swing {swing:.2f}x is inside PLAN's 2x tolerance"
+
+    # The tail is not opened here. Asserted against a literal, not against TAIL_START:
+    # comparing the data to the constant that cut it can never fail, and this unit already
+    # published one table computed over the withheld period before that was noticed.
+    assert str(et[-1]) == "2026-02-27 15:50:00-05:00", et[-1]
+
+
+def test_unit3_per_window_xmult_spans_the_grid() -> None:
+    """The replacement done-when: normalization is refitted per IS window (SPEC §1.2).
+
+    PLAN Unit 3 asked for normalized sd within +-0.15 for N>=5. Frozen, that holds in 9% of
+    windows; refitted per window it holds in 100%, worst case 0.142 -- and N=21..24 are
+    genuine extrapolation, since xmult only averages N=3..20.
+
+    Windows here are 21 gated sessions stepping 5, which is Unit 7's IS/OOS shape in bar
+    space without pre-empting its calendar. Unit 7 owns the real window generator.
+    """
+    real = _real_series()
+    if real is None:
+        print("       (skipped: no cache)")
+        return
+    rows, starts, _ = real
+    ns = rmv.N_VALUES
+    big = ns >= 5
+    sessions = starts.size - 1
+    assert sessions > 2500, f"only {sessions} sessions -- fixture too small"
+
+    win_ok = frozen_ok = windows = 0
+    worst = 0.0
+    oos_win, oos_frozen = [], []
+    for s in range(21, sessions - 5, 5):
+        is_slice = rows[:, starts[s - 21] : starts[s]]
+        oos_slice = rows[:, starts[s] : starts[s + 5]]
+        if is_slice.shape[1] < 500 or oos_slice.shape[1] < 100:
+            continue
+        windows += 1
+        mult = rmv.xmult(is_slice, np.ones(is_slice.shape[1], bool), ns)
+
+        dev = np.abs(_norm_sd(is_slice, ns, mult) - 1.0)[big]
+        win_ok += dev.max() <= 0.15
+        worst = max(worst, float(dev.max()))
+        frozen_dev = np.abs(_norm_sd(is_slice, ns, XMULT_FROZEN_2016_17) - 1.0)[big]
+        frozen_ok += frozen_dev.max() <= 0.15
+
+        oos_win.append(np.median(np.abs(_norm_sd(oos_slice, ns, mult) - 1.0)[big]))
+        oos_frozen.append(
+            np.median(np.abs(_norm_sd(oos_slice, ns, XMULT_FROZEN_2016_17) - 1.0)[big])
+        )
+
+    assert windows > 400, f"only {windows} windows"
+    assert win_ok / windows >= 0.99, (
+        f"per-window normalization holds +-0.15 in only {win_ok / windows:.1%} of windows "
+        f"(worst deviation {worst:.3f})"
+    )
+    # Without this the test would pass on any multiplier at all, frozen included.
+    assert frozen_ok / windows < 0.20, (
+        f"frozen xmult holds in {frozen_ok / windows:.1%} of windows -- the test no longer "
+        "distinguishes the two options"
+    )
+
+    # The honest caveat, bounded so a regression shows up. Refitting fixes the *in-sample*
+    # scale exactly; next week's scale is still only predicted, at a median 26% error. That
+    # is strategy risk for Unit 7 to carry, not a normalization defect -- but Unit 8 should
+    # know that a vup chosen on IS lands on an OOS week whose sd differs by about a quarter.
+    med_win, med_frozen = float(np.median(oos_win)), float(np.median(oos_frozen))
+    assert med_win < 0.40, f"OOS transfer degraded: median |sd-1| = {med_win:.3f}"
+    assert med_win < med_frozen / 2, (med_win, med_frozen)
+    # The tail is what Unit 9 will feel, not the median: 12 of 506 OOS weeks come in at more
+    # than 2x their IS scale, which is the saturation regime the frozen constant was rejected
+    # for. Bounded so a regression is visible rather than averaged away.
+    p99 = float(np.percentile(oos_win, 99))
+    assert p99 < 2.0, f"OOS transfer p99 |sd-1| = {p99:.3f}"
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -137,3 +137,73 @@ def rmv_all_n(
 
     _rmv_kernel(close, ns, out)
     return out
+
+
+# --------------------------------------------------------------- normalization (Unit 3)
+
+# SPEC §1.2: the Appendix averages 1/sd over N=3..20, *not* over the full 3..24 grid.
+# Averaging the whole grid instead moves xmult by 0.85% -- small enough to go unnoticed,
+# and not the published method.
+CAL_N_MAX = 20
+
+
+def xmult(rmv_matrix: np.ndarray, mask: np.ndarray, ns: np.ndarray = N_VALUES) -> float:
+    """Normalization multiplier for one slice: `mean_N( 1 / sd(RMedV_N * sqrt(N)) )`.
+
+    SPEC §1.2. `RMedV * xmult * sqrt(N)` then has sd ~ 1 across every N at once, so the
+    single 0.25..3.50 `(vup, vdn)` grid means the same thing at N=3 and at N=24. It is a
+    unit conversion, not a strategy parameter.
+
+    Callers scale **thresholds, not rows**: `RMedV_norm >= vup` is
+    `RMedV >= vup / (xmult * sqrt(n))`, which is 14 divisions per n instead of a second
+    22 x T matrix. Measured over 55.5M real (bar, n, v) triples the two orderings agree
+    everywhere, but pin the convention anyway so backtest and live cannot drift apart.
+
+    `mask` is required, and is meant to be `bars.gate == 1`. Warmup zeros and bars whose
+    window straddles a session gap are not RMedV values, and including them inflates sd
+    by 22.8% at N=3 (PLAN Unit 3). There is no defensible default, so it has to be
+    spelled -- an unmasked row is a silent 20% error, not a crash.
+
+    ⚠ **Per window, never frozen.** A constant fitted to one slice does not transfer:
+    calibrated on 2016-17 SPY it lands 3.2x off over 2018-25, and the per-year signal
+    scale swings 6.45x against PLAN Unit 3's 2x tolerance. Unit 7 calls this once per
+    IS window and applies the result to that window's IS *and* OOS grid runs -- the IS
+    window strictly precedes its OOS, so there is no look-ahead. Evidence, including what
+    refitting does *not* fix, is in SPEC §1.2.1.
+    """
+    ns = np.asarray(ns)
+    if rmv_matrix.ndim != 2 or ns.shape != (rmv_matrix.shape[0],):
+        raise ValueError(
+            f"rmv_matrix must be 2-D with one row per n; got {rmv_matrix.shape} against "
+            f"{ns.size} n values"
+        )
+    mask = np.asarray(mask)
+    if mask.dtype != np.bool_ or mask.shape != (rmv_matrix.shape[1],):
+        # dtype is not pedantry. `Bars.gate` is int8, and `row[int8_gate]` is *integer* fancy
+        # indexing: it silently returns row[0] and row[1] over and over and the sd it produces
+        # looks entirely plausible. Pass `gate == 1`.
+        raise ValueError(
+            f"mask must be bool[{rmv_matrix.shape[1]}], got {mask.dtype}{mask.shape}"
+        )
+    sel = np.flatnonzero(ns <= CAL_N_MAX)
+    if sel.size == 0:
+        raise ValueError(f"no n <= {CAL_N_MAX} in ns; there is nothing to average over")
+    if int(np.count_nonzero(mask)) < 2:
+        raise ValueError("mask selects fewer than 2 bars; sd is undefined")
+
+    inv = np.empty(sel.size, dtype=np.float64)
+    for k, a in enumerate(sel):
+        # One row at a time: the mask copies the row, and doing all 22 at once in float64
+        # would peak at 33 MB on the full sample to produce a single float. ddof=1 vs 0
+        # moves the result by 2.8e-6 relative here, and the float64 promotion by 4.7e-6 --
+        # both immaterial, both pinned so two callers cannot disagree, and the promotion
+        # kept for the same reason as `_rmv_kernel`'s (SPEC §7): the guarantee holds for
+        # any input range, and no test can distinguish it on this one.
+        sd = np.std(rmv_matrix[a][mask].astype(np.float64), ddof=1)
+        if not np.isfinite(sd) or sd == 0.0:
+            # A NaN here is worse than a crash: it makes every threshold NaN, every
+            # `RMedV >= NaN` False, and the window a silent flat week instead of an error.
+            # `rmv_all_n` rejects a non-finite close for the same reason.
+            raise ValueError(f"sd(RMedV) is {sd} at n={ns[a]}; the slice is constant or not finite")
+        inv[k] = 1.0 / (sd * np.sqrt(ns[a]))
+    return float(inv.mean())
