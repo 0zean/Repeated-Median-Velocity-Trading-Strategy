@@ -285,6 +285,7 @@ a cache tier, or a distributed runner is solving a problem this project does not
 ## 3. Units of work
 
 Each unit: one sitting, one testable deliverable, then an adversarial review, then **stop**.
+DO NOT spawn many subagents during work to avoid hitting usage limits, only spawn the one adversarial subagent for review.
 
 ---
 
