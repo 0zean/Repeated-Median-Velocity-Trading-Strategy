@@ -207,3 +207,265 @@ def xmult(rmv_matrix: np.ndarray, mask: np.ndarray, ns: np.ndarray = N_VALUES) -
             raise ValueError(f"sd(RMedV) is {sd} at n={ns[a]}; the slice is constant or not finite")
         inv[k] = 1.0 / (sd * np.sqrt(ns[a]))
     return float(inv.mean())
+
+
+# ----------------------------------------------------------------- simulation (Unit 4)
+
+# Column meaning of the trades array. A name, so a caller reading `trades[:, 3]` does not
+# have to count and a reordering breaks loudly.
+TRADE_COLS = ("entry", "exit", "dir", "net")
+
+
+@njit(cache=True)
+def threshold(v: float, xmult: float, n: int) -> float:
+    """`RMedV_norm >= v` is `RMedV >= threshold(v, xmult, n)`. SPEC §1.2, PLAN Unit 6.
+
+    **The only place this expression exists.** Unit 6 hoists it per `(n, v)` -- 14 divisions
+    per n, not one per combo -- Unit 7 stores the window's `xmult`, Unit 11 writes it to
+    `params.json`, and Unit 12b calls this per bar off that file. One expression means one
+    rounding, so backtest, grid, replay and live cannot land on opposite sides of a
+    boundary. Written `v / (xmult * sqrt(n))` and never `v / xmult / sqrt(n)`, which rounds
+    twice and is a different float64.
+
+    `njit` so Unit 6 can call it from inside `prange`; it is callable from Python too.
+    Deliberately unguarded: `xmult <= 0` would invert the inequality and NaN would make
+    every comparison False, but a raise inside a parallel region is not something to rely
+    on, and `simulate` rejects the non-positive or non-finite threshold that comes out.
+    """
+    return v / (xmult * np.sqrt(n))
+
+
+@njit(cache=True)
+def _simulate(
+    rmv_row: np.ndarray,
+    close: np.ndarray,
+    gate: np.ndarray,
+    vup: float,
+    vdn: float,
+    cost: float,
+    out: np.ndarray,
+) -> int:
+    """Fill `out` with closed trades and return how many. SPEC §2.
+
+    Called from inside Unit 6's `prange` with a caller-owned buffer, so it allocates
+    nothing. See `simulate` for the contract -- this is the same code without the guards.
+
+    The `np.float64()` promotions on `close` below are not load-bearing and no test can
+    distinguish them, exactly as in `_rmv_kernel`: both prices in a trade come from one
+    session, so Sterbenz's lemma makes the float32 subtraction exact. Measured over 500,000
+    pairs, **0** same-session subtractions differ from their float64 result, against **31,606**
+    drawn from the full $180-$690 range. They are kept because the guarantee then holds for
+    any input range rather than for this one -- and the day PLAN §8-F's overnight erratum is
+    tested, a trade *can* span sessions and the range assumption stops holding.
+    """
+    total = close.shape[0]
+    k = 0
+    pos = 0  # -1 short, 0 flat, +1 long
+    entry = 0
+    for t in range(total):
+        if gate[t] != 1:
+            if pos != 0:
+                # The gate went 1->0, so t-1 was the last bar the position could be held on
+                # and its close is the fill. On a regular session that bar opens 15:50 and
+                # closes 15:55 -- exactly SPEC §2's "flat at 15:55". t >= 1 always holds
+                # here, because pos != 0 requires an earlier gated bar.
+                #
+                # ponytail: one exit rule for both reasons the gate can shut. Ceiling:
+                # 2 of 2,682 1->0 edges are not the scheduled clock exit -- 2016-02-02
+                # (one missing 5-minute bucket) and 2020-03-18 (the LULD halt) -- and on
+                # those, close[t-1] means "assume you got out before the gap". That is
+                # optimistic whenever the gap runs *toward* the position; it came out
+                # conservative on this sample only because the grid was net short into both
+                # down-gaps, which is a fact about the sample and not a property of the
+                # rule. Fixing it would need a day index in the signature. Revisit if a
+                # refresh pushes non-scheduled edges above ~0.5% of the total.
+                out[k, 0] = entry
+                out[k, 1] = t - 1
+                out[k, 2] = pos
+                out[k, 3] = pos * (np.float64(close[t - 1]) - np.float64(close[entry])) - cost
+                k += 1
+                pos = 0
+            continue
+        if t == 0:
+            # Not defensive padding. In numba `rmv_row[-1]` is the LAST element, not an
+            # error, so without this a slice whose first bar is gated would read the end of
+            # the window as its own previous bar: end-of-window look-ahead, no exception.
+            # Unit 7's week-anchored windows never start gated, which is exactly why this
+            # has to be pinned here rather than discovered by a test that cannot fire.
+            continue
+
+        cur = np.float64(rmv_row[t])
+        prev = np.float64(rmv_row[t - 1])
+        # SPEC §2 crossing rules, both bounds inclusive, with the system's only negation of
+        # vdn (which is a positive number compared against a negative velocity). Dropping
+        # either `prev` term turns these back into the superseded 2005 *level* rules --
+        # measured on a 4000-bar walk at n=24, 71 buy signals become 1294 (`rmv_all_n`).
+        # No warmup or session guard is needed on `prev`, but only while max(ns) <= MAX_N:
+        # blackout puts the first gated bar MAX_N + 1 bars past a gap, and `gate[:MAX_N]`
+        # is 0, so over
+        # the real sample 0 of 189,373 gated bars have a t-1 that is warmup, in another
+        # session, or across a gap. That margin is exactly zero (SPEC §3.1).
+        # The branches are mutually exclusive for vup, vdn > 0: cur cannot be both
+        # >= vup > 0 and <= -vdn < 0.
+        sig = 0
+        if cur >= vup and prev < vup:
+            sig = 1
+        elif cur <= -vdn and prev > -vdn:
+            sig = -1
+        if sig == 0 or sig == pos:
+            continue  # no signal, or already positioned that way -- hold (SPEC §2)
+
+        if t + 1 >= total or gate[t + 1] != 1:
+            # t is the last gated bar of its run, so a position opened at its close would be
+            # flattened at that same close: zero bars, zero gross, exactly -cost. Live
+            # flattens at 15:55, it does not also enter, so booking these would charge a
+            # cost live never pays and break the Unit 12a parity check. Measured over the
+            # pre-tail sample they are 1.74% of all trades (1.0-3.2% by combo), and the skip
+            # removes *exactly* the trades whose exit index equals their entry index --
+            # 0 discrepancies over 16 (n, v) combos, and nT drops by precisely the zero-bar
+            # count. This is also what makes Unit 7's "N trades = N round trips" identity
+            # true, so the cost convention and this skip are one decision.
+            #
+            # Skipping outright is right even mid-position: holding to the 1->0 edge one bar
+            # later exits at close[t], the same fill a reversal here would have taken, so
+            # the two are provably the same output and one branch beats two.
+            #
+            # ponytail: reading gate[t+1] rather than recomputing the session cut. Not price
+            # look-ahead -- 2,680 of 2,682 1->0 edges are pure clock, known from
+            # cache/nyse_calendar.json before the session opens, and live knows them too.
+            # Ceiling: the blackout term keys on the *next* bar's arrival (data.build_gate),
+            # which live cannot know at t. That is 2 of 189,373 gated bars, plus the one
+            # session in 2,680 whose data stops early (2019-08-12, last bar 15:30). On those
+            # three the backtest skips an entry live would take -- a deleted trade, not a
+            # conservative one. Fixing it needs the calendar in this signature; not worth it
+            # at 0.0016% of gated bars.
+            continue
+
+        if pos != 0:
+            # Stop-and-reverse: the old position closes at this bar's close and the new one
+            # opens at the same price. Each side is a trade and each pays `cost`, which is
+            # what PLAN Unit 9's `trades x shares x (slippage + SEC/TAF)` check counts.
+            out[k, 0] = entry
+            out[k, 1] = t
+            out[k, 2] = pos
+            out[k, 3] = pos * (np.float64(close[t]) - np.float64(close[entry])) - cost
+            k += 1
+        pos = sig
+        entry = t
+
+    if pos != 0:
+        # The array ended while still gated. One session in 2,680 does this in place
+        # (2019-08-12, whose data stops at 15:30), and any slice that is not session-aligned
+        # can. Force-closing is the only option under which every entry has a matching exit,
+        # which is what Unit 5's trade-indexed equity needs; and the `t + 1 >= total` skip
+        # above means the position being closed here was always opened strictly earlier, so
+        # this can never emit a zero-bar trade.
+        out[k, 0] = entry
+        out[k, 1] = total - 1
+        out[k, 2] = pos
+        out[k, 3] = pos * (np.float64(close[total - 1]) - np.float64(close[entry])) - cost
+        k += 1
+    return k
+
+
+def simulate(
+    rmv_row: np.ndarray,
+    close: np.ndarray,
+    gate: np.ndarray,
+    vup: float,
+    vdn: float,
+    cost: float,
+    out: np.ndarray | None = None,
+) -> np.ndarray:
+    """Trades from one RMedV row under SPEC §2. Returns a float64[k, 4] view of `out`.
+
+    Columns are `TRADE_COLS`: entry bar index, exit bar index, direction (+1 long, -1
+    short) and **net** profit per share (gross minus `cost`). Gross is `net + cost` and
+    bars-held is `exit - entry`, so nothing else is stored. `cost` is one round trip per
+    completed trade; a stop-and-reverse bar closes one trade and opens another and is
+    charged twice, which is what PLAN Unit 9's `trades x shares x (slippage + SEC/TAF)`
+    sanity check counts.
+
+    ⚠ **`vup` and `vdn` are raw RMedV thresholds -- price per bar -- not grid units.**
+    Build them with `rmv.threshold(v, xmult, n)`, which is the only producer of this unit;
+    Unit 6 hoists it per `(n, v)`. Both are positive: `vdn` is compared against `-vdn`
+    internally, matching the paper's positive down-threshold against a negative velocity.
+
+    Nothing here can detect a wrong-units caller, in either direction, and two of the three
+    failure modes return a complete, plausible-looking backtest rather than nothing:
+
+    1. grid units passed as raw -- the threshold is then 5.3x (n=3) to 15.0x (n=24) too
+       large at the median `xmult`, and 24x at SPEC §1.2.1's quiet extreme: few or no trades.
+    2. a raw threshold built from the **wrong window's** `xmult` -- that spans 20.4x across
+       the 506 windows (SPEC §1.2.1), so a stale or global multiplier is still an entirely
+       plausible positive float and the run completes with plausible metrics. This is the
+       one that can smuggle look-ahead past Unit 7 in silence.
+    3. a threshold scaled for a different `n` than `rmv_row` -- `n` is not an argument here,
+       so not checkable at this boundary even in principle.
+
+    None of the three is closed by validation; they are closed structurally, by
+    `rmv.threshold` being the single expression and by Unit 12a's replay proving the
+    backtest and live paths agree.
+
+    `out` is a caller-owned buffer of at least `len(close)` rows, reused across Unit 6's
+    4312 combos. A trade opens only on a gated bar and at most one per bar, so that many
+    rows can never overflow.
+    """
+    # Made contiguous but never re-typed: a strided window view would otherwise make numba
+    # compile a second layout specialization, and this is a no-op when it already is one.
+    close = np.ascontiguousarray(close)
+    rmv_row = np.ascontiguousarray(rmv_row)
+    gate = np.ascontiguousarray(gate)
+    total = close.shape[0]
+
+    # Dtypes are checked, not coerced. Coercing a float64 rmv_row down to float32 would
+    # round it onto the other side of a threshold and silently change the trade list --
+    # the same class of defect as Unit 3's int8 mask. These are the dtypes Unit 2 and
+    # `data.Bars` already produce, so a caller holding anything else has a bug upstream.
+    if close.ndim != 1 or close.dtype != np.float32:
+        raise ValueError(f"close must be 1-D float32, got {close.dtype}{close.shape}")
+    if rmv_row.shape != (total,) or rmv_row.dtype != np.float32:
+        # shape, not just ndim -- this is what catches passing the whole 22 x T matrix.
+        raise ValueError(f"rmv_row must be float32[{total}], got {rmv_row.dtype}{rmv_row.shape}")
+    if gate.shape != (total,) or gate.dtype != np.int8:
+        raise ValueError(
+            f"gate must be int8[{total}] -- pass `bars.gate`, or `mask.astype(np.int8)` -- "
+            f"got {gate.dtype}{gate.shape}"
+        )
+    if not np.all((gate == 0) | (gate == 1)):
+        # The kernel asks `gate[t] != 1`, so a stray 2 would read as flat while the equally
+        # natural `gate[t] == 0` would read it as tradeable. One O(T) scan buys the right to
+        # not care which one the kernel happens to use.
+        raise ValueError("gate must contain only 0 and 1")
+    for name, value in (("vup", vup), ("vdn", vdn)):
+        if not np.isfinite(value) or value <= 0.0:
+            # Not pedantry: a non-positive threshold makes the two crossing branches overlap
+            # and a negative vdn fires the sell rule on nearly every bar, while a NaN makes
+            # every comparison False -- a silent flat window rather than an error. This is
+            # also where a non-positive or NaN `xmult` surfaces, since `rmv.threshold`
+            # passes it straight through.
+            raise ValueError(
+                f"{name} must be a finite positive raw threshold from rmv.threshold "
+                f"(a non-positive one means xmult was non-positive), got {value}"
+            )
+    if not np.isfinite(cost) or cost < 0.0:
+        # A negative cost silently inflates every Unit 5 metric.
+        raise ValueError(f"cost must be finite and >= 0, got {cost}")
+
+    if out is None:
+        out = np.empty((total, 4), dtype=np.float64)
+    elif out.dtype != np.float64 or out.ndim != 2 or out.shape[1] != 4:
+        raise ValueError(f"out must be float64[k, 4], got {out.dtype}{out.shape}")
+    elif out.shape[0] < total:
+        raise ValueError(f"out has {out.shape[0]} rows; {total} bars need at least that many")
+    elif not out.flags["C_CONTIGUOUS"]:
+        raise ValueError("out must be C-contiguous")
+    elif any(np.shares_memory(out, a) for a in (close, rmv_row, gate)):
+        # `gate` belongs here as much as the other two: the kernel writes `out[k]` as it goes
+        # and reads `gate[t]` afterwards, so an aliased gate is corrupted mid-loop. Checked
+        # after the contiguity conversion, because a strided input is copied away first and
+        # the alias would no longer exist to find.
+        raise ValueError("out aliases close, rmv_row or gate; the kernel would overwrite its input")
+
+    k = _simulate(rmv_row, close, gate, float(vup), float(vdn), float(cost), out)
+    return out[:k]

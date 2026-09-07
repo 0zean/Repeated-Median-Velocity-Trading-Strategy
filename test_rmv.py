@@ -6,6 +6,7 @@ One test function per unit of work (see PLAN.md §3).
 from __future__ import annotations
 
 import functools
+import math
 import re
 import shutil
 import subprocess
@@ -998,25 +999,40 @@ TAIL_START = datetime(2026, 3, 1, tzinfo=timezone.utc)
 
 
 @functools.cache
-def _real_series():
-    """Full-sample RMedV, restricted to gated bars before the withheld tail.
+def _real_bars():
+    """Full-sample `Bars` and RMedV matrix, cache-only, truncated before the withheld tail.
 
-    Returns `(rows float64[22, G], session_start int64[S+1], et)` or None when there is no
-    cache. ponytail: a missing cache makes the three real-data tests print "(skipped)" and
-    still count as PASS, so the empirical basis of Unit 3's whole conclusion can evaporate
-    quietly. Deferred, not accepted -- it is the pattern Units 1 and 2 already use, and the
-    fix (a skip count in `main`) belongs to all three units at once, not to this one. ~5 s, so the Unit 3 tests share one copy. Gated bars are gathered once into a
-    contiguous matrix; every window below is then a slice, not a mask over 257k booleans.
+    Returns `(bars, matrix float32[22, T])` or None when there is no cache. ~5 s, so Units 3
+    and 4 share one copy. Truncating on load rather than masking afterwards is what keeps
+    the tail structurally out of reach, and it changes nothing: RMedV at t reads only bars
+    t-n+1..t, and the gate's rules are all backward-looking, so every retained value is
+    identical to the same bar in a full-sample load.
+
+    ponytail: a missing cache makes every real-data test print "(skipped)" and still count
+    as PASS, so the empirical basis of Units 3 and 4 can evaporate quietly. Deferred, not
+    accepted -- the fix (a skip count in `main`) belongs to Units 1-4 at once, not to one.
     """
     npz, _ = data._cache_paths("SPY", "sip")
     if not npz.exists():
         return None
     bars = data.load_bars(
-        "SPY", datetime(2016, 1, 1, tzinfo=timezone.utc),
-        datetime(2026, 9, 1, tzinfo=timezone.utc), refresh=False,
+        "SPY", datetime(2016, 1, 1, tzinfo=timezone.utc), TAIL_START, refresh=False,
     )
-    matrix = rmv.rmv_all_n(bars.close)
-    keep = np.flatnonzero((bars.gate == 1) & (bars.ts < data._to_ns(TAIL_START)))
+    return bars, rmv.rmv_all_n(bars.close)
+
+
+@functools.cache
+def _real_series():
+    """Gated pre-tail RMedV as one contiguous float64 matrix, plus session bounds and ET.
+
+    Returns `(rows float64[22, G], session_start int64[S+1], et)` or None. Gated bars are
+    gathered once, so every window below is a slice rather than a mask over 257k booleans.
+    """
+    got = _real_bars()
+    if got is None:
+        return None
+    bars, matrix = got
+    keep = np.flatnonzero(bars.gate == 1)
     et = data.to_et(bars.ts[keep])
     day = et.normalize().asi8
     # First position of each session, plus a terminating bound, so sessions s..e are
@@ -1251,6 +1267,712 @@ def test_unit3_per_window_xmult_spans_the_grid() -> None:
     # for. Bounded so a regression is visible rather than averaged away.
     p99 = float(np.percentile(oos_win, 99))
     assert p99 < 2.0, f"OOS transfer p99 |sd-1| = {p99:.3f}"
+
+
+# --------------------------------------------------------------------- unit 4: simulation
+
+# SPEC §3.2: $0.01/share round-trip slippage + ~$0.017/share SEC/TAF on the sell. One
+# scalar per trade; the notional-scaling half of that is Unit 9's to verify, not Unit 4's.
+COST = 0.027
+
+
+def _sim_reference(rmv_row, close, gate, vup, vdn, cost) -> list[tuple]:
+    """Deliberately slow, obviously-correct pure Python. PLAN Unit 4 asks for exactly this.
+
+    Structured differently from the kernel on purpose. The kernel makes one linear pass and
+    notices the gate's 1->0 edge as it goes; this splits the series into maximal runs of
+    `gate == 1` first and then trades inside each, where "flatten at the end of the run" and
+    "never open on the run's last bar" are single visible statements. Two implementations
+    that share a shape share their bugs.
+    """
+    runs, lo = [], None
+    for t in range(len(close)):
+        if gate[t] == 1 and lo is None:
+            lo = t
+        elif gate[t] != 1 and lo is not None:
+            runs.append((lo, t - 1))
+            lo = None
+    if lo is not None:
+        runs.append((lo, len(close) - 1))
+
+    trades = []
+    for lo, hi in runs:
+        pos, entry = 0, None
+        for t in range(lo, hi + 1):
+            if t == 0:
+                continue  # no predecessor bar, so no crossing exists
+            cur, prev = float(rmv_row[t]), float(rmv_row[t - 1])
+            if cur >= vup and prev < vup:
+                sig = 1
+            elif cur <= -vdn and prev > -vdn:
+                sig = -1
+            else:
+                sig = 0
+            if sig == 0 or sig == pos or t == hi:
+                # t == hi: an entry here would fill at the same close its own forced exit
+                # fills at, so it is a guaranteed -cost trade and live would never take it.
+                continue
+            if pos != 0:
+                trades.append((entry, t, pos, pos * (float(close[t]) - float(close[entry])) - cost))
+            pos, entry = sig, t
+        if pos != 0:  # SPEC §2's flat-at-15:55, filled on the run's last bar
+            trades.append((entry, hi, pos, pos * (float(close[hi]) - float(close[entry])) - cost))
+    return trades
+
+
+def _random_case(rng) -> tuple:
+    """One random (rmv_row, close, gate, vup, vdn).
+
+    Half the cases draw the thresholds straight out of `rmv_row`, so `RMedV[t] == vup` holds
+    exactly and the `>=` boundary is genuinely exercised rather than merely reachable. That
+    is only constructible because `simulate` takes raw thresholds: a grid-unit boundary would
+    have to survive a division, which lands exactly only ~91% of the time.
+    """
+    total = int(rng.integers(30, 300))
+    close = (400.0 + np.cumsum(rng.normal(0, 0.15, total))).astype(np.float32)
+
+    gate = np.zeros(total, np.int8)
+    for _ in range(int(rng.integers(1, 5))):  # a few runs, sometimes touching either end
+        lo = int(rng.integers(0, total))
+        gate[lo : lo + int(rng.integers(1, 60))] = 1
+
+    if rng.random() < 0.5:
+        rmv_row = (rng.integers(-24, 25, total) / 8.0).astype(np.float32)
+        pick = lambda: abs(float(rmv_row[rng.integers(total)])) or 0.125  # noqa: E731
+        vup, vdn = pick(), pick()
+    else:
+        rmv_row = rng.normal(0, 0.4, total).astype(np.float32)
+        n = int(rng.integers(3, 25))
+        xmult = float(rng.uniform(0.679, 13.830))  # SPEC §1.2.1's measured per-window span
+        vup = rmv.threshold(float(rng.uniform(0.25, 3.5)), xmult, n)
+        vdn = rmv.threshold(float(rng.uniform(0.25, 3.5)), xmult, n)
+    return rmv_row, close, gate, vup, vdn
+
+
+def test_unit4_threshold_is_the_only_conversion() -> None:
+    """`rmv.threshold` is `v / (xmult * sqrt(n))` with one rounding, and that matters.
+
+    PLAN Unit 6 pins the convention so backtest, grid, replay and live cannot drift onto
+    opposite sides of a boundary. A second call site that wrote the algebraically identical
+    `v / xmult / sqrt(n)` would land on a different float64 in about a third of cases, which
+    is why "one expression" is the invariant and not a stylistic preference.
+    """
+    rng = np.random.default_rng(3)
+    n = rng.integers(3, 25, 200_000)
+    xmult = rng.uniform(0.679, 13.830, 200_000)  # SPEC §1.2.1's measured per-window span
+    v = rng.choice(np.arange(1, 15) * 0.25, 200_000)  # SPEC §3.3's grid
+
+    one = v / (xmult * np.sqrt(n))
+    two = v / xmult / np.sqrt(n)
+    apart = int(np.count_nonzero(one != two))
+    assert apart > 20_000, (
+        f"the two association orders differ in only {apart}/200000 draws -- if they have "
+        "become identical, `threshold`'s one-expression rationale needs restating"
+    )
+    assert np.max(np.abs(one - two) / one) < 1e-15, "a 1-ulp claim, not a real disagreement"
+
+    for i in (0, 1, 12345, 199_999):
+        got = rmv.threshold(float(v[i]), float(xmult[i]), int(n[i]))
+        assert got == float(one[i]), f"threshold is not the pinned expression: {got} != {one[i]}"
+    # And the direction of the conversion: a grid value is far larger than its raw threshold,
+    # which is why passing one for the other is silent rather than loud (SPEC §1.2.1).
+    assert 5.0 < 1.0 / rmv.threshold(1.0, 3.063, 3) < 6.0
+    assert 14.0 < 1.0 / rmv.threshold(1.0, 3.063, 24) < 16.0
+
+
+def test_unit4_matches_reference_on_random_series() -> None:
+    """PLAN Unit 4's done-when: kernel == reference trade-for-trade, 1000 random cases.
+
+    Bit-exact on the net figures, not within a tolerance. Both sides do the same float64
+    arithmetic in the same order, so anything looser would hide a real divergence.
+    """
+    rng = np.random.default_rng(4)
+    boundary = traded = 0
+    for case in range(1000):
+        rmv_row, close, gate, vup, vdn = _random_case(rng)
+        got = rmv.simulate(rmv_row, close, gate, vup, vdn, COST)
+        want = _sim_reference(rmv_row, close, gate, vup, vdn, COST)
+
+        assert len(got) == len(want), (
+            f"case {case}: kernel produced {len(got)} trades, reference {len(want)}"
+        )
+        for i, (e, x, d, net) in enumerate(want):
+            assert (got[i, 0], got[i, 1], got[i, 2]) == (e, x, d), (
+                f"case {case} trade {i}: kernel {tuple(got[i, :3])} != reference {(e, x, d)}"
+            )
+            assert got[i, 3] == net, f"case {case} trade {i}: net {got[i, 3]!r} != {net!r}"
+        traded += len(want)
+        # Count exact-threshold hits so the `>=` boundary cannot quietly stop being covered.
+        boundary += int(np.count_nonzero(((rmv_row == vup) | (rmv_row == -vdn)) & (gate == 1)))
+
+    assert traded > 5000, f"only {traded} trades over 1000 cases -- the generator went inert"
+    assert boundary > 200, f"only {boundary} bars sat exactly on a threshold -- boundary untested"
+
+
+def test_unit4_hand_built_trade_list() -> None:
+    """The exact expected trade list, on a series small enough to check by hand."""
+    #                 0    1    2    3     4     5    6    7   8   9    10    11    12  13  14   15   16  17
+    gate = np.array([ 0,   0,   1,   1,    1,    1,   1,   1,  0,  0,    1,    1,    1,  0,  1,   1,   1,  0], np.int8)
+    rmvr = np.array([0., 0., 1.5, 0.5, -1.5, -0.5, 1.0, 2.0, 0., 0., -2.0, -1.0, -3.0, 0., 0., 0.5, 2.0, 0.], np.float32)
+    close = np.arange(100, 118, dtype=np.float32)
+
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+
+    # The column order is the contract Unit 5 reads by index, and nothing else pins it: a
+    # reorder of TRADE_COLS alone changes no behaviour, so it has to be asserted outright.
+    assert rmv.TRADE_COLS == ("entry", "exit", "dir", "net")
+
+    # Run [2..7]: buy the 1.5 crossing at 2; reverse short on -1.5 at 4; reverse long on the
+    #   1.0 crossing at 6. Bar 7 is not a crossing (prev is already 1.0) and is the run's last
+    #   bar anyway, so the long is flattened there by the gate.
+    # Run [10..12]: short the -2.0 crossing at 10. -1.0 and -3.0 are not crossings, because
+    #   prev is already at or below -1.0. Flattened at 12.
+    # Run [14..16]: the 2.0 crossing lands on bar 16, the run's last bar -- suppressed.
+    want = [
+        (2, 4, 1, 104.0 - 102.0 - COST),
+        (4, 6, -1, 104.0 - 106.0 - COST),
+        (6, 7, 1, 107.0 - 106.0 - COST),
+        (10, 12, -1, 110.0 - 112.0 - COST),
+    ]
+    assert len(got) == len(want), f"{len(got)} trades, expected {len(want)}:\n{got}"
+    for i, (e, x, d, net) in enumerate(want):
+        assert (got[i, 0], got[i, 1], got[i, 2]) == (e, x, d), f"trade {i}: {got[i, :3]}"
+        assert abs(got[i, 3] - net) < 1e-12, f"trade {i}: net {got[i, 3]} != {net}"
+
+
+def test_unit4_threshold_is_inclusive() -> None:
+    """SPEC §2: `>=` and `<=`. Turning either into a strict inequality drops the trade that
+    sits exactly on the threshold, which on a penny-tick instrument is not measure-zero."""
+    gate = np.ones(9, np.int8)
+    close = np.arange(100, 109, dtype=np.float32)
+
+    exact = np.array([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+    assert len(rmv.simulate(exact, close, gate, 1.0, 1.0, COST)) == 1, (
+        "a bar exactly equal to vup must trigger -- SPEC §2 says >=, not >"
+    )
+    below = exact.copy()
+    below[1] = np.nextafter(np.float32(1.0), np.float32(0.0))  # one float32 ulp under
+    assert len(rmv.simulate(below, close, gate, 1.0, 1.0, COST)) == 0
+
+    down = np.array([0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+    got = rmv.simulate(down, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 1 and got[0, 2] == -1, f"exactly -vdn must trigger a short: {got}"
+
+    # The boundary at a threshold that is not a round number, taken straight out of the row:
+    # exact by construction, which is the whole reason `vup` is raw and not a grid value.
+    odd = np.array([0.0, 0.0407123, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32)
+    assert len(rmv.simulate(odd, close, gate, float(odd[1]), 1.0, COST)) == 1
+
+
+def test_unit4_is_a_crossing_rule_not_a_level_rule() -> None:
+    """SPEC §2's 2025 rules read RMedV[t-1]; the superseded 2005 rules do not.
+
+    The two only diverge where the previous bar is already past the threshold and no
+    position is open -- which is exactly the first gated bar of a session, whose `t-1` is
+    the prior *extended-hours* bar (PLAN Unit 4 review focus, SPEC §3.1). A level rule
+    would open there; a crossing rule waits for an actual crossing. This is the shape that
+    catches dropping the `prev` term, and the one a same-direction repeat cannot catch,
+    because holding makes a repeated signal a no-op either way.
+    """
+    close = np.arange(100, 106, dtype=np.float32)
+    gate = np.array([0, 0, 1, 1, 1, 0], np.int8)
+
+    up = np.array([0.0, 2.0, 2.0, 0.0, 0.0, 0.0], np.float32)
+    assert len(rmv.simulate(up, close, gate, 1.0, 1.0, COST)) == 0, (
+        "RMedV was already above vup on the ungated bar 1, so bar 2 is not a crossing -- "
+        "a level rule opens here and this is the only place the two rules differ"
+    )
+    dn = np.array([0.0, -2.0, -2.0, 0.0, 0.0, 0.0], np.float32)
+    assert len(rmv.simulate(dn, close, gate, 1.0, 1.0, COST)) == 0
+
+    # ...and a genuine crossing on the same bar does open, so the assertions above are not
+    # passing because the gate or the run bounds swallowed everything.
+    cross = np.array([0.0, 0.0, 2.0, 0.0, 0.0, 0.0], np.float32)
+    got = rmv.simulate(cross, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 1 and (got[0, 0], got[0, 1]) == (2, 4), got
+
+
+def test_unit4_gated_first_bar_does_not_wrap_around() -> None:
+    """A slice whose bar 0 is gated must not read `rmv_row[-1]` as the prior bar.
+
+    In numba `a[-1]` is the LAST element, not an IndexError, so without the `t == 0` guard
+    the first bar of such a slice would take the END of the window as its own predecessor:
+    end-of-window look-ahead, silent, no exception. Unit 7's week-anchored windows never
+    start on a gated bar, which is precisely why this is pinned in the kernel rather than
+    left to a test that could never fire on the planned inputs.
+    """
+    close = np.arange(100, 106, dtype=np.float32)
+    gate = np.ones(6, np.int8)
+    # Bar 0 is gated and sits above vup, while the LAST bar is far below it. A wrapped
+    # `prev` would read -9.0 < 1.0, call bar 0 a crossing and open a trade there.
+    rmvr = np.array([2.0, 2.0, 2.0, 2.0, 2.0, -9.0], np.float32)
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 0, f"bar 0 read the end of the window as its predecessor: {got}"
+
+    # Positive control: the same shape with a real crossing at bar 1 does trade, so the
+    # assertion above is not passing because everything was suppressed.
+    rmvr = np.array([0.0, 2.0, 2.0, 2.0, 2.0, -9.0], np.float32)
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 1 and (got[0, 0], got[0, 1]) == (1, 5), got
+
+
+def test_unit4_reversal_is_one_bar_one_price() -> None:
+    """Stop-and-reverse: the closing and opening fills are the same bar at the same price,
+    and each side pays `cost` -- which is what PLAN Unit 9's cost sanity check counts."""
+    gate = np.ones(7, np.int8)
+    close = np.array([100.0, 101.0, 103.0, 102.0, 105.0, 104.0, 106.0], np.float32)
+    rmvr = np.array([0.0, 2.0, 0.0, -2.0, 0.0, 0.0, 0.0], np.float32)
+
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 2, got
+    assert got[0, 1] == got[1, 0] == 3, f"the reversal must share bar 3: {got[:, :2]}"
+    assert got[0, 2] == 1 and got[1, 2] == -1
+    # Long 101 -> 102, then short 102 -> 106 (flattened on the last bar). Both pay cost,
+    # and both legs of the reversal fill at the same 102 -- one price, not two.
+    assert abs(got[0, 3] - (102.0 - 101.0 - COST)) < 1e-12, got[0, 3]
+    assert abs(got[1, 3] - (102.0 - 106.0 - COST)) < 1e-12, got[1, 3]
+    assert close[int(got[0, 1])] == close[int(got[1, 0])] == 102.0
+
+
+def test_unit4_no_entry_on_the_last_gated_bar() -> None:
+    """A trade opened on the last gated bar of a run fills at the close its own forced exit
+    fills at: zero bars, zero gross, exactly -cost.
+
+    Live flattens at 15:55 and does not also enter, so booking these charges a cost live
+    never pays and breaks the Unit 12a parity check. Measured over the pre-tail sample they
+    are 1.74% of all trades (1.0-3.2% by combo) and the skip removes *exactly* the trades
+    whose exit index equals their entry index -- 0 discrepancies over 16 (n, v) combos.
+    """
+    gate = np.array([0, 1, 1, 1, 0], np.int8)
+    close = np.array([100.0, 101.0, 102.0, 103.0, 104.0], np.float32)
+
+    # A fresh crossing exactly on bar 3, the run's last bar, with nothing open.
+    rmvr = np.array([0.0, 0.0, 0.0, 2.0, 0.0], np.float32)
+    assert len(rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)) == 0, (
+        "an entry on the run's last bar is a guaranteed -cost trade carrying no information"
+    )
+
+    # The same crossing one bar earlier is a real trade, held to the forced exit at bar 3.
+    rmvr = np.array([0.0, 0.0, 2.0, 2.0, 0.0], np.float32)
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 1 and (got[0, 0], got[0, 1]) == (2, 3), got
+
+    # Suppression must not leak into an open position: the reversal signal on the last bar
+    # is skipped, and the existing trade still exits there, at the price it would have.
+    rmvr = np.array([0.0, 2.0, 0.0, -2.0, 0.0], np.float32)
+    got = rmv.simulate(rmvr, close, gate, 1.0, 1.0, COST)
+    assert len(got) == 1 and (got[0, 0], got[0, 1], got[0, 2]) == (1, 3, 1), got
+    assert abs(got[0, 3] - (103.0 - 101.0 - COST)) < 1e-12, got[0, 3]
+
+    # An array that ends while still gated force-closes on the final bar. One real session
+    # in 2,680 does this in place (2019-08-12, whose data stops at 15:30), and any slice
+    # that is not session-aligned can. The `t + 1 >= total` skip means the position being
+    # closed was always opened strictly earlier, so this can never emit a zero-bar trade.
+    open_at_end = np.array([0.0, 2.0, 0.0, 0.0, 0.0], np.float32)
+    got = rmv.simulate(open_at_end, close, np.ones(5, np.int8), 1.0, 1.0, COST)
+    assert len(got) == 1 and (got[0, 0], got[0, 1], got[0, 2]) == (1, 4, 1), got
+    assert abs(got[0, 3] - (104.0 - 101.0 - COST)) < 1e-12, got[0, 3]
+
+
+def test_unit4_gate_holds_on_real_data() -> None:
+    """PLAN Unit 4's done-when against the real series: no trade opens before 10:00, none
+    spans 15:55, and none is held across a bar the gate has shut.
+
+    Checked against `gate` itself as well as against the clock. The gate carries three
+    separate rules -- the 10:00 open, `session_close - 5 min`, and the max_n blackout after
+    a data gap -- and on an early close the last tradeable bar opens 12:50, not 15:50.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    mult = rmv.xmult(matrix, bars.gate == 1)
+    et = data.to_et(bars.ts)
+    minute = np.asarray(et.hour * 60 + et.minute)
+    day = et.normalize().asi8
+    csum = np.concatenate([[0], np.cumsum(bars.gate == 1)])
+
+    checked = 0
+    for n in (3, 12, 24):
+        row = matrix[int(np.flatnonzero(rmv.N_VALUES == n)[0])]
+        for v in (0.25, 1.5, 3.5):
+            thr = rmv.threshold(v, mult, n)
+            trades = rmv.simulate(row, bars.close, bars.gate, thr, thr, COST)
+            assert len(trades), f"n={n} v={v} produced no trades at all"
+            entry = trades[:, 0].astype(np.int64)
+            exit_ = trades[:, 1].astype(np.int64)
+            tag = f"n={n} v={v}"
+
+            assert np.all(bars.gate[entry] == 1), f"{tag}: entry on an ungated bar"
+            assert np.all(bars.gate[exit_] == 1), f"{tag}: exit on an ungated bar"
+            assert minute[entry].min() >= data.GATE_OPEN_MIN, (
+                f"{tag}: entry at minute {minute[entry].min()}, before the 10:00 gate"
+            )
+            # The last gated bar OPENS 15:50 and closes 15:55; nothing opens or closes later.
+            assert minute[exit_].max() < data.GATE_CLOSE_MIN, (
+                f"{tag}: exit at minute {minute[exit_].max()}, at or past 15:55"
+            )
+            assert np.all(day[entry] == day[exit_]), f"{tag}: a trade spans a session"
+            assert np.all(exit_ > entry), f"{tag}: a zero-bar trade survived"
+            assert np.all(entry[1:] >= exit_[:-1]), f"{tag}: trades overlap"
+            # No entry is the last gated bar of its run -- the rule itself, stated directly.
+            assert np.all(bars.gate[entry + 1] == 1), f"{tag}: opened on a run's last bar"
+            # Nothing is held across a shut gate. A prefix sum rather than a loop over ~10k
+            # trades: a fully-gated span has as many gated bars as it has bars.
+            assert np.all(csum[exit_ + 1] - csum[entry] == exit_ - entry + 1), (
+                f"{tag}: a trade is held across a bar the gate has shut"
+            )
+            checked += len(trades)
+    print(f"    ({checked} real trades checked)", end="")
+
+
+def test_unit4_matches_reference_on_real_data() -> None:
+    """The kernel-vs-reference equivalence again, but on the real gate.
+
+    Early closes, the two mid-session blackouts and the 28 holed sessions are shapes
+    `_random_case` does not make. One year only, because the pure-Python reference is
+    ~1000x slower than the kernel -- which is the point of it.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    mult = rmv.xmult(matrix, bars.gate == 1)
+    lo, hi = np.searchsorted(bars.ts, [
+        data._to_ns(datetime(2020, 1, 1, tzinfo=timezone.utc)),
+        data._to_ns(datetime(2021, 1, 1, tzinfo=timezone.utc)),
+    ])
+    close = np.ascontiguousarray(bars.close[lo:hi])
+    gate = np.ascontiguousarray(bars.gate[lo:hi])
+
+    for n in (3, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        row = np.ascontiguousarray(matrix[a, lo:hi])
+        for v in (0.5, 2.0):
+            thr = rmv.threshold(v, mult, n)
+            k = rmv.simulate(row, close, gate, thr, thr, COST)
+            r = _sim_reference(row, close, gate, thr, thr, COST)
+            assert len(k) == len(r), f"n={n} v={v}: kernel {len(k)} trades, reference {len(r)}"
+            for i, (e, x, d, net) in enumerate(r):
+                assert (k[i, 0], k[i, 1], k[i, 2], k[i, 3]) == (e, x, d, net), (
+                    f"n={n} v={v} trade {i}: {tuple(k[i])} != {(e, x, d, net)}"
+                )
+
+
+def test_unit4_scaling_thresholds_equals_scaling_rows() -> None:
+    """PLAN Unit 6's pinned convention, checked where it actually lands -- on trades.
+
+    Unit 6 measured 0 disagreements over 111.1M raw comparisons; that is the premise. This
+    is the conclusion, and it is what a future refactor moving the division would break.
+    The alternative is built the way Unit 6 rejected it: a second float32 row, scaled.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    mult = rmv.xmult(matrix, bars.gate == 1)
+    differed = compared = 0
+    for n in (3, 11, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        scaled = np.ascontiguousarray(matrix[a] * np.float32(mult * math.sqrt(n)))
+        for v in (0.25, 1.0, 3.5):
+            thr = rmv.threshold(v, mult, n)
+            by_threshold = rmv.simulate(matrix[a], bars.close, bars.gate, thr, thr, COST)
+            by_row = rmv.simulate(scaled, bars.close, bars.gate, v, v, COST)
+            compared += len(by_threshold)
+            differed += len(by_threshold) + len(by_row) - 2 * len(
+                {tuple(t[:3]) for t in by_threshold} & {tuple(t[:3]) for t in by_row}
+            )
+    assert compared > 10000, compared
+    assert differed == 0, (
+        f"{differed} of {compared} trades differ between scaling thresholds and scaling "
+        "rows -- PLAN Unit 6 measured 0 disagreements at the comparison level, so this is "
+        "either a real regression or that measurement needs restating at the trade level"
+    )
+
+
+def test_unit4_costs_and_buffer_reuse() -> None:
+    """`net` is gross minus exactly one `cost` per trade, and a reused buffer changes nothing.
+
+    Unit 6 hands one buffer to all 4312 combos, so a kernel that read past `k`, or that
+    depended on the buffer being clean, would pass every single-call test and fail only there.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    mult = rmv.xmult(matrix, bars.gate == 1)
+    row = matrix[int(np.flatnonzero(rmv.N_VALUES == 12)[0])]
+    thr = rmv.threshold(1.0, mult, 12)
+
+    fresh = rmv.simulate(row, bars.close, bars.gate, thr, thr, COST).copy()
+    entry = fresh[:, 0].astype(np.int64)
+    exit_ = fresh[:, 1].astype(np.int64)
+    gross = fresh[:, 2] * (
+        bars.close[exit_].astype(np.float64) - bars.close[entry].astype(np.float64)
+    )
+    assert np.array_equal(fresh[:, 3], gross - COST), "net is not gross minus exactly one cost"
+    # Zero cost must move every trade by exactly COST and change nothing else about it.
+    free = rmv.simulate(row, bars.close, bars.gate, thr, thr, 0.0)
+    assert np.array_equal(free[:, :3], fresh[:, :3]) and np.array_equal(free[:, 3], gross)
+
+    wide = rmv.threshold(3.5, mult, 12)
+    tight = rmv.threshold(0.25, mult, 12)
+    buf = np.empty((len(bars), 4), np.float64)
+    first = rmv.simulate(row, bars.close, bars.gate, wide, wide, COST, out=buf).copy()
+    rmv.simulate(row, bars.close, bars.gate, tight, tight, COST, out=buf)  # dirties it
+    again = rmv.simulate(row, bars.close, bars.gate, wide, wide, COST, out=buf)
+    assert np.array_equal(first, again), "a dirty buffer changed the answer"
+    # The buffer bound is len(close); the busiest combo in the grid says how much slack.
+    fastest = rmv.threshold(0.25, mult, 3)
+    busiest = len(rmv.simulate(matrix[0], bars.close, bars.gate, fastest, fastest, COST))
+    assert busiest < len(bars), f"{busiest} trades against a {len(bars)}-row bound"
+    print(f"    (busiest combo {busiest} trades / {len(bars)} rows)", end="")
+
+
+def test_unit4_rejects_bad_input() -> None:
+    """Every guard, each for something a caller can actually hit -- and each for a *silent*
+    wrong answer rather than a crash, which is why they are all ValueError."""
+    T = 40
+    row = np.zeros(T, np.float32)
+    close = np.full(T, 400.0, np.float32)
+    gate = np.ones(T, np.int8)
+
+    def rejects(fragment: str, *args, **kw) -> None:
+        try:
+            rmv.simulate(*args, **kw)
+        except ValueError as exc:
+            assert fragment in str(exc), f"wrong message for {fragment!r}: {exc}"
+        else:
+            raise AssertionError(f"accepted input that should raise {fragment!r}")
+
+    ok = (row, close, gate, 0.1, 0.1, COST)
+    rmv.simulate(*ok)  # the baseline really does pass
+
+    rejects("close must be", row, close.astype(np.float64), gate, 0.1, 0.1, COST)
+    rejects("rmv_row must be", row.astype(np.float64), close, gate, 0.1, 0.1, COST)
+    # The whole 22 x T matrix instead of one row -- caught by shape, not by ndim alone.
+    rejects("rmv_row must be", np.zeros((22, T), np.float32), close, gate, 0.1, 0.1, COST)
+    rejects("rmv_row must be", np.zeros(T - 1, np.float32), close, gate, 0.1, 0.1, COST)
+    # `Bars.gate` is int8. A bool mask would work, but pinning one dtype keeps numba to one
+    # specialization and keeps every call site writing the same thing.
+    rejects("gate must be", row, close, gate.astype(bool), 0.1, 0.1, COST)
+    rejects("gate must be", row, close, gate.astype(np.int64), 0.1, 0.1, COST)
+    # A stray value reads as "flat" under the kernel's `gate[t] != 1` and as "tradeable"
+    # under the equally natural `gate[t] == 0`. Neither is wrong; guessing is.
+    rejects("only 0 and 1", row, close, (gate * 2), 0.1, 0.1, COST)
+    rejects("only 0 and 1", row, close, (gate * -1), 0.1, 0.1, COST)
+
+    # The thresholds. A non-positive one makes the two crossing branches overlap; a negative
+    # vdn fires the sell rule on nearly every bar; NaN makes every comparison False, which is
+    # a silent flat window rather than an error. This is also where a non-positive or NaN
+    # `xmult` surfaces, because `rmv.threshold` passes it straight through.
+    for bad in (0.0, -1.0, np.nan, np.inf):
+        rejects("vup must be", row, close, gate, bad, 0.1, COST)
+        rejects("vdn must be", row, close, gate, 0.1, bad, COST)
+    rejects("vup must be", row, close, gate, rmv.threshold(1.0, -3.0, 12), 0.1, COST)
+    rejects("vup must be", row, close, gate, rmv.threshold(1.0, np.nan, 12), 0.1, COST)
+    rejects("cost must be", row, close, gate, 0.1, 0.1, -0.01)
+    rejects("cost must be", row, close, gate, 0.1, 0.1, np.nan)
+
+    rejects("out must be float64", *ok, out=np.empty((T, 4), np.float32))
+    rejects("out must be float64", *ok, out=np.empty((T, 3), np.float64))
+    rejects("rows", *ok, out=np.empty((T - 1, 4), np.float64))
+    rejects("C-contiguous", *ok, out=np.empty((4, T), np.float64).T)
+    # A caller who sliced one scratch arena into both the price series and the buffer. The
+    # views have to be contiguous to survive `ascontiguousarray`, or the alias is copied away
+    # before the check can see it -- which is why the check comes after the conversion.
+    arena = np.empty(T * 4, np.float64)
+    arena[:] = 400.0
+    alias32, alias8 = arena.view(np.float32)[:T], arena.view(np.int8)[:T]
+    rejects("aliases", row, alias32, gate, 0.1, 0.1, COST, out=arena.reshape(T, 4))
+    # Each input needs its own case: the guard is three `or`ed clauses and dropping any one
+    # of them is invisible to a test that only aliases the first.
+    rejects("aliases", alias32, close, gate, 0.1, 0.1, COST, out=arena.reshape(T, 4))
+    arena[:] = 0.0  # int8 view of 0.0 is all zeros, i.e. a legal all-flat gate
+    rejects("aliases", row, close, alias8, 0.1, 0.1, COST, out=arena.reshape(T, 4))
+
+
+def test_unit4_budget() -> None:
+    """Unit 6's < 60 ms/window has to be reachable from here, on *real* windows.
+
+    Measured on synthetic bars this understates the cost by 3-4x: threshold density drives
+    the trade count, and a synthetic row calibrated by eye produces ~5 trades per combo where
+    a real window produces 16-22. So the budget runs on real IS-sized windows with each
+    window's own refitted `xmult`, and asserts the whole 4312-combo sweep fits inside Unit 6's
+    per-window budget on **one** thread -- `prange` is then headroom, not the thing being
+    relied on.
+    """
+    import time
+
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total = 1638  # PLAN §2.4's stated IS window size
+    buf = np.empty((total, 4), np.float64)
+    rmv._simulate(matrix[0, :total].copy(), bars.close[:total].copy(),
+                  bars.gate[:total].copy(), 0.01, 0.01, COST, buf)  # JIT
+
+    worst = worst_trades = 0
+    for start in np.linspace(30_000, len(bars) - total - 1, 4).astype(int):
+        sl = slice(start, start + total)
+        close = np.ascontiguousarray(bars.close[sl])
+        gate = np.ascontiguousarray(bars.gate[sl])
+        rows = np.ascontiguousarray(matrix[:, sl])
+        mult = rmv.xmult(rows, gate == 1)
+        # The real grid: 22 n x 14 vup x 14 vdn = 4312, with the divide hoisted per (n, v).
+        thr = np.array([[rmv.threshold(0.25 * (j + 1), mult, n) for j in range(14)]
+                        for n in rmv.N_VALUES])
+        trades = 0
+        begin = time.perf_counter()
+        for a in range(rmv.N_VALUES.size):
+            row = np.ascontiguousarray(rows[a])
+            for i in range(14):
+                for j in range(14):
+                    trades += rmv._simulate(row, close, gate, thr[a, i], thr[a, j], COST, buf)
+        elapsed = time.perf_counter() - begin
+        if elapsed > worst:
+            worst, worst_trades = elapsed, trades
+    print(f"    (worst real window {worst * 1000:.0f} ms serial for 4312 combos, "
+          f"{worst_trades / 4312:.1f} trades/combo, "
+          f"{worst * 1e9 / (4312 * total):.1f} ns/bar-step)", end="")
+    assert worst_trades / 4312 > 10, (
+        f"only {worst_trades / 4312:.1f} trades per combo -- the windows went quiet and this "
+        "is measuring an empty loop, which is how the synthetic fixture understated it"
+    )
+    assert worst < 0.060, (
+        f"{worst * 1000:.0f} ms serial for one window's 4312 combos, on one thread, against "
+        "Unit 6's 60 ms budget for the whole window"
+    )
+
+
+def test_unit4_iex_signal_divergence_on_real_feeds() -> None:
+    """PLAN Unit 4's ⚑ item, re-derivable rather than quoted. SPEC §3.2's table comes from here.
+
+    Both feeds through the identical pipeline for June 2024. The two failures compound: IEX's
+    missing pre-market bars trip the `max_n` blackout, so a quarter of SIP's tradeable bars are
+    not tradeable at all on IEX; and on the bars that survive on both, the 2.50c of per-print
+    noise moves the signal itself.
+
+    Needs `cache/SPY_5min_iex.npz`, fetched once and kept beside the SIP cache precisely so
+    this number stops resting on one un-repeatable network run.
+    """
+    npz, _ = data._cache_paths("SPY", "iex")
+    if not npz.exists():
+        print("    (skipped: no IEX cache)", end="")
+        return
+    start = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 7, 1, tzinfo=timezone.utc)
+    feeds = {}
+    for feed in ("sip", "iex"):
+        b = data.load_bars("SPY", start, end, feed=feed, refresh=False)
+        feeds[feed] = (b, rmv.rmv_all_n(b.close), rmv.xmult(rmv.rmv_all_n(b.close), b.gate == 1))
+    (sip, sip_m, sip_x), (iex, iex_m, iex_x) = feeds["sip"], feeds["iex"]
+
+    sip_gated, iex_gated = int((sip.gate == 1).sum()), int((iex.gate == 1).sum())
+    assert (len(sip), sip_gated) == (1824, 1349), (len(sip), sip_gated)
+    assert (len(iex), iex_gated) == (1484, 982), (len(iex), iex_gated)
+    # 19 trading days in June 2024 at the full 96-bar session and 71 gated bars.
+    assert sip_gated == 19 * 71 and len(sip) == 19 * 96
+
+    shared, s_i, i_i = np.intersect1d(sip.ts, iex.ts, assume_unique=True, return_indices=True)
+    both = (sip.gate[s_i] == 1) & (iex.gate[i_i] == 1)
+
+    def signals(matrix, bars, a, thr):
+        """Which way the crossing rule fires on every bar -- the decision, before position."""
+        cur, prev = matrix[a][1:].astype(np.float64), matrix[a][:-1].astype(np.float64)
+        sig = np.zeros(bars.ts.size, np.int8)
+        sig[1:] = np.where(
+            (cur >= thr) & (prev < thr), 1, np.where((cur <= -thr) & (prev > -thr), -1, 0)
+        )
+        return sig
+
+    worst = 0.0
+    sip_trades = iex_trades = 0
+    for n in (3, 6, 12, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        for v in (0.25, 1.0, 2.0, 3.5):
+            s_thr, i_thr = rmv.threshold(v, sip_x, n), rmv.threshold(v, iex_x, n)
+            disagree = (signals(sip_m, sip, a, s_thr)[s_i][both]
+                        != signals(iex_m, iex, a, i_thr)[i_i][both])
+            worst = max(worst, 100 * disagree.mean())
+            sip_trades += len(rmv.simulate(sip_m[a], sip.close, sip.gate, s_thr, s_thr, COST))
+            iex_trades += len(rmv.simulate(iex_m[a], iex.close, iex.gate, i_thr, i_thr, COST))
+
+    cover = 100 * iex_gated / sip_gated
+    ratio = 100 * iex_trades / sip_trades
+    print(f"    (IEX gates {cover:.1f}% of SIP's bars, makes {ratio:.1f}% of the trades, "
+          f"worst signal disagreement {worst:.1f}%)", end="")
+    # SPEC §3.2's recorded figures. Bounds, not equalities, so a cache refresh reports a
+    # drift rather than a mystery -- but tight enough that drift is what it would report.
+    assert 72.0 < cover < 74.0, f"IEX gated-bar coverage {cover:.1f}%, SPEC §3.2 says 72.8%"
+    assert 70.0 < ratio < 77.0, f"IEX trade ratio {ratio:.1f}%, SPEC §3.2 says 73.2%"
+    assert worst > 8.0, (
+        f"worst signal disagreement {worst:.1f}%, SPEC §3.2 says 11.9%. If IEX has become "
+        "this close to SIP, §3.2's rejection is what needs rewriting, not this bound"
+    )
+
+
+def test_unit4_iex_noise_would_break_the_signal() -> None:
+    """PLAN Unit 4's flagged item: Unit 1's IEX *price* divergence, turned into a *signal* one.
+
+    Unit 1 measured IEX against SIP over June 2024 inside the session window (SPEC §3.2):
+    81.4% coverage, no usable pre-market warmup, and a median 2.50c difference on every
+    shared print -- 15% of a median 17c bar move, 76.3% of bars off by >= 1c. Whether that
+    matters is a Unit 4 question, because trades are the output.
+
+    Fetched live once through this exact pipeline and recorded in SPEC §3.2: over June 2024
+    IEX gates 982 bars against SIP's 1,349, signals disagree on up to 11.9% of the bars both
+    feeds gate, and IEX yields 73.2% of SIP's trades. That measurement needs the network, so
+    what runs here is the mechanism, offline: inject IEX's measured 2.50c of per-bar noise
+    into the cached SIP series and count how many trades move. A repeated median resists
+    outlier points, not error on every point, and this is the number that says so.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, _ = got
+    lo, hi = np.searchsorted(bars.ts, [
+        data._to_ns(datetime(2024, 6, 1, tzinfo=timezone.utc)),
+        data._to_ns(datetime(2024, 7, 1, tzinfo=timezone.utc)),
+    ])
+    close = np.ascontiguousarray(bars.close[lo:hi])
+    gate = np.ascontiguousarray(bars.gate[lo:hi])
+
+    # sd chosen so the median absolute perturbation is IEX's measured 2.50c: for a normal,
+    # median|x| = 0.6745 sd.
+    noisy = (close + np.random.default_rng(24).normal(0, 0.025 / 0.6745, close.size)).astype(
+        np.float32
+    )
+    assert abs(float(np.median(np.abs(noisy - close))) - 0.025) < 0.004, "noise is not IEX-sized"
+
+    clean_m = rmv.rmv_all_n(close)
+    noisy_m = rmv.rmv_all_n(noisy)
+    mult = rmv.xmult(clean_m, gate == 1)
+    moved = total = 0
+    for n in (3, 12, 24):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        for v in (0.25, 1.0, 2.0):
+            thr = rmv.threshold(v, mult, n)
+            c = rmv.simulate(clean_m[a], close, gate, thr, thr, COST)
+            d = rmv.simulate(noisy_m[a], noisy, gate, thr, thr, COST)
+            same = len({tuple(t[:3]) for t in c} & {tuple(t[:3]) for t in d})
+            moved += len(c) - same
+            total += len(c)
+    pct = 100 * moved / total
+    print(f"    ({pct:.1f}% of trades move under IEX-sized noise)", end="")
+    assert pct > 20.0, (
+        f"only {pct:.1f}% of trades moved under 2.5c of per-bar noise. If the signal really "
+        "is that robust, SPEC §3.2's IEX rejection needs re-arguing -- not this assertion "
+        "loosening"
+    )
 
 
 def main() -> int:

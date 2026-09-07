@@ -427,22 +427,72 @@ NaN-through-`np.median`: a wrong answer with no exception.
 
 ---
 
-### Unit 4 — Trade simulation kernel
+### Unit 4 — Trade simulation kernel ✅ **shipped**
 
-**Do**
+**Shipped** in `rmv.py`: `simulate(rmv_row, close, gate, vup, vdn, cost, out=None) -> trades`
+over an njit `_simulate` Unit 6 can call from inside `prange`, plus
+`threshold(v, xmult, n)`. 55/55 tests pass; **24 of 25 mutations killed**, the survivor
+provably equivalent (below). Two of those mutations — a `TRADE_COLS` reorder and dropping one
+arm of the `out`-aliasing guard — survived the first pass and were found by the §4 review, not
+by the author; both are now killed.
 
-- `simulate(rmv_row, close, gate, vup, vdn, cost) -> trades`, one pass, fixed buffer.
-- 2025 crossing rules, 10:00 gate, 15:55 flat, stop-and-reverse.
-- A deliberately slow, obviously-correct pure-Python reference in `test_rmv.py`.
+- **`trades` is `float64[k, 4]`**, columns `TRADE_COLS = (entry, exit, dir, net)` — entry and
+  exit bar index, direction ±1, and net profit per share. Gross is `net + cost` and bars-held
+  is `exit - entry`; walking SPEC §6.1–6.3, 16 of the 18 starred IS metrics need only the
+  ordered per-trade P&L, `mLb`/`mWb` add the bar count, and all 6 OOS metrics are sums or
+  extrema over the same column. The two index columns are separately forced by this unit's own
+  done-when. Caller-owned buffer of `len(close)` rows; nothing allocates per combo.
+- ⚑ **`vup`/`vdn` are raw RMedV thresholds, and `rmv.threshold` is their only producer.**
+  Grid units in the signature were built and then reverted. Three reasons, all measured:
+  (i) §1.7's `>=` boundary is only exactly testable at the public boundary under raw units —
+  a grid value has to survive a division, which lands exactly in **89.9%** of draws, so 5.1%
+  of the time a *correct* `>=` kernel fails the test and 5.0% of the time a *buggy* `>` kernel
+  passes it; (ii) grid units would have put `n` in the signature, and `n` matching `rmv_row` is
+  structurally uncheckable — a new silent channel traded for an old one; (iii) the parity
+  argument for it was false: `_simulate` returns closed trades, not a desired position, so
+  `live.py` cannot call it and the formula would exist twice regardless. One shared
+  `threshold()` is what actually closes that, and it is what Unit 12b calls per bar. Writing
+  `v / (xmult * sqrt(n))` rather than `v / xmult / sqrt(n)` is not pedantry: **31.6%** of
+  draws land on a different float64.
+- **Three semantics the sources leave open are now pinned in SPEC §2.1** — no entry on the
+  last gated bar of a run, one exit-fill rule for both gate causes, and `gate[t+1]` as a
+  calendar read rather than look-ahead. Each was decided on measurement; see §2.1 for the
+  numbers and for what each rejected alternative costs.
+- **The IEX-vs-SIP signal divergence** ⚑ landed here as planned and is recorded in SPEC §3.2:
+  IEX gates **72.8%** of the bars SIP does, disagrees on **up to 11.9%** of the signals on
+  bars both feeds gate, and yields **73.2%** of the trades. SPEC §3.2's IEX rejection now rests
+  on trades, not only on prices.
 
-**Done when** kernel == reference trade-for-trade on 1000 random series × random
-`(N, vup, vdn)`; hand-built series produce the exact expected trade list; a bar exactly equal
-to `vup` triggers (`>=`, per the paper); no trade spans 15:55; none opens before 10:00.
-⚑ Plus: the IEX-vs-SIP **signal** divergence from Unit 1's price comparison (this needs
-Units 2–4 to exist, so it lands here, not in Unit 1).
+**Done when — as met.** Kernel == reference trade-for-trade and bit-exact on `net` over 1000
+random series (14,917 trades, 1,287 of them sitting exactly on a threshold) and over a full year of
+real bars; the hand-built series produces its exact expected list; a bar exactly equal to `vup`
+triggers; on 64,067 real trades none opens before 10:00, none exits at or past 15:55, none
+spans a session, and none is held across a bar the gate has shut.
 
-**Review focus** `>=` vs `>` boundary; the first bar of the day (`t-1` is now the prior
-*extended-hours* bar, which is the intended contiguous reference under §1.3); forced EOD exit
+Budget: **12 ms serial** for the worst of four **real** 1638-bar windows swept over the whole
+4312-combo grid with each window's own refitted `xmult` — 20.8 trades/combo, 1.7 ns/bar-step;
+an independent sweep over twelve windows measured 17–23 ms. Either way one thread does an
+entire window inside Unit 6's 60 ms budget, so `prange` is headroom rather than the thing
+being relied on. ⚑ The first version of this test used synthetic bars and reported 10 ms /
+1.4 ns — **3–4× optimistic**, because threshold density drives the trade count and a row
+calibrated by eye made 5 trades per combo where a real window makes 16–22. The test now
+asserts `trades/combo > 10`, so it cannot quietly go back to timing an empty loop.
+
+⚑ **The done-when as originally written did not catch the unit's largest defect.** "No trade
+spans 15:55" is satisfied by a zero-bar trade *at* 15:55 — 1.74% of all trades, every one a
+guaranteed `-cost` loser. The criteria that catch it are `exit > entry` and
+`gate[entry + 1] == 1`, and they are now in the suite.
+
+⚑ **Mutation survivor, resolved not chased.** `gate[t] != 1` → `gate[t] == 0` survives, and is
+equivalent — but the reason has to be `build_gate`, not the wrapper. `simulate` does reject a
+`gate` outside `{0, 1}` (and *that* guard's own removal is killed), yet Unit 6 calls the njit
+`_simulate` directly and runs none of those guards. What makes the two comparisons identical
+on the production path is that `data.build_gate` is a boolean expression cast to int8 followed
+by zero-assignments, so `{0, 1}` is the only thing it can emit. The wrapper guard covers
+hand-built callers; `build_gate`'s construction covers the grid.
+
+**Review focus** `>=` vs `>` boundary; the first bar of the day (`t-1` is the prior
+*extended-hours* bar, the intended contiguous reference under §1.3); forced EOD exit
 accounting; reversal-on-same-bar.
 
 ---
@@ -456,6 +506,19 @@ accounting; reversal-on-same-bar.
 **Done when** every metric matches an independent numpy computation on a hand-built trade
 list; ⚑ the base-$100 and base-$200,000 equity cases from §1.7 both stay exact; degenerate
 cases return defined values (0 trades; 0 losers → `PF = inf`; `mLTr` undefined → sentinel).
+
+⚑ **From Unit 4.** `trades` is `float64[k, 4]` = `(entry, exit, dir, net)`; bars-held is
+`exit - entry` and gross is `net + cost`. Two things this settles before they are asked:
+
+- **No trade has 0 bars.** Unit 4 suppresses the last-gated-bar entry, so `exit > entry`
+  always. Whether Meyers' PWFO counts a same-bar trade as 0 bars or 1 is unrecorded and
+  SPEC §6.1 is verbatim-silent — and now it cannot matter, which is load-bearing, because
+  `mLb` is a rank-and-pick metric in CL2 and CL4 and a 0-bar loser would sort to the front.
+- ⚑ **`ownp`/`ownt` are the NET winner set, not the gross one.** The two genuinely differ:
+  measured on the full pre-tail sample, gross-winners vs net-winners are 4,810 vs 4,688 at
+  `n=6, v=0.5` and 1,517 vs 1,502 at `n=12, v=1.0`. SPEC §6.2's verbatim reading — *"Winning
+  Trades total Net Profits"* — pins it to net. Assert the count, so a later refactor cannot
+  drift onto the other reading in silence.
 
 **Review focus** Division by zero; `mLTr` sign (§1.5); `lr` counting across window boundaries.
 
@@ -475,6 +538,25 @@ convention anyway, so the backtest and live paths cannot drift onto opposite sid
 ⚑ **Free diagnostic**: count **distinct** trade sets among the 4312 combos per window. On a
 penny-tick instrument at low N many `(vup, vdn)` pairs are clones; the effective grid size is
 smaller than 4312 and directly informs §Unit 9's multiplier.
+
+⚑ **From Unit 4.** The inner call is
+`rmv._simulate(row_a, close, gate, up, dn, cost, trades)` with
+`up = rmv.threshold(vs[j], xmult, ns[a])` **hoisted per `(n, v)`** — the 14 divisions per `n`
+above, not one per combo. Two obligations follow: `run_grid` gains a `cost` argument (the
+signature above omits it, and Unit 5 applies cost to net figures, so it has to arrive here),
+and the `trades` buffer must be a per-thread caller-owned slice of `len(close)` rows, since
+`_simulate` takes `out` and this unit's own done-when forbids allocation in `prange`.
+
+⚑ **`simulate` returns a *view* into `out`, and this unit is where that bites.** One buffer
+serves all 4312 combos in sequence, so Unit 5 code that keeps the returned array instead of
+consuming it immediately reads the *next* combo's trades. Documented in `rmv.simulate` but
+unguarded; add "the metric row for combo *c* is computed before combo *c+1* runs" to the
+done-when, or copy at the boundary.
+
+⚑ Its done-when — "any single row equals the Unit 4+5 path" — is **load-bearing, not a
+formality**: `run_grid` calls the unvalidated njit kernel directly, so it is the only thing
+checking that `ns[a]` is matched to row `a`. A mismatch mis-scales the threshold by
+`sqrt(n_true / n)` and the run completes with plausible metrics.
 
 **Done when** any single row equals the Unit 4+5 path; output bit-identical across
 `NUMBA_NUM_THREADS=1` vs 32 (genuinely satisfiable — each combo writes an independent output
@@ -508,6 +590,20 @@ row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero alloca
 - Re-running produces byte-identical tables.
 - Budget: **< 60 s**, peak RSS **< 1 GB**.
 - A randomly chosen row's OOS `osnp` reproduces when replayed standalone.
+
+⚑ **From Unit 4: window slices must end on an ungated bar — assert it.** `_simulate` treats
+the last bar of *any* slice as if it were the last gated bar of a run: no entry there, and an
+open position force-closed at the slice edge. That is right for week-anchored windows, which
+end Friday 15:55 on an ungated bar, so the windowed and full-sample answers coincide. It stops
+being right the moment a window is cut by bar count or on a mid-session timestamp — the window
+then silently loses one entry and force-closes at the window edge instead of the session edge.
+One `assert gate[-1] == 0` per emitted window costs nothing and pins it.
+
+⚑ **From Unit 4: `cost` is a selection input, like `xmult`.** It enters every IS metric, so it
+enters the filter's choice of row and not merely the reported P&L. It therefore inherits
+`xmult`'s discipline exactly: computed from **IS bars only**, stored per window beside
+`xmult`, and applied to that window's IS *and* OOS runs. Deriving it from OOS prices would
+leak a price level backwards into a row that was already picked.
 
 **Review focus** The `<=` / `+1 day` boundary bug pattern from the current `walk_forward`;
 partial windows at the ends; holidays shortening an OOS week to 4 sessions (e.g. Thanksgiving
@@ -563,6 +659,16 @@ the two zero cases distinctly.
   inflated — treat it as descriptive. If autocorrelation is non-trivial, block-bootstrap.
 - Verify (not re-apply) the §1.3 cost model. ⚑ Sanity check is
   `trades × shares × ($0.01 + SEC/TAF)`, not slippage alone.
+- ⚑ **The cost constant is what needs verifying, and it is wrong in two ways** (SPEC §3.2).
+  `$0.017/share on sells` folds two structurally different fees into one notional-scaled
+  number: FINRA's TAF is charged **per share** and does not scale with notional at all, while
+  the SEC Section 31 fee is charged on notional at a rate that is reset periodically. So one
+  of the two carries the wrong price sensitivity across the whole sample, and a single pinned
+  rate is wrong in every year but one. ⚑ The actual TAF figure and the Section 31 rate history
+  are **external facts this repo has not measured** — that is a source lookup against FINRA's
+  schedule and the SEC's Section 31 advisories, and it belongs to this unit. Split the two,
+  date-key the statutory one, and check the direction of the error before trusting any
+  after-cost figure: `toNP > 0` is one of the three decision-gate conditions.
 - Produce a Table-1-shaped report (same columns) plus the equity curve with its 2nd-order fit.
 
 **Done when** a filter run against shuffled OOS columns comes back insignificant; ⚑ **plus a
@@ -627,6 +733,11 @@ slice and a fresh 30-day fetch selects a different row — **the offline/online 
 because `adjustment="split"` makes the two price series identical. Params fall inside the grid.
 A `params.json` older than 10 days refuses to trade.
 
+⚑ **From Unit 4: `params.json` must carry `cost` as well as `xmult`,** and the offline/online
+equivalence check must compare it. `cost` selects the row (Unit 7), so a live loop that
+reconstructs `N/vup/vdn/xmult` correctly but re-derives `cost` differently is not reproducing
+the same decision.
+
 **Review focus** Timezone of "last 30 days"; whether the refit sees the coming week; what
 happens when no row passes (answer: flat week, logged loudly).
 
@@ -669,6 +780,19 @@ shows up here or nowhere. If parity fails, nothing upstream is trustworthy.
 
 **Done when** a mid-session kill and restart converges to the correct position within one bar;
 every guard has a test that fires it and asserts the position afterwards.
+
+⚑ **From Unit 4, two guard details that decide parity rather than decorate it.**
+
+- **The 15:55 flatten must run *before* signal evaluation on the 15:50 bar.** Unit 4 opens no
+  position on the last gated bar of a run; if the live loop evaluates the signal first and
+  enters, live and backtest differ by **1.74% of the trade count**, all of it pure cost, with
+  no failing test anywhere. Nothing in SPEC §2 pinned this ordering, so it is pinned here.
+- **The stale-bar guard's "flatten *and halt*" does not match the backtest gate**, which
+  reopens the same session once the `max_n` blackout expires: 2016-02-02 reopens 13:25–15:50
+  (**30** more gated bars) and 2020-03-18 reopens 15:10–15:50 (**9** more). Live would have
+  traded none of them. That is a parity gap of dozens of trades on those two sessions, and no
+  exit-price rule closes it — either the live guard resumes on the same rule the gate uses, or
+  Unit 12a's harness must exempt post-blackout reopens and say so.
 
 **Review focus** Bar-close race; partial fills; rejected orders; short-sale rejects; 15:55
 flatten under a rejected order; 429/5xx/timeout handling on the poll path.

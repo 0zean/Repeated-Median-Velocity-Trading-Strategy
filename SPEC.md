@@ -311,6 +311,56 @@ sustainable trends occur in pit hours.
 > thin). Because §3 computes RMedV on the full session regardless, testing this later is a
 > gate change, not a rewrite. See §9-F.
 
+### 2.1 What the rules do not say — pinned in Unit 4
+
+Three cases fall between the paper's rules and the gate. All three are decided here because
+they are silent: each produces a complete, plausible backtest under either reading.
+
+**A. A trade may not *open* on the last gated bar of a gated run.** Fills are at the close of
+the signal bar, and the last gated bar of a regular session opens 15:50 and closes 15:55 —
+which is the EOD flat time. A position opened there is flattened at that same close: zero
+bars, zero gross, exactly `-cost`. Live flattens at 15:55 and does not also enter, so booking
+these charges a cost live never pays and would break the Unit 12a parity check.
+
+Measured, pre-tail sample, 16 `(n, v)` combos, 107,067 trades: **1,866 = 1.74%** are zero-bar
+(1.0–3.2% depending on the combo), every one exactly `-cost`. The skip removes **exactly** the
+trades whose exit index equals their entry index — 0 discrepancies, and `nT` falls by precisely
+the zero-bar count. Every remaining trade therefore has `exit > entry`, which also settles the
+`mLb` bar-count question before it is asked: no trade contributes 0 bars.
+
+This is also what makes "N trades = N round trips" true, so the cost convention and this skip
+are one decision and are tested as a pair.
+
+⚑ **PLAN Unit 4's done-when does not catch this.** "No trade spans 15:55" is satisfied by a
+zero-bar trade *at* 15:55. The test that catches it asserts `exit > entry` and
+`gate[entry + 1] == 1`.
+
+**B. The exit fill is the last gated bar's close, whatever shut the gate.** `gate` goes 1→0 for
+the scheduled clock exit and for the `max_n` blackout after a data gap; one rule covers both,
+and `close[t-1]` is the last bar the position could be held on.
+
+Measured, full sample: **2,682** gate 1→0 edges, of which **2,680 are the scheduled clock exit**
+(2,658 at 15:50, 21 at 12:50 on early closes, 1 at 15:30) and **2 are not** — 2016-02-02 11:15
+(one missing 5-minute bucket in an open market) and 2020-03-18 12:55 (the LULD halt). On those
+two, `close[t-1]` means "assume you got out before the gap", which is optimistic whenever the
+gap runs *toward* the position; it came out conservative on this sample only because the grid
+was net short into both down-gaps, which is a fact about the sample and not a property of the
+rule.
+
+The 15:30 edge is 2019-08-12, the one session whose feed stops before 15:55. It counts as
+*scheduled* here because the bar after it belongs to the next session, which the calendar
+knows — but it is an exception for rule C below, where the question is what **live** could
+have known at the time. The same edge, two different questions.
+
+**C. Reading `gate[t+1]` for rule A is not look-ahead — with one measured exception.** The gate
+is a pure function of timestamps and the NYSE calendar (`data.build_gate`), both known before
+the session opens, and live knows them too. The blackout term is the exception: it keys on the
+*next* bar's arrival, which live cannot know at `t`. That is **2 of 189,373 gated bars**, plus
+the one session in 2,680 whose data stops early (2019-08-12, last bar 15:30). On those three
+the backtest skips an entry live would have taken — a deleted trade, not a conservative one.
+Fixing it would need the calendar inside the kernel signature; at 0.0016% of gated bars it is
+recorded rather than fixed.
+
 ---
 
 ## 3. SPY adaptation
@@ -425,6 +475,51 @@ a test asserts they continue to agree.
 | Intraday halts | any inter-bar gap > 5 min zeroes the gate for the next `max(N)` bars | Circuit breakers (2020-03-09/12/16/18) splice an intraday price gap into the window — the same failure as §3.1. |
 | Direction | long/short | [M25]. Requires a margin account; SPY is trivially shortable. |
 | Minimum live capital | **$25,000** | PDT: ~8 round trips/week trips the rule in week one, and the consequence is closing-only for 90 days. |
+
+
+#### IEX at the signal level — measured in Unit 4
+
+Unit 1 rejected IEX on price. Unit 4 is the first point at which that can be restated as
+trades, which is what actually matters. Both feeds fetched for June 2024 and run through the
+identical pipeline (session mask → `build_gate` → `rmv_all_n` → per-feed `xmult` → `simulate`):
+
+| | SIP | IEX |
+|---|---|---|
+| session bars | 1,824 | 1,484 |
+| **gated bars** | **1,349** | **982** (72.8%) |
+| `xmult` | 3.100 | 3.271 (+5.5%) |
+| trades over 16 `(n, v)` combos | 1,061 | 777 (**73.2%**) |
+
+On the 982 bars **both** feeds gate, the signals disagree on **3.35%** overall and up to
+**11.9%** at `n=3, v=0.25`. The coverage failure and the noise failure compound: IEX's missing
+pre-market bars trip the `max_n` blackout, so a quarter of SIP's tradeable bars are not
+tradeable at all on IEX, and on the ones that are, one signal in eight can differ at low `N`.
+
+The mechanism is checked offline in the test suite rather than over the network: injecting
+IEX's measured 2.50¢ of per-bar noise into the cached SIP series moves **29.7%** of trades. A
+repeated median resists outlier *points*, not error on *every* point.
+
+⚑ **The table above is re-derivable, not quoted.** The June 2024 IEX bars are cached beside
+the SIP bars (`cache/SPY_5min_iex.npz`, 18 KB) exactly so this does not rest on one
+un-repeatable network run, and `test_unit4_iex_signal_divergence_on_real_feeds` recomputes
+every figure in it from that cache. SIP's 1,824 session bars and 1,349 gated bars are also
+checkable by arithmetic: June 2024 has 19 trading days, and 19 × 96 and 19 × 71 are exactly
+those two numbers.
+
+⚑ **The cost constant needs Unit 9's attention, not Unit 4's.** `$0.017/share on sells` folds
+two structurally different fees into one notional-scaled number. FINRA's TAF is charged **per
+share** and does not scale with notional at all; the SEC Section 31 fee is charged on notional
+and its rate is reset periodically. Folding them together means one of the two is modelled with
+the wrong price sensitivity for the whole sample, and a rate pinned at one point in time is
+wrong at the others.
+
+⚑ **Unverified, and deliberately left that way here.** The per-share TAF figure and the
+Section 31 rate history are external facts, not repo measurements, and this project does not
+put unmeasured numbers in the durable record. Unit 9 already owns *"verify (not re-apply) the
+§1.3 cost model"*; the verification is a source lookup against FINRA's TAF schedule and the
+SEC's published Section 31 fee-rate advisories for each year in the sample, and the split
+above is what it should be looking for. Unit 4 takes a scalar `cost` per share per trade and
+is agnostic to how it was built.
 
 ### 3.3 Parameter grid
 
