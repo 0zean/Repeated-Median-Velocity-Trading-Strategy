@@ -868,3 +868,224 @@ def metrics(
     # is_never_zero_on_real_data` checks the invariant where it is actually produced.
     _metrics(trades, out, scratch)
     return out
+
+
+# ----------------------------------------------------------------- grid runner (Unit 6)
+
+# SPEC §3.3's `vup`/`vdn` grid: 0.25 .. 3.50 step 0.25, in normalized sd, one grid for
+# every N because Unit 3's `xmult` already removed the N-dependence.
+#
+# Written `0.25 * k` because the *count* is then stated rather than solved for. `np.arange`
+# with a float step is exact on these values -- it computes `start + i * step`, not a
+# running sum, and 0.25 is a power of two -- so the danger is not the arithmetic, it is the
+# half-open stop: `np.arange(0.25, 3.50, 0.25)` returns **13** values and silently drops
+# `vup = 3.50`, which is 308 of the 4312 combos, and only a test that pins the literal
+# values catches it (`test_unit6_grid_is_spec_3_3`). The `3.51` in the obvious spelling is
+# there to work around exactly that, which is a good sign it is the wrong spelling.
+V_VALUES = 0.25 * np.arange(1, 15, dtype=np.float64)
+V_VALUES.flags.writeable = False
+
+
+@njit(parallel=True, cache=True)
+def _run_grid(
+    rmv_window: np.ndarray,
+    close: np.ndarray,
+    gate: np.ndarray,
+    thr: np.ndarray,
+    cost: float,
+    out: np.ndarray,
+    trades: np.ndarray,
+    scratch: np.ndarray,
+) -> None:
+    """Every combo's metric row. See `run_grid` -- this is the same code without the guards.
+
+    `prange` runs over **`a`, the N index**, not over the flat combo index. PLAN §2.1
+    assumed the latter and asked for static contiguous chunks to keep a thread on one or
+    two N-rows; ranging over `a` gets that by construction, and it is also what makes the
+    two scratch buffers safe without a thread id -- iteration `a` owns `trades[a]` and
+    `scratch[a]`, which no other iteration touches.
+
+    ponytail: 22 tasks, and their cost is far from equal -- n=3 averages 49.2 trades per
+    combo against n=24's 11.3, measured over 24 real windows -- so the measured speedup is
+    **5.2x**, not 22x: 3.2 ms against 16.6 ms on one thread. Ceiling named rather than
+    fixed, because the budget is 60 ms and this is 3.2. The upgrade path is chunking the
+    flat combo index across `numba.get_num_threads()` slices with buffers indexed by chunk
+    -- same disjointness argument, better balance -- and it is worth writing the day a
+    window costs 19x more than this one does.
+
+    Bit-identical across thread counts follows from the same disjointness: every iteration
+    writes its own 196 output rows and nothing reduces across them.
+
+    `_simulate` fills `buf` and returns `k`; `_metrics` consumes `buf[:k]` **before** the
+    next combo overwrites it. The two calls being adjacent is the whole of that contract
+    (PLAN Unit 6) -- anything that collects trade arrays first reads the wrong combo.
+    """
+    n_v = thr.shape[1]
+    for a in prange(thr.shape[0]):
+        row = rmv_window[a]
+        buf = trades[a]
+        scr = scratch[a]
+        c = a * n_v * n_v
+        for i in range(n_v):
+            up = thr[a, i]
+            for j in range(n_v):
+                k = _simulate(row, close, gate, up, thr[a, j], cost, buf)
+                _metrics(buf[:k], out[c], scr)
+                c += 1
+
+
+def run_grid(
+    rmv_window: np.ndarray,
+    close: np.ndarray,
+    gate: np.ndarray,
+    ns: np.ndarray,
+    vs: np.ndarray,
+    xmult: float,
+    cost: float,
+    out: np.ndarray | None = None,
+    trades: np.ndarray | None = None,
+    scratch: np.ndarray | None = None,
+) -> np.ndarray:
+    """Simulate and score every `(n, vup, vdn)` combo on one window. SPEC §3.3, §6.1.
+
+    Returns `out`, a `float32[len(ns) * len(vs)**2, 24]` -- one `METRIC_COLS` row per
+    combo, in the **`a`-major** order `c = a * len(vs)**2 + i * len(vs) + j` for
+    `n = ns[a]`, `vup = vs[i]`, `vdn = vs[j]`. Unit 7 calls this twice per window, once on
+    the IS slice and once on the OOS slice with the *same* `xmult`, then writes
+    `out[:, IS_COLS]` and `out[:, OOS_COLS]` to their two separate files.
+
+    `rmv_window` is `float32[len(ns), T]` -- a **copy** of the window's columns out of the
+    Unit 2 matrix, not a strided view, per PLAN §2.1. `close` and `gate` are the same
+    window's bars. `xmult` is `rmv.xmult` on this window, `cost` one round trip per trade.
+
+    ⚠ **`ns[a]` must be the N that produced `rmv_window[a]`, and nothing here can check
+    it.** The matrix carries no labels, so a caller that slices rows and forgets to slice
+    `ns` the same way mis-scales every threshold by `sqrt(n_true / n)` and the run
+    completes with entirely plausible metrics. Only the shapes are checked. This is Unit 7's
+    obligation and `test_unit6_row_equals_the_unit4_5_path` is what pins the ordering it
+    depends on.
+
+    `vs` is in **grid units** (normalized sd, `V_VALUES`); the raw per-bar thresholds are
+    built here by `rmv.threshold`, hoisted to `len(ns) * len(vs)` divisions instead of one
+    per combo, and it is the only producer of them. Both sides of the grid come from the
+    same `vs`, so a 14-value grid is 196 pairs including `vup != vdn`.
+
+    Pass `out`, `trades` and `scratch` to reuse buffers across Unit 7's ~469 windows.
+    `trades` is `float64[>= len(ns), >= T, 4]` and `scratch` is `float64[>= len(ns), >= T]`
+    -- one pair of rows per `prange` iteration, 1.15 MB and 0.29 MB at PLAN's 1638-bar
+    window against the 0.41 MB table itself. They are **per-iteration, not per-thread**:
+    the kernel ranges over the N index, so `trades[a]` and `scratch[a]` are owned by
+    iteration `a` whatever the thread count is.
+
+    ⚠ The metric rows are `float32` storage, which is SPEC §7 rule 3 -- every accumulator
+    inside `_metrics` is float64 regardless. Measured over 1,078 real combos in Unit 5,
+    rounding the float64 row to float32 flipped 0 of SPEC §5's eight filter screens.
+    """
+    # The grid is validated first: `n_a` and `n_v` are what the `rmv_window` and `out`
+    # shape checks are stated in terms of, so a malformed grid would otherwise surface as a
+    # complaint about a different argument entirely.
+    ns = np.ascontiguousarray(ns)
+    vs = np.ascontiguousarray(vs, dtype=np.float64)
+    if ns.ndim != 1 or ns.size == 0 or not np.all(ns == np.floor(ns)) or np.any(ns < 3):
+        # ⚠ Integer-*valued*, checked before the cast rather than performed by it.
+        # `np.ascontiguousarray(ns, dtype=np.int64)` truncates, so a float64 `ns` carrying
+        # 3.9999999999999996 for n=4 -- one ulp low, which is what a division or a
+        # non-dyadic `arange` produces -- silently becomes 3, and the row it is paired with
+        # is still n=4's. That is precisely the `ns[a]` / `rmv_window[a]` mis-pairing this
+        # unit calls unguardable. *This* channel of it is guardable and now is; the other
+        # channel, a caller slicing matrix rows without slicing `ns` the same way, is not.
+        raise ValueError(f"ns must be a non-empty 1-D array of integers >= 3, got {ns}")
+    ns = ns.astype(np.int64, copy=False)
+    if vs.ndim != 1 or vs.size == 0 or not np.all(np.isfinite(vs)) or np.any(vs <= 0.0):
+        raise ValueError(
+            f"vs must be a non-empty 1-D array of finite positive grid units, got {vs}"
+        )
+
+    rmv_window = np.ascontiguousarray(rmv_window)
+    close = np.ascontiguousarray(close)
+    gate = np.ascontiguousarray(gate)
+    total = close.shape[0]
+    n_a = ns.shape[0]
+    n_v = vs.shape[0]
+    n_combos = n_a * n_v * n_v
+
+    # Dtypes checked and not coerced, as in `simulate`: a float64 `rmv_window` rounds onto
+    # the other side of a threshold and silently changes the trade list.
+    if close.ndim != 1 or close.dtype != np.float32:
+        raise ValueError(f"close must be 1-D float32, got {close.dtype}{close.shape}")
+    if rmv_window.shape != (n_a, total) or rmv_window.dtype != np.float32:
+        raise ValueError(
+            f"rmv_window must be float32[{n_a}, {total}] -- one row per n in `ns`, one "
+            f"column per bar in `close` -- got {rmv_window.dtype}{rmv_window.shape}"
+        )
+    if gate.shape != (total,) or gate.dtype != np.int8:
+        raise ValueError(f"gate must be int8[{total}], got {gate.dtype}{gate.shape}")
+    if not np.all((gate == 0) | (gate == 1)):
+        raise ValueError("gate must contain only 0 and 1")
+    if not np.isfinite(xmult) or xmult <= 0.0:
+        raise ValueError(f"xmult must be finite and > 0, got {xmult}")
+    if not np.isfinite(cost) or cost < 0.0:
+        raise ValueError(f"cost must be finite and >= 0, got {cost}")
+
+    # 14 divisions per n, hoisted out of the 196-combo sweep. `threshold` is njit and this
+    # is the Python side of it -- same expression, same rounding, so the grid cannot land
+    # on a different float64 than Unit 12b's per-bar call off `params.json`.
+    thr = np.empty((n_a, n_v), dtype=np.float64)
+    for a in range(n_a):
+        for i in range(n_v):
+            thr[a, i] = threshold(vs[i], xmult, ns[a])
+    if not np.all(np.isfinite(thr)) or np.any(thr <= 0.0):
+        # `simulate` raises on this per call; the kernel path skips those guards entirely,
+        # and a non-positive threshold makes the two crossing branches overlap while a NaN
+        # makes every comparison False -- a silent flat window, not an error.
+        raise ValueError(f"thresholds are not all finite and positive (xmult={xmult})")
+
+    if out is None:
+        out = np.empty((n_combos, N_METRICS), dtype=np.float32)
+    elif out.shape != (n_combos, N_METRICS) or out.dtype != np.float32:
+        raise ValueError(
+            f"out must be float32[{n_combos}, {N_METRICS}], got {out.dtype}{out.shape}"
+        )
+    elif not out.flags["C_CONTIGUOUS"]:
+        raise ValueError("out must be C-contiguous")
+
+    # PLAN Unit 6: `_metrics` cannot check `scratch`, numba bounds checking is off, and an
+    # undersized buffer is a silent out-of-bounds write rather than an exception. Both
+    # buffers are sized by the bar count because a trade opens at most once per gated bar.
+    if trades is None:
+        trades = np.empty((n_a, total, 4), dtype=np.float64)
+    elif trades.dtype != np.float64 or trades.ndim != 3 or trades.shape[2] != 4:
+        raise ValueError(f"trades must be float64[a, k, 4], got {trades.dtype}{trades.shape}")
+    elif trades.shape[0] < n_a or trades.shape[1] < total:
+        raise ValueError(
+            f"trades is {trades.shape[0]}x{trades.shape[1]}; {n_a} n-values x {total} bars "
+            "need at least that -- one buffer per prange iteration, one row per bar"
+        )
+    elif not trades.flags["C_CONTIGUOUS"]:
+        raise ValueError("trades must be C-contiguous")
+
+    if scratch is None:
+        scratch = np.empty((n_a, total), dtype=np.float64)
+    elif scratch.dtype != np.float64 or scratch.ndim != 2:
+        raise ValueError(f"scratch must be float64[a, k], got {scratch.dtype}{scratch.shape}")
+    elif scratch.shape[0] < n_a or scratch.shape[1] < total:
+        raise ValueError(
+            f"scratch is {scratch.shape[0]}x{scratch.shape[1]}; {n_a} n-values x {total} "
+            "bars need at least that"
+        )
+    elif not scratch.flags["C_CONTIGUOUS"]:
+        raise ValueError("scratch must be C-contiguous")
+
+    # All three buffers are written while the three inputs are still being read, and
+    # `trades` is read by `_metrics` while `scratch` is overwritten five times, so the
+    # buffers have to be disjoint from each other as well as from the inputs -- PLAN
+    # Unit 6 is explicit that `scratch` cannot be the trades buffer.
+    inputs = (("close", close), ("rmv_window", rmv_window), ("gate", gate))
+    outputs = (("out", out), ("trades", trades), ("scratch", scratch))
+    for i, (name, buf) in enumerate(outputs):
+        for other, arr in inputs + outputs[:i]:
+            if np.shares_memory(buf, arr):
+                raise ValueError(f"{name} aliases {other}; the kernel would overwrite it")
+
+    _run_grid(rmv_window, close, gate, thr, float(cost), out, trades, scratch)
+    return out

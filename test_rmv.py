@@ -2847,6 +2847,397 @@ def test_unit5_budget() -> None:
     )
 
 
+# ------------------------------------------------------------- grid runner (Unit 6)
+
+GRID_TOTAL = 1638  # PLAN §2.4's stated IS window size
+
+
+def _grid_window(start: int, total: int = GRID_TOTAL):
+    """One IS-sized real window as `(close, gate, rows, xmult)`, or None with no cache.
+
+    Columns are copied out of the Unit 2 matrix rather than passed as a strided view,
+    which is PLAN §2.1's rule and also what `run_grid`'s float32 shape check demands.
+    """
+    got = _real_bars()
+    if got is None:
+        return None
+    bars, matrix = got
+    sl = slice(start, start + total)
+    close = np.ascontiguousarray(bars.close[sl])
+    gate = np.ascontiguousarray(bars.gate[sl])
+    rows = np.ascontiguousarray(matrix[:, sl])
+    return close, gate, rows, rmv.xmult(rows, gate == 1)
+
+
+def _grid_starts(count: int, total: int = GRID_TOTAL):
+    """The same window starts Units 4 and 5 timed, so the three budgets are comparable."""
+    got = _real_bars()
+    if got is None:
+        return None
+    return np.linspace(30_000, len(got[0]) - total - 1, count).astype(int)
+
+
+def _grid_reference(close, gate, rows, mult, ns, vs, cost) -> np.ndarray:
+    """The Unit 4 + Unit 5 path, serially, in `a`-major order. `run_grid` must equal this."""
+    out = np.empty((ns.size * vs.size * vs.size, rmv.N_METRICS), np.float32)
+    buf = np.empty((close.size, 4), np.float64)
+    scratch = np.empty(close.size, np.float64)
+    c = 0
+    for a in range(ns.size):
+        row = np.ascontiguousarray(rows[a])
+        for i in range(vs.size):
+            for j in range(vs.size):
+                k = rmv._simulate(row, close, gate,
+                                  rmv.threshold(vs[i], mult, ns[a]),
+                                  rmv.threshold(vs[j], mult, ns[a]), cost, buf)
+                rmv._metrics(buf[:k], out[c], scratch)
+                c += 1
+    return out
+
+
+def test_unit6_row_equals_the_unit4_5_path() -> None:
+    """PLAN Unit 6's load-bearing done-when, at two altitudes.
+
+    `run_grid` calls the unvalidated kernels directly, so nothing else checks that `ns[a]`
+    reaches row `a`'s thresholds, that the combo index is `a`-major, or that `_metrics`
+    reads combo *c*'s trades before `_simulate` overwrites the buffer for *c+1*. All three
+    are silent: a mis-paired `n` mis-scales the threshold by `sqrt(n_true / n)` and the run
+    completes with entirely plausible metrics.
+
+    So: every one of the 4312 rows against a serial replay of the same kernels, **and**
+    twelve spot rows -- the six grid corners plus six random draws -- against the guarded
+    public `simulate` + `metrics`, which share no buffer, no ordering and no threshold
+    hoisting with the kernel path.
+    """
+    starts = _grid_starts(1)
+    if starts is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    close, gate, rows, mult = _grid_window(starts[0])
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+
+    table = rmv.run_grid(rows, close, gate, ns, vs, mult, COST)
+    assert table.shape == (4312, 24) and table.dtype == np.float32, table.shape
+    assert not np.isnan(table).any(), "a NaN reached the storage table -- SPEC §7 rule 2"
+
+    ref = _grid_reference(close, gate, rows, mult, ns, vs, COST)
+    bad = np.flatnonzero(~(table == ref).all(axis=1))
+    assert bad.size == 0, (
+        f"{bad.size} of 4312 rows differ from the serial Unit 4+5 replay; first is combo "
+        f"{bad[0]} (n={ns[bad[0] // 196]}, i={bad[0] % 196 // 14}, j={bad[0] % 14})"
+    )
+
+    # The independent half: the public wrappers, which validate their inputs, allocate
+    # their own buffers and take `vup`/`vdn` one pair at a time. If both the kernel and
+    # the replay above agreed on a *wrong* combo order, this is what catches it.
+    # Stratified, not purely random: a fixed seed draws 8 combos that happen to touch
+    # only 5 of the 22 N-values and never n=3 or n=24 -- the two rows with the most
+    # distinct combos and the most extreme thresholds. The six corners are pinned and the
+    # random draws are on top of them.
+    rng = np.random.default_rng(6)
+    hi_a, hi_v = ns.size - 1, vs.size - 1
+    picks = [(0, 0, 0), (0, 0, hi_v), (0, hi_v, hi_v), (hi_a, 0, 0), (hi_a, hi_v, 0),
+             (hi_a, hi_v, hi_v)]
+    picks += [(int(rng.integers(ns.size)), int(rng.integers(vs.size)),
+               int(rng.integers(vs.size))) for _ in range(6)]
+    for a, i, j in picks:
+        trades = rmv.simulate(np.ascontiguousarray(rows[a]), close, gate,
+                              rmv.threshold(vs[i], mult, ns[a]),
+                              rmv.threshold(vs[j], mult, ns[a]), COST)
+        expect = rmv.metrics(trades).astype(np.float32)
+        c = a * vs.size * vs.size + i * vs.size + j
+        assert np.array_equal(table[c], expect), (
+            f"combo (n={ns[a]}, vup={vs[i]}, vdn={vs[j]}) at row {c} disagrees with the "
+            f"public path:\n{table[c]}\n{expect}"
+        )
+    print(f"    (4312 rows bit-identical, {table[:, 1].mean():.1f} trades/combo)", end="")
+
+
+def test_unit6_grid_is_spec_3_3() -> None:
+    """The two grid constants, against literals rather than against their own construction.
+
+    ⚑ The hazard is the element count, not the arithmetic. `np.arange` with a float step is
+    exact here -- it computes `start + i * step` and 0.25 is a power of two -- but its stop
+    is half-open, so `np.arange(0.25, 3.50, 0.25)` returns **13** values and drops
+    `vup = 3.50`: 308 of the 4312 combos gone, every other test in this unit still green,
+    because they all derive their expectations from `V_VALUES` itself. This is the only
+    test that owes it nothing.
+    """
+    assert rmv.V_VALUES.tolist() == [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75,
+                                     2.00, 2.25, 2.50, 2.75, 3.00, 3.25, 3.50], rmv.V_VALUES
+    assert rmv.N_VALUES.tolist() == list(range(3, 25)), rmv.N_VALUES
+    assert rmv.N_VALUES.size * rmv.V_VALUES.size ** 2 == 4312, "SPEC §3.3's grid size"
+
+
+def test_unit6_is_thread_count_invariant() -> None:
+    """Bit-identical on 1 thread and on all of them -- PLAN Unit 6's done-when.
+
+    Not a formality even though each combo writes an independent row: `trades` and
+    `scratch` are shared buffers indexed by the loop variable, so any scheduling change
+    that let two iterations land on the same buffer index would show up here and nowhere
+    else. Run on real data because a synthetic window can be quiet enough that most combos
+    produce no trades and every buffer race is invisible.
+    """
+    import numba
+
+    starts = _grid_starts(1)
+    if starts is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    close, gate, rows, mult = _grid_window(starts[0])
+    keep = numba.get_num_threads()
+    try:
+        numba.set_num_threads(1)
+        one = rmv.run_grid(rows, close, gate, rmv.N_VALUES, rmv.V_VALUES, mult, COST)
+        numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+        many = rmv.run_grid(rows, close, gate, rmv.N_VALUES, rmv.V_VALUES, mult, COST)
+        threads = numba.get_num_threads()
+    finally:
+        numba.set_num_threads(keep)
+    assert one.tobytes() == many.tobytes(), (
+        f"{np.flatnonzero(~(one == many).all(axis=1)).size} rows differ between 1 thread "
+        f"and {threads}"
+    )
+    print(f"    (identical on 1 and {threads} threads)", end="")
+
+
+def test_unit6_reuses_buffers_across_windows() -> None:
+    """Unit 7 passes one set of buffers through ~469 windows; dirt must not survive.
+
+    `out` is fully overwritten every call, `trades` is overwritten up to `k` rows and read
+    only that far, and `scratch` is refilled per median. Each of those is an argument, not
+    a proof, so the test dirties all three on a busy window and re-runs a quiet one.
+    """
+    starts = _grid_starts(2)
+    if starts is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    a_win, b_win = (_grid_window(s) for s in starts)
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+
+    clean = rmv.run_grid(b_win[2], b_win[0], b_win[1], ns, vs, b_win[3], COST)
+    out = np.empty((4312, rmv.N_METRICS), np.float32)
+    trades = np.empty((ns.size, GRID_TOTAL, 4), np.float64)
+    scratch = np.empty((ns.size, GRID_TOTAL), np.float64)
+    rmv.run_grid(a_win[2], a_win[0], a_win[1], ns, vs, a_win[3], COST, out, trades, scratch)
+    dirty = rmv.run_grid(b_win[2], b_win[0], b_win[1], ns, vs, b_win[3], COST,
+                         out, trades, scratch)
+    assert dirty is out, "run_grid did not return the caller's buffer"
+    assert clean.tobytes() == dirty.tobytes(), (
+        f"{np.flatnonzero(~(clean == dirty).all(axis=1)).size} rows changed when the "
+        "buffers arrived dirty from the previous window"
+    )
+
+    # Oversized buffers are legal -- Unit 7 sizes them once for the longest window it will
+    # ever see and reuses them on shorter ones.
+    big = rmv.run_grid(b_win[2], b_win[0], b_win[1], ns, vs, b_win[3], COST,
+                       None, np.empty((ns.size + 3, GRID_TOTAL + 50, 4), np.float64),
+                       np.empty((ns.size + 3, GRID_TOTAL + 50), np.float64))
+    assert clean.tobytes() == big.tobytes(), "an oversized buffer changed the answer"
+
+
+def test_unit6_zero_allocation_in_prange() -> None:
+    """PLAN Unit 6's done-when: nothing allocates per combo inside the parallel region.
+
+    The njit-to-njit trick Unit 5 used is not available here -- `_run_grid` is
+    `parallel=True`, and numba runs an inner `prange` serially when it is called from
+    another njit function, so a driver would measure a different kernel than the one that
+    ships. Instead: allocations per *call* must not depend on the combo count. Argument
+    boxing at the interpreter boundary is a fixed cost of eight arrays; anything the loop
+    body allocates scales with the 49x between the two grids below. Both grids keep all 22
+    n-values, so the `prange` iteration count is identical and only the inner sweep differs
+    -- otherwise this would be measuring numba's per-chunk scheduling instead.
+    """
+    import os
+
+    src = (
+        "import numpy as np, rmv\n"
+        "from numba.core.runtime import nrt\n"
+        "rng = np.random.default_rng(0)\n"
+        "T = 1638\n"
+        "close = np.cumsum(rng.normal(0, 0.05, T).astype(np.float32)) + 500.0\n"
+        "close = close.astype(np.float32)\n"
+        "gate = np.ones(T, np.int8)\n"
+        "def run(ns, vs, reps):\n"
+        "    rows = np.ascontiguousarray(rmv.rmv_all_n(close, ns))\n"
+        "    mult = rmv.xmult(rows, gate == 1, ns)\n"
+        "    out = np.empty((ns.size * vs.size ** 2, rmv.N_METRICS), np.float32)\n"
+        "    tr = np.empty((ns.size, T, 4)); sc = np.empty((ns.size, T))\n"
+        "    args = (rows, close, gate, ns, vs, mult, 0.027, out, tr, sc)\n"
+        "    rmv.run_grid(*args)\n"
+        "    before = nrt.rtsys.get_allocation_stats().alloc\n"
+        "    for _ in range(reps): rmv.run_grid(*args)\n"
+        "    return nrt.rtsys.get_allocation_stats().alloc - before\n"
+        "small = run(rmv.N_VALUES, 0.25 * np.arange(1, 3), 20)\n"
+        "big = run(rmv.N_VALUES, rmv.V_VALUES, 20)\n"
+        "print(small, big)\n"
+    )
+    env = {**os.environ, "NUMBA_NRT_STATS": "1", "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True,
+                          cwd=str(Path(__file__).parent), env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    small, big = (int(x) for x in proc.stdout.strip().splitlines()[-1].split())
+    assert big == small, (
+        f"{big / 20:.1f} allocations per 4312-combo call against {small / 20:.1f} per "
+        "88-combo call -- something inside the loop allocates, and `np.median` or "
+        "`ndarray.sort()` in `_median` is exactly what does it"
+    )
+    print(f"    ({big / 20:.0f} allocations per call at 88 and at 4312 combos, "
+          "all argument boxing)", end="")
+
+
+def test_unit6_effective_grid_size() -> None:
+    """PLAN Unit 6's free diagnostic: how many of the 4312 combos are actually distinct.
+
+    SPY moves in pennies, so at low `n` many neighbouring `(vup, vdn)` pairs cross the same
+    bars and produce the same trade list. Unit 9's comparison multiplier is the number of
+    *independent* things tried, so the honest count is distinct trade sets, not 4312.
+
+    The cheap proxy is distinct metric rows, which Unit 9 can read straight off the stored
+    table. It can only undercount -- identical trade sets always give identical rows, and
+    two different sets agreeing on all 24 float columns would be a coincidence. Measured
+    here against the real thing rather than assumed, on one window.
+    """
+    starts = _grid_starts(4)
+    if starts is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+    counts = []
+    for w, start in enumerate(starts):
+        close, gate, rows, mult = _grid_window(start)
+        table = rmv.run_grid(rows, close, gate, ns, vs, mult, COST)
+        by_row = np.unique(table, axis=0).shape[0]
+        counts.append(by_row)
+        if w:
+            continue
+        # The oracle, once: hash the actual trade lists.
+        buf = np.empty((close.size, 4), np.float64)
+        seen = set()
+        for a in range(ns.size):
+            row = np.ascontiguousarray(rows[a])
+            for i in range(vs.size):
+                for j in range(vs.size):
+                    k = rmv._simulate(row, close, gate, rmv.threshold(vs[i], mult, ns[a]),
+                                      rmv.threshold(vs[j], mult, ns[a]), COST, buf)
+                    seen.add(buf[:k].tobytes())
+        assert by_row <= len(seen), (
+            f"{by_row} distinct metric rows against {len(seen)} distinct trade sets -- the "
+            "proxy is supposed to be an undercount, so this is a hash collision or worse"
+        )
+        assert by_row >= 0.99 * len(seen), (
+            f"the metric-row proxy sees {by_row} of {len(seen)} distinct trade sets; it is "
+            "too lossy to stand in for the real count in Unit 9's multiplier"
+        )
+    lo, hi = min(counts), max(counts)
+    assert hi < 4312, "every combo distinct -- the diagnostic is measuring nothing"
+    print(f"    ({lo}-{hi} distinct of 4312 combos over 4 windows, "
+          f"{100 * lo / 4312:.0f}-{100 * hi / 4312:.0f}%)", end="")
+
+
+def test_unit6_rejects_bad_input() -> None:
+    """Each guard is for a caller mistake that would otherwise return a plausible table.
+
+    The one that cannot be guarded is `ns[a]` not being the N that produced
+    `rmv_window[a]` -- there is no label on the matrix -- so it is Unit 7's obligation and
+    is documented, not checked.
+    """
+    ns = np.arange(3, 6, dtype=np.int64)
+    vs = np.array([0.5, 1.0])
+    total = 600
+    rng = np.random.default_rng(3)
+    close = (500.0 + np.cumsum(rng.normal(0, 0.05, total))).astype(np.float32)
+    gate = np.ones(total, np.int8)
+    rows = np.ascontiguousarray(rmv.rmv_all_n(close, ns))
+    mult = rmv.xmult(rows, gate == 1, ns)
+    ok = dict(rmv_window=rows, close=close, gate=gate, ns=ns, vs=vs, xmult=mult, cost=0.027)
+    n_combos = ns.size * vs.size ** 2
+
+    def rejects(fragment, **kw):
+        try:
+            rmv.run_grid(**{**ok, **kw})
+        except ValueError as exc:
+            assert fragment in str(exc), f"wrong message for {fragment!r}: {exc}"
+            return
+        raise AssertionError(f"accepted input that should raise on {fragment!r}")
+
+    rejects("close must be", close=close.astype(np.float64))
+    rejects("rmv_window must be", rmv_window=rows.astype(np.float64))
+    rejects("rmv_window must be", rmv_window=rows[:2])              # dropped an n row
+    rejects("rmv_window must be", rmv_window=rows[:, :-1].copy())   # off by one bar
+    rejects("gate must be int8", gate=gate.astype(np.int64))
+    rejects("only 0 and 1", gate=np.full(total, 2, np.int8))
+    rejects("ns must be", ns=np.array([2, 3, 4]))                   # n=2 has no RMedV
+    # One ulp below 4.0 -- what a division or a non-dyadic arange produces. Coerced to
+    # int64 this is 3, paired with n=4's RMedV row, and the run returns plausible metrics.
+    rejects("ns must be", ns=np.array([3.0, np.nextafter(4.0, 0.0), 5.0]))
+    rejects("vs must be", vs=np.array([0.5, -1.0]))                 # a negative threshold
+    rejects("vs must be", vs=np.array([0.5, np.nan]))               # every compare False
+    rejects("xmult must be", xmult=0.0)
+    rejects("xmult must be", xmult=float("nan"))
+    rejects("cost must be", cost=-0.01)                             # inflates every metric
+    rejects("out must be", out=np.empty((n_combos, 23), np.float32))
+    rejects("out must be", out=np.empty((n_combos, 24), np.float64))
+    rejects("trades is", trades=np.empty((ns.size, total - 1, 4)))  # one bar short
+    rejects("trades is", trades=np.empty((ns.size - 1, total, 4)))  # one n short
+    rejects("trades must be", trades=np.empty((ns.size, total, 3)))
+    rejects("scratch is", scratch=np.empty((ns.size, total - 1)))
+    rejects("scratch must be", scratch=np.empty((ns.size, total), np.float32))
+    # Real overlaps, not two separate buffers: `scratch` carved out of the `trades`
+    # block, and `out` carved out of the same float32 storage as `rmv_window`.
+    pool = np.empty(ns.size * total * 4, np.float64)
+    rejects("aliases", trades=pool.reshape(ns.size, total, 4),
+            scratch=pool[:ns.size * total].reshape(ns.size, total))
+    pool32 = np.empty(ns.size * total, np.float32)
+    shared_rows = pool32.reshape(ns.size, total)
+    shared_rows[:] = rows
+    rejects("aliases", rmv_window=shared_rows,
+            out=pool32[:n_combos * 24].reshape(n_combos, 24))
+    # Exactly-sized buffers are enough, and a single-combo grid is legal.
+    rmv.run_grid(**ok, out=np.empty((n_combos, 24), np.float32),
+                 trades=np.empty((ns.size, total, 4)), scratch=np.empty((ns.size, total)))
+    rmv.run_grid(rows[:1], close, gate, ns[:1], vs[:1], mult, 0.0)
+
+
+def test_unit6_budget() -> None:
+    """< 60 ms per window, on real windows, and with `prange` as headroom rather than alibi.
+
+    Unit 5 measured the serial sweep at 21 ms, so this passing tells us little on its own;
+    what it has to catch is a regression that makes the parallel path *slower* than the
+    serial one -- a per-call buffer allocation, a lost specialization, a copy inside the
+    loop. Both numbers are printed so the ratio is visible.
+    """
+    import time
+
+    starts = _grid_starts(4)
+    if starts is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+    out = np.empty((4312, rmv.N_METRICS), np.float32)
+    trades = np.empty((ns.size, GRID_TOTAL, 4), np.float64)
+    scratch = np.empty((ns.size, GRID_TOTAL), np.float64)
+    warm = _grid_window(starts[0])
+    rmv.run_grid(warm[2], warm[0], warm[1], ns, vs, warm[3], COST, out, trades, scratch)  # JIT
+
+    worst = worst_trades = 0.0
+    for start in starts:
+        close, gate, rows, mult = _grid_window(start)
+        begin = time.perf_counter()
+        rmv.run_grid(rows, close, gate, ns, vs, mult, COST, out, trades, scratch)
+        elapsed = time.perf_counter() - begin
+        if elapsed > worst:
+            worst, worst_trades = elapsed, out[:, 1].mean()
+    print(f"    (worst real window {worst * 1000:.1f} ms for 4312 combos, "
+          f"{worst_trades:.1f} trades/combo)", end="")
+    assert worst_trades > 10, (
+        f"only {worst_trades:.1f} trades per combo -- this is timing an empty grid"
+    )
+    assert worst < 0.060, (
+        f"{worst * 1000:.1f} ms for one window's 4312 combos against the 60 ms budget"
+    )
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

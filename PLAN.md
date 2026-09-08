@@ -272,7 +272,8 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 | RMV, 22 N × 196k bars | < 5 s, < 50 MB | **1.95 s, 34 MB** (prototype) |
 | ⚑ RMV, 22 N × 257k bars, shipped kernel, no fastmath | < 5 s, < 50 MB | **1.91 s, 23 MB** |
 | Same via `scipy.siegelslopes` (oracle only) | — | ~27–47 s |
-| Grid, one IS window (4312 × 1638) | < 60 ms | **43 ms** |
+| Grid, one IS window (4312 × 1638) | < 60 ms | **43 ms** (prototype) |
+| ⚑ Same, shipped `run_grid`, 32 threads | < 60 ms | **3.2 ms** (16.6 ms on 1 thread) |
 | Full PWFO, 546 windows, IS+OOS | < 60 s, peak RSS < 1 GB | **~32 s, 226 MB** |
 | One filter over the full table | < 1 s | — |
 | Live per-bar compute | < 1 ms, zero steady-state allocation | — |
@@ -590,73 +591,145 @@ trade list, so a streak has no way to span windows.
 
 ---
 
-### Unit 6 — Grid runner
+### Unit 6 — Grid runner ✅ **shipped**
 
-**Do** `run_grid(rmv_window, close, gate, ns, vs, out)` — `prange` over an `a`-major combo
-index, writing a preallocated `float32[4312, 24]`.
+**Shipped** in `rmv.py`: `V_VALUES` (SPEC §3.3's 14 grid units, built as `0.25 * k` so every
+value is exact where `np.arange`'s accumulated step is not), the `parallel=True` njit
+`_run_grid`, and the guarded
+`run_grid(rmv_window, close, gate, ns, vs, xmult, cost, out=None, trades=None, scratch=None)`
+returning `float32[len(ns) * len(vs)**2, 24]`. `xmult` and `cost` are the two arguments the
+plan's stated signature was missing; both are positional and neither has a default, because
+Unit 7 must supply a per-window value for each and a default would be the one mistake this
+unit cannot detect.
 
-⚑ **Scale thresholds, not rows** (Unit 3). `RMedV_norm >= vup` is
-`RMedV >= vup / (xmult * sqrt(n))`, so the window's `xmult` turns into 14 divisions per `n`
-instead of a second 22 x T matrix. Measured over 55.5M real `(bar, n, v)` triples — 111.1M
-comparisons, counting both threshold sides — the two orderings differ in **0** cases, as does a float32 vs float64 threshold constant — but pin the
-convention anyway, so the backtest and live paths cannot drift onto opposite sides of it.
+⚑ **`prange` runs over `a`, the N index, not the flat combo index.** §2.1 assumed the latter
+and asked for static contiguous chunks to keep a thread on one or two N-rows; ranging over
+`a` gets that by construction and, more usefully, makes the two scratch buffers safe with no
+thread id at all — iteration `a` owns `trades[a]` and `scratch[a]` and no other iteration
+touches them. Bit-identical output across thread counts is then a property of the loop shape
+rather than something a test has to hope for. Buffers are `float64[>= len(ns), >= T, 4]` and
+`float64[>= len(ns), >= T]` — **per iteration, not per thread** — 1.15 MB and 0.29 MB at the
+1638-bar window, against the 0.41 MB table itself.
 
-⚑ **Free diagnostic**: count **distinct** trade sets among the 4312 combos per window. On a
-penny-tick instrument at low N many `(vup, vdn)` pairs are clones; the effective grid size is
-smaller than 4312 and directly informs §Unit 9's multiplier.
+**Done when — all met.**
 
-⚑ **From Unit 4.** The inner call is
-`rmv._simulate(row_a, close, gate, up, dn, cost, trades)` with
-`up = rmv.threshold(vs[j], xmult, ns[a])` **hoisted per `(n, v)`** — the 14 divisions per `n`
-above, not one per combo. Two obligations follow: `run_grid` gains a `cost` argument (the
-signature above omits it, and Unit 5 applies cost to net figures, so it has to arrive here),
-and the `trades` buffer must be a per-thread caller-owned slice of `len(close)` rows, since
-`_simulate` takes `out` and this unit's own done-when forbids allocation in `prange`.
+- **Any single row equals the Unit 4+5 path**, at two altitudes: all **4312 rows
+  bit-identical** to a serial replay of `_simulate` + `_metrics`, and 8 random rows
+  bit-identical to the guarded public `simulate` + `metrics`, which share no buffer, no combo
+  ordering and no threshold hoisting with the kernel path. The second half is what would
+  catch the kernel and its replay agreeing on a *wrong* order.
+- **Bit-identical on 1 thread and on 32**, measured through `numba.set_num_threads` on a real
+  window rather than argued from the loop shape.
+- **3.2 ms per window** worst observed against the 60 ms budget (2.1 ms in a quiet run).
+- **Zero allocation in `prange`: 7 per call at 88 combos and 7 per call at 4312**, all of it
+  argument boxing at the interpreter boundary. ⚑ Unit 5's njit-to-njit driver trick is *not*
+  available here — numba runs an inner `prange` serially when the kernel is called from
+  another njit function, so a driver would measure a different kernel than the one that
+  ships. The test instead holds the `prange` iteration count fixed at 22 (both grids keep all
+  22 N-values) and varies only the inner sweep, 49×; anything the loop body allocated would
+  scale with it. ⚑ **That sentence was false when first written** — see the review triage.
 
-⚑ **`simulate` returns a *view* into `out`, and this unit is where that bites.** One buffer
-serves all 4312 combos in sequence, so Unit 5 code that keeps the returned array instead of
-consuming it immediately reads the *next* combo's trades. Documented in `rmv.simulate` but
-unguarded; add "the metric row for combo *c* is computed before combo *c+1* runs" to the
-done-when, or copy at the boundary.
+**26 of 26 mutations killed, 3 provably equivalent.** The equivalents are `prange` →
+`range` (the loop shape is the correctness argument; the budget still passes at 16.6 ms),
+`V_VALUES` built by `np.arange(0.25, 3.51, 0.25)`, which is **bit-identical** to `0.25 * k`,
+and `astype(np.int64)` with and without `copy=False` on an already-int64 `ns`.
 
-⚑ Its done-when — "any single row equals the Unit 4+5 path" — is **load-bearing, not a
-formality**: `run_grid` calls the unvalidated njit kernel directly, so it is the only thing
-checking that `ns[a]` is matched to row `a`. A mismatch mis-scales the threshold by
-`sqrt(n_true / n)` and the run completes with plausible metrics.
+⚑ **That second equivalent caught a claim of mine that was wrong.** The comment shipped in
+`rmv.py` said `arange` "accumulates its step and lands 3.5000000000000004 at the top". It does
+not — `np.arange` computes `start + i * step`, not a running sum, and 0.25 is a power of two,
+so both spellings are exact to the last bit. Corrected in place. The real hazard is the one
+the mutation harness then confirmed: the stop is **half-open**, so `np.arange(0.25, 3.50,
+0.25)` returns **13** values and silently drops `vup = 3.50` — 308 of the 4312 combos — and
+every other test in this unit still passes, because they all derive their expectations from
+`V_VALUES` itself. `test_unit6_grid_is_spec_3_3` pins the 14 values literally and is the only
+test here that owes them nothing; it kills both that mutation and a shifted grid.
 
-⚑ **From Unit 5.** The inner call after `_simulate` is
-`rmv._metrics(trades[:k], out[c], scratch)`, and it writes all 24 columns whether the run is
-IS or OOS. Three obligations follow:
+⚑ **The parallel speedup is 5.2×, not 22×, and it is recorded rather than fixed.** Measured
+3.2 ms against 16.6 ms on one thread over the same four windows. The 22 tasks are far from
+equal: over 24 real windows `n=3` averages **49.2 trades per combo** against `n=24`'s
+**11.3**, and both `_median`'s insertion sort and the Kendall pass are O(k²), so the `n=3`
+row alone is most of the wall clock. Named as a `ponytail:` ceiling in `_run_grid` with the
+upgrade path (chunk the flat combo index across `numba.get_num_threads()` slices, buffers
+indexed by chunk — the same disjointness argument, better balance). Not worth writing at
+3.2 ms against 60.
 
-- `scratch` is a **second per-thread caller-owned buffer**, `float64[len(close)]` — 13 KB per
-  thread at the 1638-bar window size. `_metrics` refills it five times per combo for the
-  medians and once more for the Kendall pass, so it cannot be shared across threads and it
-  cannot be the trades buffer.
-- `out[c]` may be the **float32 storage row directly**; every accumulator inside `_metrics`
-  is float64 regardless, which is §1.7 rule 3. Measured over 1,078 real combos, rounding the
-  float64 row to float32 flipped **0** of the eight screens in SPEC §5, with the closest any
-  combo came to a bound at 2.9e-4 against a half-ulp of 1.9e-6.
-- Zero allocation inside `prange` holds: measured 0 per call njit-to-njit with
-  `NUMBA_NRT_STATS=1`. This is why `_median` is a hand-rolled insertion sort — `np.median`
-  costs 1 allocation per call and `ndarray.sort()` costs 4.
+⚑ **Free diagnostic — the effective grid is ~74% of 4312, and the plan had the mechanism
+backwards.** Distinct trade sets per window, measured over 24 real pre-tail windows:
+**2640–3652 of 4312 (61.2–84.7%), median 3202**. The plan predicted the clones would sit at
+*low* N on a penny-tick instrument. They do not — distinctness rises monotonically with the
+trade count and therefore *falls* with N: `n=3` averages 181.6 distinct of its 196 pairs,
+`n=24` averages 130.2, correlation with mean `nT` **+0.94**. Zero-trade combos are not the
+cause either (3.8 of 196 at `n=24`); a shorter trade list simply has fewer ways to differ.
+Unit 9's multiplier should use ~3200, not 4312.
 
-⚑ **From Unit 5: the buffer-reuse hazard is now concrete.** `simulate` returns a view, and
-`_metrics` must run on combo *c*'s trades before `_simulate` overwrites the buffer for
-*c+1*. The two calls being adjacent in the inner loop is what satisfies this; anything that
-batches trade arrays first does not.
+⚑ **The cheap proxy for that count is validated, not assumed.** Unit 9 can read distinct
+*metric rows* straight off the stored table, which can only undercount — identical trade sets
+always give identical rows. Measured against hashing the actual trade lists on three windows:
+gaps of **0, 7 and 0** out of ~3300, i.e. at worst 0.22%. `test_unit6_effective_grid_size`
+re-checks that on every run and fails if the proxy drifts past 1%.
 
-⚑ **From Unit 5: measured headroom.** `_simulate` + `_metrics` over one real window's 4312
-combos is **21 ms serial on one thread** (Unit 4's half was 13 ms), against this unit's
-60 ms budget. `prange` is headroom, not the thing being relied on.
+⚑ **The one thing that cannot be guarded is `ns[a]` not being the N that produced
+`rmv_window[a]`.** The matrix carries no labels, so a caller that slices rows and forgets to
+slice `ns` the same way mis-scales every threshold by `sqrt(n_true / n)` and the run completes
+with entirely plausible metrics. Only the shapes are checked. This is Unit 7's obligation and
+it is stated in `run_grid`'s docstring as such.
 
-⚑ **From Unit 5: assert the `scratch` length here, because `_metrics` cannot.** The wrapper
-checks it; `run_grid` calls the kernel directly and numba bounds checking is off, so an
-undersized `scratch` is a silent out-of-bounds write rather than an exception. One
-`assert scratch.shape[0] >= close.shape[0]` in `run_grid` closes it.
+### Review findings, triaged
 
-**Done when** any single row equals the Unit 4+5 path; output bit-identical across
-`NUMBA_NUM_THREADS=1` vs 32 (genuinely satisfiable — each combo writes an independent output
-row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero allocation in `prange`.
+One adversarial subagent per §4. It re-measured all seven claims (five reproduced exactly,
+including the 24-window effective-grid figures bit-for-bit; the timings reproduced in kind at
+2.3–5.7 ms across runs), confirmed both claimed equivalents independently, and ran its own
+mutations against the buffer-disjointness argument — forcing every `prange` iteration onto one
+`trades`/`scratch` row broke 5 of the 8 Unit 6 tests at once.
+
+- ⚑ **Fixed — a measurement that did not match its own description, and it was mine.** The
+  allocation test's "small" grid was `np.arange(3, 5)` — **2** N-values, so 8 combos and a
+  `prange` count of 2 — while its docstring, its assertion message and its printed output all
+  said 88 combos with the count "fixed at 22". The invariance result was real; the *reason*
+  given for it was not, because the outer count moved with the inner sweep, which is exactly
+  the confound the paragraph claimed to have eliminated. Now `rmv.N_VALUES` in both grids: 88
+  and 4312 combos, 22 iterations either way, still 7 allocations per call. ⚑ Root cause worth
+  recording: two `.replace()` calls in the patch script that wrote this test silently matched
+  nothing, because this shell mangles `\n` inside heredocs — the same hazard the Unit 5
+  handoff warned about. Every patch script since asserts each replacement fired.
+- **Fixed — `ns` was silently coerced where every other dtype is checked and rejected.**
+  `np.ascontiguousarray(ns, dtype=np.int64)` truncates, so a float64 `ns` carrying
+  3.9999999999999996 for `n=4` — one ulp low, what a division or a non-dyadic `arange`
+  produces — became 3 while still paired with `n=4`'s RMedV row. The reviewer demonstrated it:
+  accepted with no exception, 4 of 12 rows silently computed against the wrong row. That is
+  the `ns[a]` / `rmv_window[a]` mis-pairing this unit calls unguardable — and *this* channel of
+  it was guardable all along. Now rejected before the cast. The other channel, a caller
+  slicing matrix rows without slicing `ns`, still is not, and stays Unit 7's obligation.
+- **Fixed — the guard order misattributed two errors.** `n_a` was taken from `ns` before `ns`
+  was validated, so a malformed `ns` surfaced as *"rmv_window must be…"*. The grid is now
+  validated first. The remaining case is deliberate: a non-finite `vs` reaches the threshold
+  guard and reports *"thresholds are not all finite"*, which is the correct second line of
+  defence rather than a gap — an exception is always raised.
+- **Fixed — 8 fixed-seed spot rows touched only 5 of 22 N-values**, never `n=3` or `n=24`, the
+  rows with the most distinct combos and the most extreme thresholds. Now six pinned grid
+  corners plus six random draws. Mitigating, and measured by the reviewer: a vup/vdn swap is
+  already caught by the 4312-row half at 3992 rows differing, so the public-API half's unique
+  contribution is narrower than its framing suggested.
+- **Fixed — the alias sweep's hardcoded `range(3, 6)`** over a 6-tuple was correct today and a
+  magic-number contract tomorrow. Split into `inputs`/`outputs`; same 12 pairs, no positional
+  assumption. Both new mutations against it are killed.
+- **Rejected, with reason — the allocation test cannot see a dead allocation.** The reviewer
+  inserted a per-combo `np.empty(4)` whose value was multiplied by a literal `0.0`; the count
+  stayed at 7 because LLVM deletes an allocation that never escapes. Not a defect: it is not
+  an allocation in the shipped binary. Its realistic counterpart — reallocating `scratch` per
+  combo instead of reusing `scr = scratch[a]` — was caught hard, 4319 against 15.
+- **Recorded, not fixed** — the proxy-validation gaps (0, 7, 0 of ~3300) reproduce only under
+  `_grid_starts(24)`'s first three windows, not `_grid_starts(3)`; the shipped test checks one
+  window and says so. And no look-ahead was found: `run_grid` reads only the slices and the
+  two scalars it is handed.
+
+**The withheld tail was not touched.** The reviewer asserted `len(bars) == 245_025` before
+every measurement, and finished with `rmv.py` and `test_rmv.py` sha256-identical to how it
+found them. Unlike Unit 5's review, this one costs Unit 9's comparison counter nothing.
+
+**Review focus** Buffer aliasing across the three output buffers (checked pairwise, including
+`scratch` carved out of `trades`, which PLAN called out); the `a`-major index arithmetic;
+whether the 4312-row equality test can pass against a broken kernel.
 
 ---
 
@@ -707,6 +780,24 @@ enters the filter's choice of row and not merely the reported P&L. It therefore 
 `xmult`'s discipline exactly: computed from **IS bars only**, stored per window beside
 `xmult`, and applied to that window's IS *and* OOS runs. Deriving it from OOS prices would
 leak a price level backwards into a row that was already picked.
+
+⚑ **From Unit 6: three things `run_grid` hands over and one it cannot check.**
+
+- The combo index is `c = a * len(vs)**2 + i * len(vs) + j` for `n = ns[a]`, `vup = vs[i]`,
+  `vdn = vs[j]` — `a`-major, `vup` before `vdn`. Pinned in SPEC §3.3 because Units 8, 9 and 11
+  all have to map a winning row back to its parameters, and nothing in the stored table
+  records them.
+- `xmult` and `cost` are positional arguments with no defaults, and both are per window
+  (above). The same `xmult` goes into the IS and the OOS call; recomputing it on OOS is
+  look-ahead.
+- Pass `out`, `trades` and `scratch` once and reuse them across all ~469 windows — size them
+  for the **longest** window the generator will emit, since oversized buffers are legal and
+  undersized ones raise. 1.15 MB + 0.29 MB + 0.41 MB total, so this is about not churning the
+  allocator 938 times, not about peak RSS.
+- ⚑ **`ns[a]` must be the N that produced `rmv_window[a]`, and `run_grid` cannot check it** —
+  the matrix has no labels, and a mis-pairing mis-scales every threshold by
+  `sqrt(n_true / n)` and returns plausible metrics. Unit 7 slices both `rmv_matrix` and `ns`;
+  a done-when here should pin that they are sliced together, or simply never slice `ns`.
 
 ⚑ **From Unit 5: the 18/6 split is a slice, not a projection.** `run_grid` emits
 `float32[4312, 24]` for both the IS and the OOS run. Unit 7 writes `table[:, rmv.IS_COLS]` of
@@ -817,6 +908,11 @@ the two zero cases distinctly.
   schedule and the SEC's Section 31 advisories, and it belongs to this unit. Split the two,
   date-key the statutory one, and check the direction of the error before trusting any
   after-cost figure: `toNP > 0` is one of the three decision-gate conditions.
+⚑ **From Unit 6: the grid is ~3200 wide, not 4312.** Distinct trade sets per window
+measure **2640–3652 of 4312 (median 3202)** over 24 real windows, so a multiplier built on
+4312 overstates the search by ~35%. Read it per window off the stored table as the count of
+distinct metric rows — validated against hashing the real trade lists to within 0.22%.
+
 ⚑ **From Unit 5: two things the report must not misread.** `%P`, `eqR2`, `eq2R2` and
 `ktau` are all stored ×100 (SPEC §6.6) — `ktau` signed, so `[-100, 100]`. And our `dd`/`llt`
 are **net** where [M25 Table 1]'s `odd`/`ollt` are **gross**: Meyers subtracts cost as a

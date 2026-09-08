@@ -538,6 +538,25 @@ vdn  : 0.25 .. 3.50 step 0.25   (14 values)   -- normalized sd
 > [M25 p.7] states these ranges produce **4508** combinations. 22×14×14 = 4312; 4508 = 23×14×14.
 > One of the paper's stated ranges is off by one N-value. See §9-B.
 
+**Combo ordering — pinned in Unit 6.** The stored table has one row per combination and does
+not record the parameters, so the index *is* the mapping:
+
+```
+c = a * len(vs)**2 + i * len(vs) + j     n = ns[a], vup = vs[i], vdn = vs[j]
+```
+
+`a`-major, then `vup`, then `vdn` — 196 consecutive rows per N. Both `vup` and `vdn` are drawn
+from the same 14-value grid, so the 196 include every `vup != vdn` pair in both directions.
+`rmv.run_grid` emits this order and Units 7–11 read a winning row back to its parameters with
+it; the `a`-major part is also why one RMedV row stays hot across a whole 196-pair sweep
+(PLAN §2.1).
+
+⚑ **The effective grid is smaller than 4312.** Measured over 24 real pre-tail windows,
+distinct trade sets number **2640–3652 (median 3202)**, because neighbouring `(vup, vdn)`
+pairs frequently cross the same bars. Distinctness tracks the trade count (correlation +0.94
+with mean `nT`) and therefore falls as N rises — 181.6 of 196 at `n=3`, 130.2 at `n=24`. PLAN
+§Unit 9's comparison multiplier uses the distinct count, not 4312.
+
 ---
 
 ## 4. Walk-forward scheme
