@@ -285,7 +285,7 @@ a cache tier, or a distributed runner is solving a problem this project does not
 ## 3. Units of work
 
 Each unit: one sitting, one testable deliverable, then an adversarial review, then **stop**.
-DO NOT spawn many subagents during work to avoid hitting usage limits, only spawn the one adversarial subagent for review.
+DO NOT spawn many subagents during work to avoid hitting usage limits, only spawn the one adversarial subagent for review (Use sonnet 5 with max effort for subagent).
 
 ---
 
@@ -498,30 +498,95 @@ accounting; reversal-on-same-bar.
 
 ---
 
-### Unit 5 — Metric set
+### Unit 5 — Metric set ✅ **shipped**
 
-**Do** All 24 metrics from a trade array in one numba function, `cost` applied to net figures.
-⚑ Equity regressions per §1.7 rule 3: zero-based, mean-centered, float64 accumulators.
-`eqR2` = R² of a straight-line fit to **trade-indexed** equity; `eq2R2` = the 2nd-order fit.
+**Shipped** in `rmv.py`: `METRIC_COLS` (24 keys, PLAN §1.6's order), `N_METRICS`, `IS_COLS`,
+`OOS_COLS`, an allocation-free `_median`, the njit `_metrics(trades, out, scratch)` Unit 6
+calls inside `prange`, and the guarded `metrics(trades, out=None, scratch=None) -> float64[24]`.
+One 24-wide row carries both blocks: Unit 7 writes `row[IS_COLS]` from an IS run to
+`pwfo_is.npy` and `row[OOS_COLS]` from an OOS run to `pwfo_oos.npy`. Four columns are
+duplicates — `osnp`/`ont`/`ollt`/`odd` are `tnp`/`nT`/`llt`/`dd` on a different trade set —
+which costs 16 bytes a row against Unit 7 fancy-indexing at every write.
 
-**Done when** every metric matches an independent numpy computation on a hand-built trade
-list; ⚑ the base-$100 and base-$200,000 equity cases from §1.7 both stay exact; degenerate
-cases return defined values (0 trades; 0 losers → `PF = inf`; `mLTr` undefined → sentinel).
+**Done when — all met.** Every metric matches an independent numpy/scipy computation
+(`_metrics_reference`, built on `np.polyfit` residuals, `itertools.groupby`,
+`scipy.stats.kendalltau` and `np.maximum.accumulate` so it does not share the kernel's
+shape): worst relative gap **4.1e-14** over 3,000 random trade arrays × 24 columns, and
+**2.0e-14** over 72 combos of a real window. A hand-built five-trade list pins all 24 answers
+literally — ⚑ *after* the review found that two of them were not: `eq2R2` was checked only by
+`eq2R2 >= eqR2`, which admitted anything in [74.298, 100] including the 100.0 an exact-fit
+bug produces, in the one test whose whole job is to owe nothing to the numpy reference. `ktau` agrees with scipy to **2.8e-14** over 2,000 curves including tie cases.
+Degenerate cases are defined and tested. **38 of 38 mutations killed.**
 
-⚑ **From Unit 4.** `trades` is `float64[k, 4]` = `(entry, exit, dir, net)`; bars-held is
-`exit - entry` and gross is `net + cost`. Two things this settles before they are asked:
+⚑ **The base-$100 / base-$200,000 cases.** Reproduced on *trade-indexed* equity, and the test
+demonstrates both halves rather than asserting one. Adding a constant to the first trade's
+net shifts the whole equity curve and nothing else, so `eqR2`, `eq2R2` and `ktau` must not
+move: measured **4.8e-9** under a $200,000 shift, against a float32 eps of 7.6e-6 at 100. The
+same curves through the naive uncentred one-pass float32 form that §1.7 warns about go
+**0.0002 → 1.72 → 96.94** absolute error at bases 0 / $100 / $200,000, with **104 screen
+flips and 367 of 600 non-finite** at the top. The kernel is immune because it mean-centres in
+float64 before accumulating; the test fails if the naive form ever stops breaking, so it
+cannot decay into asserting nothing.
 
-- **No trade has 0 bars.** Unit 4 suppresses the last-gated-bar entry, so `exit > entry`
-  always. Whether Meyers' PWFO counts a same-bar trade as 0 bars or 1 is unrecorded and
-  SPEC §6.1 is verbatim-silent — and now it cannot matter, which is load-bearing, because
-  `mLb` is a rank-and-pick metric in CL2 and CL4 and a 0-bar loser would sort to the front.
-- ⚑ **`ownp`/`ownt` are the NET winner set, not the gross one.** The two genuinely differ:
-  measured on the full pre-tail sample, gross-winners vs net-winners are 4,810 vs 4,688 at
-  `n=6, v=0.5` and 1,517 vs 1,502 at `n=12, v=1.0`. SPEC §6.2's verbatim reading — *"Winning
-  Trades total Net Profits"* — pins it to net. Assert the count, so a later refactor cannot
-  drift onto the other reading in silence.
+**Semantics pinned in SPEC §6.6**, all of them silent failures the sources do not settle:
+signs (loss metrics negative), scales (`%P`, `eqR2`, `eq2R2`, `ktau` all ×100), `ddof=1`, the
+strict `net > 0` / `net < 0` winner-loser partition with `net == 0` in neither, and a
+per-consumer sentinel table. Two of those were **corrected during this unit after measuring
+the selection consequence**, not the returned value:
+
+- ⚑ **`eqR2` = 100.0, not 0.0, when the fit is undefined.** `0.0` passes both `eqR2 < 80`
+  (CL2) and `eqR2 <= 50` (CL4). Measured on two real windows, **321 and 260 of 4312 combos
+  have `nT < 2`, and every one of them entered CL4's rank pool** under the 0.0 sentinel.
+  100.0 fails both screens.
+- ⚑ **`mLb`/`mWb` = +inf, not 0.0, when the set is empty.** [M25 p.8] is explicit that
+  `b10mLb` means the *ten smallest* `mLb`, so 0.0 puts every no-loser and no-trade row at the
+  head of the rank pool, where it displaces a real candidate and can then never win the
+  min-`mLTr` pick (its `mLTr` is 0.0; every real one is negative).
+- **`eq2R2` stays 0.0** when undefined, which is the opposite direction on purpose:
+  `meyers2005` *picks* max `eq2R2`, so its fail-safe sentinel is the one that cannot win an
+  argmax, not the one that fails a screen.
+
+⚑ **`meyers2005`'s `nT >= 16` screen is load-bearing.** `eq2R2` is exactly 100 for any
+3-trade row. Measured, **119 and 92 of 4312 combos score exactly 100 and all of them have
+`nT == 3`**; none survives `nT >= 16` (best survivor 95.9 and 98.3). Recorded in SPEC §6.6
+because a later filter picking max `eq2R2` without a trade-count floor would look reasonable
+and silently select noise.
+
+⚑ **A source citation was wrong and is fixed.** SPEC §6.1 cited [M25 p.13]'s `R² = 0.9496`
+as an `eq2R2` value. It is an Excel chart trendline label on Figure 1's *weekly time-indexed*
+equity curve (the same figure carries `R² = 0.9285` for the net curve), not a column. No
+published per-combination `eq2R2` value exists in either paper, so that scale is a project
+convention. The 0–100 scale now rests on [M25 p.8]'s own screen — *"r2<50"* against a
+quantity bounded by 1 — which needs no cross-table inference.
+
+**Budget.** 4312 combos of `_simulate` + `_metrics` on a real 1638-bar window: **21 ms
+serial on one thread**, against Unit 6's 60 ms for the whole window, at 20.1 trades/combo.
+`_metrics` is therefore ~8 ms of it. Zero allocations inside njit, verified with
+`NUMBA_NRT_STATS=1` through an njit driver — the interpreted path shows 3 per call, which is
+numba boxing the three array arguments and not the kernel.
+
+⚑ **The skipped-tests-count-as-PASS deferral now costs more than it did.** Six of the 14
+`test_unit5_*` tests no-op to PASS without `cache/`. The sentinel *values* survive that —
+`test_unit5_degenerate_combos_are_defined` and `test_unit5_scale_and_sign_conventions_are_pinned`
+need no cache — but every ⚑ measurement above (321/260, 119/92, the eight screens, the 21 ms
+budget) evaporates silently, and those measurements are the entire argument for the sentinel
+directions. Still deferred as a cross-unit fix for Units 1–5, not this unit's alone; noting
+that it has graduated from "the empirical basis of Units 3 and 4" to covering a design
+decision.
+
+⚑ **The withheld tail was touched once, here, and it is recorded rather than argued away.**
+The adversarial review's first filter-trace probe loaded the full cache instead of truncating
+at `TAIL_START`, so 2 of its 26 windows overlapped bars after 2026-03-01 and ran
+`_simulate` + `_metrics` + a `CL2`/`CL4` selection over them. That is a stronger look than
+Unit 3's second-moment one — the tail saw per-combo trades and P&L. Every number that reached
+this file was then re-measured pre-tail, twice and independently: the review's own re-runs,
+and mine, which assert a truncated load before measuring anything. The repo's tests are clean
+here — they all go through `_real_bars()`, which truncates on load. Unit 9's comparison
+counter carries it.
 
 **Review focus** Division by zero; `mLTr` sign (§1.5); `lr` counting across window boundaries.
+The last one cannot happen here: metrics are computed per combo per window on that window's
+trade list, so a streak has no way to span windows.
 
 ---
 
@@ -559,6 +624,36 @@ formality**: `run_grid` calls the unvalidated njit kernel directly, so it is the
 checking that `ns[a]` is matched to row `a`. A mismatch mis-scales the threshold by
 `sqrt(n_true / n)` and the run completes with plausible metrics.
 
+⚑ **From Unit 5.** The inner call after `_simulate` is
+`rmv._metrics(trades[:k], out[c], scratch)`, and it writes all 24 columns whether the run is
+IS or OOS. Three obligations follow:
+
+- `scratch` is a **second per-thread caller-owned buffer**, `float64[len(close)]` — 13 KB per
+  thread at the 1638-bar window size. `_metrics` refills it five times per combo for the
+  medians and once more for the Kendall pass, so it cannot be shared across threads and it
+  cannot be the trades buffer.
+- `out[c]` may be the **float32 storage row directly**; every accumulator inside `_metrics`
+  is float64 regardless, which is §1.7 rule 3. Measured over 1,078 real combos, rounding the
+  float64 row to float32 flipped **0** of the eight screens in SPEC §5, with the closest any
+  combo came to a bound at 2.9e-4 against a half-ulp of 1.9e-6.
+- Zero allocation inside `prange` holds: measured 0 per call njit-to-njit with
+  `NUMBA_NRT_STATS=1`. This is why `_median` is a hand-rolled insertion sort — `np.median`
+  costs 1 allocation per call and `ndarray.sort()` costs 4.
+
+⚑ **From Unit 5: the buffer-reuse hazard is now concrete.** `simulate` returns a view, and
+`_metrics` must run on combo *c*'s trades before `_simulate` overwrites the buffer for
+*c+1*. The two calls being adjacent in the inner loop is what satisfies this; anything that
+batches trade arrays first does not.
+
+⚑ **From Unit 5: measured headroom.** `_simulate` + `_metrics` over one real window's 4312
+combos is **21 ms serial on one thread** (Unit 4's half was 13 ms), against this unit's
+60 ms budget. `prange` is headroom, not the thing being relied on.
+
+⚑ **From Unit 5: assert the `scratch` length here, because `_metrics` cannot.** The wrapper
+checks it; `run_grid` calls the kernel directly and numba bounds checking is off, so an
+undersized `scratch` is a silent out-of-bounds write rather than an exception. One
+`assert scratch.shape[0] >= close.shape[0]` in `run_grid` closes it.
+
 **Done when** any single row equals the Unit 4+5 path; output bit-identical across
 `NUMBA_NUM_THREADS=1` vs 32 (genuinely satisfiable — each combo writes an independent output
 row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero allocation in `prange`.
@@ -591,6 +686,13 @@ row, no reduction, and no `fastmath` per §1.7); **< 60 ms/window**; zero alloca
 - Re-running produces byte-identical tables.
 - Budget: **< 60 s**, peak RSS **< 1 GB**.
 - A randomly chosen row's OOS `osnp` reproduces when replayed standalone.
+- ⚑ **From Unit 5: a canary that the two files hold different runs.** `_metrics` fills all 24
+  columns on every call and `osnp`/`ont`/`ollt`/`odd` are byte-identical to `tnp`/`nT`/`llt`/
+  `dd`. So writing `table[:, OOS_COLS]` of the **IS** run into `pwfo_oos.npy` produces a file
+  of plausible OOS metrics that are really IS metrics, and every other done-when here still
+  passes — the leakage guard, the byte-identical re-run, the non-empty table. §2.1's
+  "structurally impossible" is weaker than it reads. Assert `pwfo_oos[:, 0] != pwfo_is[:, 0]`
+  on some rows of every window.
 
 ⚑ **From Unit 4: window slices must end on an ungated bar — assert it.** `_simulate` treats
 the last bar of *any* slice as if it were the last gated bar of a run: no entry there, and an
@@ -605,6 +707,13 @@ enters the filter's choice of row and not merely the reported P&L. It therefore 
 `xmult`'s discipline exactly: computed from **IS bars only**, stored per window beside
 `xmult`, and applied to that window's IS *and* OOS runs. Deriving it from OOS prices would
 leak a price level backwards into a row that was already picked.
+
+⚑ **From Unit 5: the 18/6 split is a slice, not a projection.** `run_grid` emits
+`float32[4312, 24]` for both the IS and the OOS run. Unit 7 writes `table[:, rmv.IS_COLS]` of
+the **IS** run into `pwfo_is.npy` and `table[:, rmv.OOS_COLS]` of the **OOS** run into
+`pwfo_oos.npy`. Both blocks are populated on every call — the OOS block of an IS run is
+simply not written anywhere — so the look-ahead barrier is which *file* a block lands in, not
+which columns were computed.
 
 **Review focus** The `<=` / `+1 day` boundary bug pattern from the current `walk_forward`;
 partial windows at the ends; holidays shortening an OOS week to 4 sessions (e.g. Thanksgiving
@@ -627,9 +736,46 @@ week 11/20–11/24/23); windows where zero rows pass any filter.
   (params selected, no signals fired) — distinct from p.15 Col G's *no row passed the filter*.
   71 of Meyers' 517 weeks had no trades; conflating the two moves `%P` by up to 14 points.
 
+⚑ **From Unit 5.** Five things are now settled upstream, and one is explicitly still this
+unit's:
+
+- **Both `mLTr` conventions come off one column.** It is stored signed and negative (SPEC
+  §6.6), so §1.5's magnitude reading is `abs(mLTr)` and the deepest-loss reading is the
+  column as stored. The reverse derivation does not exist, which is why the sign is stored.
+- **Both `r2` readings come off one column too, by moving the threshold** (SPEC §9-D). With
+  `eqR2 = 100·R²`, the `|r|` reading is `CL2: eqR2 < 64` and `CL4: eqR2 <= 25` — exact, no
+  `sqrt`, no second column. The *signed* `r` reading is not supported and has no textual
+  basis; do not add one without reopening §9-D.
+- **Degenerate rows can no longer reach a filter by accident — but only below `nT = 2`.**
+  `PF = inf` and `eqR2 = 100` fail every screen they touch, and `mLb = inf` sorts last, so a
+  no-trade row cannot enter a bottom-k rank. ⚑ **The protection stops there.** From two
+  trades up, `eqR2` is a real 2- or 3-point fit that slides under `eqR2 <= 50` honestly, and
+  neither `CL2` nor `CL4` has any trade-count screen. Measured over 24 real pre-tail windows
+  with the as-stored `mLTr` convention, **`CL4` selects a row with `nT < 5` in 5 of 24
+  windows (`nT == 3` in 2), and `CL2` in 5 of 24**. That is faithful to [M25], whose
+  published filters have no `nT` floor either — so it is a property to report, not a defect
+  to patch. This unit should surface the selected row's `nT` in its output rather than
+  silently returning a three-trade week.
+- ⚑ **The zero-trade convention is still this unit's to pin.** Unit 5 stops a zero-trade row
+  being *selected*; it does not decide how a selected-but-silent week is counted. [M25
+  Table 1] confirms both cases are real and distinct — 01/14/15, 01/21/15 and 01/28/15 carry
+  `N`/`vup`/`vdn` filled with every OOS metric at 0 (params chosen, no signals), which is not
+  §6.3 Col G's *no row passed the filter*.
+- ⚑ **`nT >= 16` in `meyers2005` is load-bearing** for its `max eq2R2` pick — measured, every
+  combo scoring exactly 100 has `nT == 3` (SPEC §6.6). Any new filter picking max `eq2R2`
+  needs a trade-count floor or it selects noise.
+
 **Done when** on a synthetic table with a planted answer the filter selects exactly that row;
 a no-eligible-row window produces a flat week, not a crash or a fallback pick; **< 1 s** per
 filter over the full table.
+
+⚑ **From Unit 5: `bottom-k mLb` is mostly a tie-break, and the tie block is large.** `mLb`
+is a median of small integer bar counts, so its resolution — not the rank — is what binds.
+Measured over 24 real pre-tail windows, the number of rows tied at exactly `CL4`'s
+10th-smallest `mLb` runs **1 to 22**, and at `CL2`'s 50th, **3 to 33**. The pick is
+deterministic (a-major combo order, §2.1) but "the bottom 10 by `mLb`" is in practice ten
+arbitrary rows drawn from that block. Report the tie width alongside the selection; a
+tie-break rule cannot fix a resolution problem.
 
 **Review focus** Tie-breaking determinism; the no-eligible-rows path; whether aggregates treat
 the two zero cases distinctly.
@@ -650,8 +796,9 @@ the two zero cases distinctly.
   choice decides the Unit 9 gate, so it is pinned here rather than discovered later.
 - ⚑ **A literal comparison counter.** A file the evaluator increments on every OOS-touching
   run, multiplied in at report time. §8's cheap A/Bs (history depth, `session_reset`, feed,
-  long/short, both filter ambiguities) are all looks at the same OOS columns, ⚑ as is Unit 3's one
-  accidental second-moment look at the withheld tail, and "it's a
+  long/short, both filter ambiguities) are all looks at the same OOS columns, ⚑ as are the two
+  accidental looks at the withheld tail (Unit 3's second-moment one, and Unit 5's review
+  probe, which saw per-combo trades and a filter selection over 2 windows), and "it's a
   35-second run" is exactly how the count gets lost. ~10 lines, and the only thing standing
   between this project and the failure mode §5 is named after.
 - ⚑ **Report lag-1..4 autocorrelation of `osnp`.** IS windows overlap by 23 of 30 days, so
@@ -670,6 +817,14 @@ the two zero cases distinctly.
   schedule and the SEC's Section 31 advisories, and it belongs to this unit. Split the two,
   date-key the statutory one, and check the direction of the error before trusting any
   after-cost figure: `toNP > 0` is one of the three decision-gate conditions.
+⚑ **From Unit 5: two things the report must not misread.** `%P`, `eqR2`, `eq2R2` and
+`ktau` are all stored ×100 (SPEC §6.6) — `ktau` signed, so `[-100, 100]`. And our `dd`/`llt`
+are **net** where [M25 Table 1]'s `odd`/`ollt` are **gross**: Meyers subtracts cost as a
+post-hoc weekly aggregate (`NOnp$13 = osnp − ont*13`) while ours is inside `_simulate` per
+trade. Its 01/07/15 week reads `osnp` −2020 with `odd` −2020, where the net figure is −2046.
+Any numeric parity check against the published table has to account for that before calling
+a difference a defect.
+
 - Produce a Table-1-shaped report (same columns) plus the equity curve with its 2nd-order fit.
 
 **Done when** a filter run against shuffled OOS columns comes back insignificant; ⚑ **plus a
@@ -704,6 +859,16 @@ threshold *before* committing to Units 10–13.
 ---
 
 ### Unit 10 — Filter search (conditional)
+
+⚑ **From Unit 5: pre-register the comparison DIRECTION, not just the metric and threshold.**
+Every degenerate sentinel in SPEC §6.6 is fail-safe in exactly one direction — the one the
+three shipped filters use — and is the worst possible value in the other. Measured over 24
+real pre-tail windows, a filter picking **max `eqR2`** selects a row with `nT <= 2` in **24 of
+24**, and **min `eq2R2`** in **24 of 24**; a screen `PF > x` passes every no-loser row, and a
+**top**-k rank on `mLb` puts every no-loser row at the head. A generated space that crosses
+metrics with both directions will therefore find "filters" that are selecting the sentinel,
+score them well in-sample, and look like discoveries. Either give every generated filter an
+`nT >= 3` screen or restrict the space to §6.6's directions — and write which, first.
 
 Meyers ran 115,320 filters through WFME64. Do **not** start there.
 

@@ -653,9 +653,19 @@ The rest are recorded for a later filter search, not built now.
 | `m(p-rd)` | Median of all Trades{Final Trade Profit minus Maximum Trade Rundown} |
 
 **Equity curves here are trade-indexed**, not time-indexed — [M05 p.6] defines `R22` against
-*"the trade Equity line"*. `eqR2` is the **straight-line** fit and `eq2R2` the 2nd-order fit;
-confirmed by [M25 Figure 2 Row 4] showing `eqR2 = 82` against the same curve's 2nd-order
-`R² = 0.9496` [M25 p.13] — a straight line fitting worse than a quadratic, on a 0–100 scale.
+*"the trade Equity line"*. `eqR2` is the **straight-line** fit and `eq2R2` the 2nd-order fit.
+
+⚑ **The 0–100 scale rests on [M25 p.8], not on Figure 1.** The self-contained evidence is the
+filter's own screen — *"we want the R2 equity trend line correction to be <50, **r2<50**"* —
+because a threshold of 50 against a quantity bounded by 1 would pass every row in the table
+and make `CL4`'s stated design intent vacuous. [M25 Figure 2 Row 4] corroborates it with
+`eqR2 = 82` beside `KTau = 93`. **Rev 1 of this file cited [M25 p.13]'s `R² = 0.9496` as an
+`eq2R2` value; it is not one.** It is an Excel chart trendline label on Figure 1's *weekly,
+time-indexed* OOS equity curve, and Excel always prints R² as a 0–1 fraction. The same figure
+carries a second label, `R² = 0.9285`, for the net curve. **No published `eq2R2` value exists
+at the per-combination level** — Figure 2 has no such column, Table 1 has no such column, and
+[M05 p.6] carries `r22` only as a ranking-variable name — so `eq2R2`'s stored scale is a
+project convention (§6.6), not a transcription.
 
 ### 6.2 Out-of-sample, per parameter combination — verbatim [PWFO]
 
@@ -730,8 +740,9 @@ In-Sample Dates | Out-of-Sample Dates | osnp | NOnp$13 | ont | ownp | ownt
 
 The page's *legend* uses different names than its own headers — it defines `ogp`, `Equity` and
 `osnp$20` (the last as `ogp - ont*13`, so even the `$20` in the name disagrees with the
-formula), none of which appear as headers, and it omits `ownp`/`ownt`/`N`/`vup`/`vdn`
-entirely. Mapping, header ← legend:
+formula), none of which appear as headers. `N`, `vup` and `vdn` **are** defined in the legend
+(*"N = N the lookback period"*, and `vup`/`vdn` as the velocity thresholds for a buy and a
+sell signal); the two it omits entirely are `ownp` and `ownt`. Mapping, header ← legend:
 
 `osnp` ← weekly OOS **gross** profit (`ogp`) · `NOnp$13` ← weekly OOS **net** profit
 = `osnp - ont*13` · `ont` trades in the OOS week · `ownp` winning-trade gross profit ·
@@ -794,6 +805,121 @@ significant. The linear approximation holds while `K*p << 1`.
 > **Our convention: the same denominator on both sides — all OOS periods, zero-trade weeks
 > counted as zero.** It is the conservative reading and the only internally consistent one.
 > See §9-K.
+
+---
+
+### 6.6 Storage contract — pinned in Unit 5 ⚑
+
+The sources define *what* each metric is and are silent on sign, scale and the degenerate
+case. All three change which row a filter selects, none of them raises, and a reference
+implementation that shares the misreading agrees with the kernel. So they are pinned here.
+
+**Signs.** Loss metrics are stored **negative**: `mLTr`, `llt`, `dd`, and their OOS twins
+`ollt`, `odd`. This is both papers' own convention, twenty years apart — [M25 Figure 2 Row 4]
+`LLTr = -3540`, `LLp = -6640`, `eqDD = -10970`, and [M05 p.6]'s `eqDD` column reads −239,
+−475, −1038, −1025 with `llw` at −188, −475, −850, −1025. Storing the signed value is what
+lets Unit 8 run §9-E's two selection conventions: the magnitude reading is `abs()` of this
+one, and the reverse is not derivable. `mLb`/`mWb` are **not** loss metrics — they are bar
+counts, always ≥ 1, and never negated; sign-flipping them would turn `b10mLb` into a top-k.
+
+**Scales.** `%P` is 0–100. The oracle is [M25 p.10]'s **`%Wtr`** — *"The % of all oos trades
+that are positive … was 45%"* — because that is the per-*trade* quantity §6.1's `%P` defines;
+[M25]'s own `%P` column is a per-*period* percentage and a different metric (see the naming
+collision below). Both are integers on 0–100 in Figure 2 (cols M and N). `eqR2`, `eq2R2` and
+`ktau` are ×100, `ktau`
+signed, so all three correlation columns share one scale and a filter threshold literal
+cannot mean 0–1 against one column and 0–100 against its neighbour. Only `eqR2`'s scale is
+sourced; the other two are convention. `PF` and `t` are dimensionless; everything else is
+per-share dollars or a raw count.
+
+⚠ **[M05] and [M25] do not share scale conventions.** [M05 p.6] stores `%P` as a fraction —
+0.69, 0.75, 0.81, 0.62 — where [M25 Figure 2 col N] stores 57. This is a direct caution
+against inferring one paper's scale from the other's.
+
+**The winner/loser partition.** A trade is a winner at `net > 0`, a loser at `net < 0`, and
+`net == 0` is **neither** — it still counts in `nT` and `tnp`, and it breaks both streaks.
+Measured, 0 of the 686,565 trades produced by eight real windows sit on the boundary (`cost`
+is 0.027 and gross moves in cents), but `cost = 0` is a legal argument and a flat price move
+then produces one. The
+strict predicate is also what keeps the sentinels unambiguous: a defined `mLTr` is strictly
+negative, so `mLTr == 0.0` can only mean "no losing trades".
+
+**`ownp`/`ownt` are the NET winner set** — §6.2 reads *"Winning Trades total **Net**
+Profits"*. Measured on the full pre-tail sample the two sets genuinely differ: 4,810 gross
+winners against 4,688 net at `n=6, v=0.5`, and 1,517 against 1,502 at `n=12, v=1.0`. `ownp`
+is numerically PF's numerator; one accumulator serves both.
+
+**Dispersion** uses `ddof=1`, matching §1.2's `xmult`. Measured at the real median trade
+count the population form runs 2.4% low, and 18.4% low in the tail — not a rounding
+difference once it reaches `t`. `t = mean / (std / sqrt(nT))`.
+
+**Drawdown is measured from a zero baseline**, so an opening loser is already a drawdown.
+[M25 Table 1] settles this rather than leaving it to taste: on its all-loser weeks `odd`
+equals the *full* cumulative loss — 01/07/15 (`ont` 2, `osnp` −2020, `odd` −2020) and
+03/25/15 (`ont` 4, `osnp` −1040, `odd` −1040) — where a peak seeded from the first equity
+value would give −990 and −220.
+
+**Degenerate rows are common and every sentinel points in its consumer's fail-safe
+direction.** Measured per window over 24 real pre-tail windows, **0.00–5.96%** of the 4312
+combos traded not at all and **2.67–12.66%** traded fewer than three times — a range, not a
+constant, because the spread across windows is an order of magnitude and any single-window
+figure understates the worst case. Every filter meets these rows every window. The sentinels
+are deliberately *not* all the same value:
+
+| Metric | Undefined when | Stored | Why that value |
+|---|---|---|---|
+| `PF` | no losing trade (incl. no trades) | `+inf` | fails `PF < 4` and `1 ≤ PF ≤ 2`, so `meyers2005` and `CL2` reject it |
+| `eqR2` | < 2 trades, or flat equity | `100.0` | fails `eqR2 < 80` and `eqR2 ≤ 50`. **A `0.0` passes both** — measured, that admitted 321 and 260 of 4312 combos into `CL4` on two real windows |
+| `eq2R2` | < 3 trades, or flat equity | `0.0` | `meyers2005` **picks** max `eq2R2`, so the safe sentinel is the one that cannot win an argmax — the opposite direction from `eqR2` |
+| `mLb`, `mWb` | no loser / no winner | `+inf` | `CL2` and `CL4` rank on the **smallest** `mLb` ([M25 p.8]: *"b10mLb means the bottom or minimum 10 mLb rows"*), so `0.0` would put every no-loser and no-trade row at the head of the pool, displacing real candidates it can then never beat |
+| `mTrd`, `mWTr`, `mLTr`, `llt`, `dd`, `std`, `t`, `lr`, `wr` | various | `0.0` | for `llt` and `dd` this is [M25 Table 1]'s published value on its all-winner week (12/15/14: `ont` 4, `ownt` 4, `ollt` 0, `odd` 0) and on its zero-trade weeks |
+
+No sentinel distinguishes "no trades" from a real value — `nT` is the only column that does,
+and screening it is Unit 8's (§Unit 8's zero-trade convention). [M25 Table 1] confirms the
+zero-trade row is a real, reportable outcome: its 01/14/15, 01/21/15 and 01/28/15 weeks carry
+`N`/`vup`/`vdn` filled and every OOS metric at 0.
+
+⚠ **Each of these values is fail-safe in exactly ONE comparison direction, and the table
+above is the direction the three shipped filters use.** Reverse the comparison and the same
+sentinel becomes the worst possible choice. Measured over 24 real pre-tail windows: a filter
+picking **max `eqR2`** selects a row with `nT <= 2` in **24 of 24** windows, and one picking
+**min `eq2R2`** does so in **24 of 24** — in every case the sentinel itself, or a trivially
+perfect 2-point fit, wins. A screen `PF > x` passes every no-loser row; a **top**-k rank on
+`mLb` puts every no-loser row at the head. Nothing in the metric row can prevent this, so any
+new filter — and in particular §Unit 10's generated space — must either carry an `nT` floor
+or be restricted to the directions above.
+
+⚠ **The sentinels stop a degenerate row being *selected*; they do not impose a trade-count
+floor.** Their protection ends at `nT < 2`, because from two trades up `eqR2` is a real fit
+and slides under `eqR2 <= 50` honestly. Measured over the same 24 windows with the as-stored
+`mLTr` convention, `CL4` selects a row with `nT < 5` in **5 of 24** windows (`nT == 3` in 2)
+and `CL2` in **5 of 24**. This is faithful to [M25] — neither published filter has a trade
+count screen, and only `meyers2005` has one — so it is recorded, not corrected.
+
+⚠ **`+inf` is safe to sort but not to average.** `PF`, `mLb` and `mWb` can hold `+inf`, so a
+column mean is `inf` and a standard deviation `nan`; measured, `mean(PF)` is non-finite in 23
+of 24 real windows. Sorting, `argsort`, `partition` and a float32 `.npy` round trip are all
+exact. §6.3's aggregates are OOS-side and unaffected, but any IS-side diagnostic or z-scored
+rank metric has to mask first.
+
+⚑ **`meyers2005`'s `nT >= 16` screen is load-bearing, not decoration.** `eq2R2` is exactly
+100 for any 3-trade row — a quadratic through three points is an exact fit — and measured on
+two real windows 119 and 92 of 4312 combos score exactly 100, *every one of them* at
+`nT == 3`. None survives `nT >= 16`; the best that does scores 95.9 and 98.3. Relax that
+screen, or write any new filter that picks max `eq2R2` without one, and the pick collapses
+onto three-trade rows tie-broken arbitrarily.
+
+⚑ **Our P&L columns are net; [M25]'s are gross.** Meyers subtracts cost as a post-hoc weekly
+aggregate (`NOnp$13 = osnp − ont*13`), so **four** of Table 1's columns are on a gross basis —
+`osnp` (the legend's `ogp`), `ownp`, `ollt` and `odd`. 01/07/15 has `osnp` −2020 and `odd`
+−2020 where the net figure is −2046. Ours carry `cost` inside `_simulate`, per trade, so all
+four of our equivalents are net. This is a deliberate divergence, recorded because it will
+look like a defect to anyone attempting a numeric parity check against the paper.
+
+⚑ **Four metric names mean two different things in this file**, and Unit 9 prints both blocks
+side by side. §6.1's `%P`, `t`, `std` and `eqR2` are **per parameter combination, over
+trades**; §6.3's cols N, K, H and V of the same names are **per filter, over OOS periods**.
+`llt` and `LLTr` collide the same way. Disambiguate before reporting them together.
 
 ---
 
@@ -872,7 +998,7 @@ question.
 | **A** | Normalization multiplier: [M25 p.7] and Fig 3 use `6.7`; the Appendix p.28 derives `9.693120`. | **Open.** All published CL results used 6.7, so Meyers' effective range was 0.17–2.4 sd. SPY calibrates by the Appendix method; expect the top of the grid to fire rarely. |
 | **B** | [M25 p.7] states 4508 combinations; the stated ranges give 22×14×14 = 4312. `4508 = 23×14×14`. | **Resolved** — use the stated ranges (4312). One of the paper's ranges is off by one N. |
 | **C** | Filter term `p<4` / `p<5` [M25 p.11] is never defined. | **Resolved: it is `pf` (Profit Factor).** [M25 Fig 2 col A p.14] shows `pf<2`, `pf<4` and `pf<5` in that grammar slot, always beside a *separate* `lr<3` term — so `p` cannot mean losing-periods-in-a-row, which is `lr`. |
-| **D** | `r2` vs `r`: [M05 p.6] defines `R22` as *"the correlation coefficient"* (i.e. `r`); [M25 p.15 Col V] writes *"correlation coefficient(R^2)"*. Used interchangeably. | **Open.** Harmless for `meyers2005` (rank metric — argmax preserved for non-negative `r`). **Decisive for `CL4`**: `r2 <= 50` keeps `\|r\| <= 0.707` under one reading, `r <= 0.50` under the other. Run both. |
+| **D** | `r2` vs `r`: [M05 p.6] defines `R22` as *"the correlation coefficient"* (i.e. `r`); [M25 p.15 Col V] writes *"correlation coefficient(R^2)"*. Used interchangeably. | **Open, but narrowed in Unit 5 to two readings, not three.** Both papers define the metric as the correlation between the equity curve and *its own fitted line* — [M05 p.6] *"between the trade Equity line and the 2nd Order Polynomial Line that is fitted to"* it, [M25 p.15 Col V] *"of a straight-line fit to the equity curve"*. For any least-squares fit carrying an intercept `corr(y, ŷ) = +sqrt(R²) ≥ 0`, so a **signed** `r` has no textual support and is deliberately not stored (§6.6). The two live readings are exact transforms of one column: with `eqR2 = 100·R²`, the `\|r\|` reading is obtained by moving the **threshold**, not the data — `CL2`'s `eqR2 < 80` becomes `eqR2 < 64` and `CL4`'s `eqR2 <= 50` becomes `eqR2 <= 25`. No `sqrt`, no second column, no precision loss. Run both. Doubly harmless for `meyers2005`: its pick is an argmax over `eq2R2`, and non-negativity there is a theorem rather than the assumption §1.5 recorded. |
 | **E** | `mLTr` sign: "we want the row that has the smallest value of `mLTr`" [M25 p.8]. | **Open.** [M25 Fig 2] stores loss metrics **negative** (`LLTr = -3540`, `LLp = -6640`, `eqDD = -10970`), under which "smallest" selects the *deepest* median loss — the opposite of the stated intent (*"minimize the effect of large losing trades"*). Run both conventions. |
 | **F** | [M25 p.4] carries a dated erratum retracting its own first-trade rule: *"(11/10/25) Note: this is no longer true…"* | **Deferred.** Keep the 10:00 gate for v1. §3.1 computes RMedV on the full session anyway, so revisiting is a gate change. |
 | **G** | Strict vs inclusive: [M25 p.8] writes `lr≤3 r2≤50`; p.10 writes `lr<3\|r2<50` for the same filter. [M05 p.6] writes `PF>1` but its Fig 2 caption writes `PF>=1`. | **Resolved by choice:** `CL4` uses `lr <= 3`, `eqR2 <= 50`; `meyers2005` uses `1 <= PF <= 2`. Recorded so the choice is visible. |

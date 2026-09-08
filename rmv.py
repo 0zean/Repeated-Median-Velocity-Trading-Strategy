@@ -469,3 +469,402 @@ def simulate(
 
     k = _simulate(rmv_row, close, gate, float(vup), float(vdn), float(cost), out)
     return out[:k]
+
+
+# -------------------------------------------------------------------- metrics (Unit 5)
+
+# PLAN §1.6's 18 in-sample and 6 out-of-sample keys, in that order. Unit 7 writes columns
+# 0:18 of an IS run into `pwfo_is.npy` and 18:24 of an OOS run into `pwfo_oos.npy` -- which
+# is why one 24-wide row carries both blocks, and why four of them are duplicates: `osnp`,
+# `ont`, `ollt` and `odd` are `tnp`, `nT`, `llt` and `dd` computed on a different slice
+# (SPEC §6.1 against §6.2 -- same formulas, different trade set). 16 bytes a row against
+# Unit 7 doing fancy indexing at every write.
+METRIC_COLS = (
+    "tnp", "nT", "PF", "%P", "mTrd", "mWTr", "mLTr", "mLb", "mWb",
+    "lr", "wr", "dd", "llt", "std", "t", "eqR2", "eq2R2", "ktau",
+    "osnp", "ont", "ownp", "ownt", "ollt", "odd",
+)
+N_METRICS = len(METRIC_COLS)
+IS_COLS = slice(0, 18)
+OOS_COLS = slice(18, 24)
+
+
+@njit(cache=True)
+def _median(buf: np.ndarray, m: int) -> float:
+    """Median of `buf[:m]`, sorting that slice in place. numpy's convention on even `m`.
+
+    Not `np.median`: numba's copies its input, and Unit 6's done-when is zero allocation
+    inside `prange`. Measured with `NUMBA_NRT_STATS=1`: this is 0 allocations per call,
+    `np.median` is 1, and `buf[:m].sort()` is 4 (numba's quicksort allocates a work stack).
+
+    ponytail: insertion sort, because `m` is a trade count and that is 19.9 on average over
+    34,496 real combos (p99 116, max 336). Ceiling: O(m^2), ~56k operations at the observed
+    max. Quickselect is the upgrade path if the trade count ever grows.
+    """
+    if m == 0:
+        # No trades, or none on this side of zero. 0.0 rather than a NaN sentinel: SPEC §7
+        # rule 2 bans NaN in kernels, and every consumer of these is a filter comparison,
+        # where a NaN quietly evaluates False on both sides of a screen.
+        return 0.0
+    for i in range(1, m):
+        v = buf[i]
+        j = i - 1
+        while j >= 0 and buf[j] > v:
+            buf[j + 1] = buf[j]
+            j -= 1
+        buf[j + 1] = v
+    h = m // 2
+    if m % 2 == 1:
+        return buf[h]
+    return 0.5 * (buf[h - 1] + buf[h])
+
+
+@njit(cache=True)
+def _metrics(trades: np.ndarray, out: np.ndarray, scratch: np.ndarray) -> None:
+    """Fill `out[:24]` with `METRIC_COLS` from a Unit 4 trade array. SPEC §6.1 and §6.2.
+
+    Called from inside Unit 6's `prange` on a per-thread `out` row and `scratch` buffer, so
+    it allocates nothing. See `metrics` for the contract -- this is the same code without
+    the guards. `out` may be float32 (Unit 6's storage row) or float64 (tests); every
+    accumulator below is float64 either way, which is SPEC §7 rule 3.
+    """
+    k = trades.shape[0]
+
+    # ---- one pass for the sums, the counts, the streaks and the largest loser.
+    # A trade with net exactly 0 is neither a winner nor a loser, and breaks both streaks.
+    # Over 686,565 real trades there are none -- `cost` is 0.027 and gross moves in cents,
+    # so net cannot land on zero -- but `cost = 0` is a legal argument and a flat price move
+    # then produces one, so the branch is spelled out rather than folded into a `>=`.
+    tnp = 0.0
+    ownp = 0.0   # sum of net over net-winning trades. Also PF's numerator: SPEC §6.2's
+    gloss = 0.0  # "Winning Trades total Net Profits" is that same sum (PLAN Unit 5).
+    nw = 0
+    nl = 0
+    llt = 0.0    # largest losing trade, stored negative; 0.0 when nothing lost
+    wr = 0
+    lr = 0
+    run_w = 0
+    run_l = 0
+    for i in range(k):
+        net = trades[i, 3]
+        tnp += net
+        if net > 0.0:
+            ownp += net
+            nw += 1
+            run_l = 0
+            run_w += 1
+            if run_w > wr:
+                wr = run_w
+        elif net < 0.0:
+            gloss -= net
+            nl += 1
+            run_w = 0
+            run_l += 1
+            if run_l > lr:
+                lr = run_l
+            if net < llt:
+                llt = net
+        else:
+            run_w = 0
+            run_l = 0
+
+    # ---- five medians, `scratch` refilled before each. Bars held is `exit - entry`, which
+    # Unit 4 guarantees is >= 1: it suppresses the entry on a run's last gated bar, so no
+    # zero-bar trade exists to sort to the front of CL2's and CL4's bottom-k `mLb` rank.
+    for i in range(k):
+        scratch[i] = trades[i, 3]
+    mtrd = _median(scratch, k)
+
+    m = 0
+    for i in range(k):
+        if trades[i, 3] > 0.0:
+            scratch[m] = trades[i, 3]
+            m += 1
+    mwtr = _median(scratch, m)
+    m = 0
+    for i in range(k):
+        if trades[i, 3] > 0.0:
+            scratch[m] = trades[i, 1] - trades[i, 0]
+            m += 1
+    mwb = _median(scratch, m) if m > 0 else np.inf  # symmetric with mLb below
+
+    m = 0
+    for i in range(k):
+        if trades[i, 3] < 0.0:
+            scratch[m] = trades[i, 3]
+            m += 1
+    mltr = _median(scratch, m)
+    m = 0
+    for i in range(k):
+        if trades[i, 3] < 0.0:
+            scratch[m] = trades[i, 1] - trades[i, 0]
+            m += 1
+    # +inf, not 0.0, and this one is a selection decision rather than a reporting one.
+    # [M25 p.8]: *"b10mLb means the bottom or minimum 10 mLb rows"* -- CL2 and CL4 rank on
+    # the SMALLEST mLb, so a 0.0 sentinel puts every no-loser and every no-trade row at the
+    # head of the pool, where it displaces a real candidate and can then never win the
+    # min-mLTr pick (its mLTr is 0.0, and every real one is negative). Measured on two real
+    # windows, that is 321 and 260 rows of 4312 competing for ten slots. +inf sorts them
+    # last instead, and is exact in float32.
+    mlb = _median(scratch, m) if m > 0 else np.inf
+
+    # ---- dispersion. ddof=1, matching `xmult`'s convention (Unit 3) so two callers cannot
+    # disagree. Measured, the population form runs 2.4% low at the median trade count and
+    # 18.4% low in the tail -- not a rounding difference once it reaches `t`.
+    mean = tnp / k if k > 0 else 0.0
+    sd = 0.0
+    if k >= 2:
+        acc = 0.0
+        for i in range(k):
+            d = trades[i, 3] - mean
+            acc += d * d
+        sd = np.sqrt(acc / (k - 1))
+    tstat = mean / (sd / np.sqrt(k)) if sd > 0.0 else 0.0
+
+    # ---- trade-indexed equity (SPEC §6.1), zero-based: it stands at 0 before the first
+    # trade, so the running peak starts at 0 and an opening loser is already a drawdown.
+    # `dd` is stored negative, matching [M25 Figure 2]'s own `eqDD = -10970` (SPEC §9-E).
+    eq = 0.0
+    peak = 0.0
+    dd = 0.0
+    sum_eq = 0.0
+    for i in range(k):
+        eq += trades[i, 3]
+        sum_eq += eq
+        if eq > peak:
+            peak = eq
+        elif eq - peak < dd:
+            dd = eq - peak
+    eq_mean = sum_eq / k if k > 0 else 0.0
+
+    # ---- the two equity regressions. SPEC §7 rule 3: mean-centered, float64 accumulators.
+    # Centering changes neither R^2 mathematically -- both fits carry an intercept, which
+    # absorbs any shift in y -- but the naive uncentered float32 form is what PLAN §1.7
+    # measured at 98.55 absolute error and 2283/4000 non-finite on a base-$200,000 curve.
+    # x is centered too, which makes sum(xc) = sum(xc^3) = 0 and collapses the quadratic's
+    # normal equations to the 2x2 solve below.
+    x_mean = (k - 1) * 0.5
+    sxx = 0.0
+    sxy = 0.0
+    syy = 0.0
+    sx2y = 0.0
+    sx4 = 0.0
+    eq = 0.0
+    for i in range(k):
+        eq += trades[i, 3]
+        yc = eq - eq_mean
+        xc = i - x_mean
+        x2 = xc * xc
+        sxx += x2
+        sxy += xc * yc
+        syy += yc * yc
+        sx2y += x2 * yc
+        sx4 += x2 * x2
+
+    # 0-100, not 0-1. The self-contained evidence is [M25 p.8]'s own screen -- *"we want the
+    # R2 equity trend line correction to be <50, r2<50"* -- since a threshold of 50 against a
+    # quantity bounded by 1 would pass every row in the table and make CL4's design intent
+    # vacuous. [M25 Figure 2 Row 4]'s eqR2 = 82 and KTau = 93 corroborate the tool's scale.
+    #
+    # 100.0 when the fit is undefined (k < 2, or a flat equity curve), and that direction is
+    # deliberate: 100.0 FAILS CL2's `eqR2 < 80` and CL4's `eqR2 <= 50`, while 0.0 passes
+    # both and hands them a row that never traded. Measured over two real windows, 321 and
+    # 260 of 4312 combos have nT < 2, and under a 0.0 sentinel every one of them entered
+    # CL4's rank pool. A k = 2 row reaches 100.0 through the formula anyway.
+    # `syy > 0.0` is the whole guard: a non-zero spread in y needs two distinct equity values,
+    # hence k >= 2, hence sxx >= 0.5. Spelling `sxx > 0.0` as well would be a second condition
+    # that can fall out of step with this one, exactly as `k >= 3` would have below.
+    eqr2 = 100.0
+    if syy > 0.0:
+        eqr2 = 100.0 * (sxy * sxy) / (sxx * syy)
+        if eqr2 > 100.0:
+            eqr2 = 100.0  # Cauchy-Schwarz bounds the ratio at 1; this is float noise only
+
+    # 0.0 when undefined, which is the OPPOSITE direction from eqR2's 100.0 -- and the
+    # asymmetry is the point. Nothing screens eq2R2; `meyers2005` *picks* max eq2R2, so the
+    # sentinel that fails safe is the one that can never win an argmax. Measured on two real
+    # windows, 119 and 92 of 4312 combos score exactly 100.0 and every single one of them
+    # has nT == 3 -- a quadratic through three points is an exact fit. None survives
+    # `nT >= 16`, which is what makes that screen load-bearing rather than decorative:
+    # relax it and `max eq2R2` becomes "pick a three-trade row", tie-broken arbitrarily.
+    eq2r2 = 0.0
+    if syy > 0.0:
+        det = k * sx4 - sxx * sxx
+        # `det > 0.0` IS the "at least three trades" condition, so there is no separate
+        # k >= 3 guard to fall out of step with it. Cauchy-Schwarz makes det >= 0 always,
+        # with equality exactly when xc^2 is constant -- which on a centred integer index
+        # happens only at k <= 2. Measured: det is 0.0, 0.0, 0.0, 2.0, 16.0 at k = 0..4,
+        # and the k = 2 zero is bit-exact (sxx = 0.5, sx4 = 0.125, both binary-exact).
+        if det > 0.0:
+            # y = a + b*xc + c*xc^2 on centered data. sum(xc) = sum(xc^3) = sum(yc) = 0
+            # leaves b decoupled and a, c in one 2x2 system.
+            a = -sxx * sx2y / det
+            b = sxy / sxx
+            c = k * sx2y / det
+            ssres = 0.0
+            eq = 0.0
+            for i in range(k):
+                eq += trades[i, 3]
+                xc = i - x_mean
+                r = (eq - eq_mean) - (a + b * xc + c * xc * xc)
+                ssres += r * r
+            # Deliberately NOT clamped at 0, unlike eqR2 at 100. A least-squares fit carrying
+            # an intercept cannot do worse than the mean of y, so a negative here would be a
+            # wrong solve rather than float noise -- and nothing reads eq2R2 through a sqrt,
+            # so letting it through is what makes that visible. The eqR2 clamp above is a
+            # different case: mutating its value is killed by the test suite, so that ratio
+            # really does exceed 1 by noise.
+            eq2r2 = 100.0 * (1.0 - ssres / syy)
+
+    # ---- Kendall tau of the equity curve against trade order. x is the trade index and is
+    # strictly increasing, so it carries no ties and tau-b collapses to
+    # (C - D) / sqrt((C + D) * nPairs) -- which is what `scipy.stats.kendalltau` computes,
+    # making scipy a valid oracle.
+    #
+    # Stored x100, so the range is [-100, 100] and all three correlation columns share one
+    # scale. The source does not pin this: [M25 Figure 2]'s KTau = 93 sits beside eqR2 = 82
+    # in the same row, but that is the aggregate column SPEC §6.3 keys as `KTau^2`, which
+    # may already be squared. It is a project convention, chosen so a filter threshold
+    # literal cannot mean 0-1 against one column and 0-100 against its neighbour.
+    #
+    # ponytail: O(k^2). Measured 3.79M pair-steps for a whole 4312-combo window against Unit
+    # 6's 60 ms budget; the merge-sort inversion count is the upgrade path if k ever grows.
+    ktau = 0.0
+    if k >= 2:
+        eq = 0.0
+        for i in range(k):
+            eq += trades[i, 3]
+            scratch[i] = eq
+        conc = 0
+        disc = 0
+        for i in range(k - 1):
+            yi = scratch[i]
+            for j in range(i + 1, k):
+                if scratch[j] > yi:
+                    conc += 1
+                elif scratch[j] < yi:
+                    disc += 1
+        if conc + disc > 0:
+            npairs = k * (k - 1) // 2
+            ktau = 100.0 * (conc - disc) / np.sqrt(float(conc + disc) * float(npairs))
+
+    out[0] = tnp
+    out[1] = k
+    # No losing trade means an undefined ratio, and `inf` is the reading that fails every
+    # upper bound: SPEC §5's `PF < 4` and `1 <= PF <= 2` both reject it, which is what keeps
+    # a zero-trade row out of `meyers2005` and `CL2`. `CL4` has no PF screen, so excluding
+    # it there is Unit 8's zero-trade convention to pin, not this kernel's.
+    out[2] = np.inf if gloss == 0.0 else ownp / gloss
+    out[3] = 100.0 * nw / k if k > 0 else 0.0
+    out[4] = mtrd
+    out[5] = mwtr
+    out[6] = mltr
+    out[7] = mlb
+    out[8] = mwb
+    out[9] = lr
+    out[10] = wr
+    out[11] = dd
+    out[12] = llt
+    out[13] = sd
+    out[14] = tstat
+    out[15] = eqr2
+    out[16] = eq2r2
+    out[17] = ktau
+    out[18] = tnp     # osnp
+    out[19] = k       # ont
+    out[20] = ownp
+    out[21] = nw      # ownt
+    out[22] = llt     # ollt
+    out[23] = dd      # odd
+
+
+def metrics(
+    trades: np.ndarray,
+    out: np.ndarray | None = None,
+    scratch: np.ndarray | None = None,
+) -> np.ndarray:
+    """The 24 `METRIC_COLS` for one parameter combination's trades. SPEC §6.1, §6.2.
+
+    `trades` is `float64[k, 4]` as returned by `simulate` -- `TRADE_COLS`, with column 3
+    already **net** of `cost`. Every profit metric here is therefore net, including `PF`
+    and `ownp`; gross is recoverable as `net + cost` but nothing in this unit wants it.
+
+    Returns `out`, a `float64[24]`. Columns `IS_COLS` are the 18 that Unit 7 writes to
+    `pwfo_is.npy` from an in-sample run; `OOS_COLS` are the 6 it writes to `pwfo_oos.npy`
+    from an out-of-sample run. Both blocks are filled on every call, because the two runs
+    differ only in which trades go in.
+
+    Conventions, none of which the sources state outright and all of which change which row
+    a filter picks (SPEC §5):
+
+    - **Loss metrics are stored negative** -- `mLTr`, `llt`, `dd` -- which is [M25 Figure
+      2]'s own convention (`LLTr = -3540`, `eqDD = -10970`). SPEC §9-E leaves *"smallest
+      `mLTr`"* open; storing the signed value is what lets Unit 8 run both readings, since
+      the magnitude convention is `abs()` of this one and not the other way round.
+    - **`eqR2`, `eq2R2` and `ktau` are on a 0-100 scale** (`ktau` signed, so `[-100, 100]`).
+      For `eqR2` that is sourced: [M25 p.8] screens *"r2<50"*, which against a quantity
+      bounded by 1 would pass every row. For `eq2R2` and `ktau` it is a project convention
+      -- no published value of either exists at the per-combination level, and [M25 p.13]'s
+      `R^2 = 0.9496` is an Excel trendline label on a chart, not a column (SPEC §6.1).
+    - **`eqR2` is R-squared of the straight-line fit.** SPEC §9-D's alternative `|r|`
+      reading needs no second column and no `sqrt` on the data: transform the *threshold*
+      instead, which is exact. CL2's `eqR2 < 80` becomes `eqR2 < 64` and CL4's
+      `eqR2 <= 50` becomes `eqR2 <= 25`. A *signed* `r` is not recoverable and deliberately
+      is not stored -- that needs `eqTrn`, and PLAN §2.1 pins `pwfo_is` at 18 columns.
+    - **`%P` is 0-100.**
+    - **A trade with `net == 0` is neither a winner nor a loser.** It still counts in `nT`
+      and `tnp`, and it breaks both streaks.
+
+    Degenerate combinations are common, not theoretical: over 34,496 real combos, 0.24%
+    produced no trades at all and 4.8% produced fewer than three. Every one is defined, and
+    each sentinel is chosen for the direction its consumer fails in, which is why they are
+    not all the same value:
+
+    - `PF = inf` and `eqR2 = 100.0` both **fail** SPEC §5's screens, keeping a row that
+      never traded out of all three filters. A `0.0` `eqR2` passes both `< 80` and `<= 50`;
+      measured, that admitted 321 and 260 of 4312 combos into CL4 on two real windows.
+    - `mLb = mWb = inf` sort **last**, because CL2 and CL4 rank on the *smallest* `mLb`.
+    - `eq2R2 = 0.0` can never **win** an argmax, which is how `meyers2005` uses it -- the
+      opposite direction from `eqR2`, on purpose.
+    - `mTrd`, `mWTr`, `mLTr`, `llt`, `dd`, `std`, `t` and the streaks are `0.0`. For `dd`
+      and `llt` that is [M25 Table 1]'s published value on its all-winner and zero-trade
+      weeks, not a choice.
+
+    None of these distinguishes "no trades" from a real value; `nT` is the only column that
+    does, and screening it stays Unit 8's job (PLAN Unit 8's zero-trade convention).
+
+    ⚠ `simulate` returns a **view** into a buffer Unit 6 reuses across 4312 combos. Compute
+    the metric row for combo *c* before running combo *c+1*, or copy at the boundary.
+
+    Pass `out` and `scratch` to reuse buffers; `scratch` needs `len(trades)` float64 slots.
+    """
+    trades = np.ascontiguousarray(trades)
+    if trades.ndim != 2 or trades.shape[1] != 4 or trades.dtype != np.float64:
+        raise ValueError(
+            f"trades must be float64[k, 4] from `simulate`, got {trades.dtype}{trades.shape}"
+        )
+    k = trades.shape[0]
+
+    if out is None:
+        out = np.empty(N_METRICS, dtype=np.float64)
+    elif out.shape != (N_METRICS,) or out.dtype != np.float64:
+        raise ValueError(f"out must be float64[{N_METRICS}], got {out.dtype}{out.shape}")
+    if scratch is None:
+        scratch = np.empty(max(k, 1), dtype=np.float64)
+    elif scratch.ndim != 1 or scratch.dtype != np.float64:
+        raise ValueError(f"scratch must be 1-D float64, got {scratch.dtype}{scratch.shape}")
+    elif scratch.shape[0] < k:
+        raise ValueError(f"scratch has {scratch.shape[0]} slots; {k} trades need that many")
+
+    # Unconditional, and deliberately not folded into either `elif` chain above: `scratch`
+    # is overwritten five times while `trades` is still being read, and `out` is written
+    # before the equity passes finish, so either alias corrupts the input mid-kernel.
+    if np.shares_memory(scratch, trades) or np.shares_memory(out, trades):
+        raise ValueError("out or scratch aliases trades; the kernel would overwrite its input")
+
+    # ponytail: no per-row check that `exit > entry` or that `dir` is +/-1. Those are
+    # `_simulate`'s construction, and Unit 6 calls `_metrics` directly, so a scan here would
+    # cost an O(k) pass to guard a path that does not go through it. `test_unit5_bars_held_
+    # is_never_zero_on_real_data` checks the invariant where it is actually produced.
+    _metrics(trades, out, scratch)
+    return out

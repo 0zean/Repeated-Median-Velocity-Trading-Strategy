@@ -1974,6 +1974,878 @@ def test_unit4_iex_noise_would_break_the_signal() -> None:
         "loosening"
     )
 
+# ============================================================== Unit 5: the metric set
+
+
+def _metrics_reference(trades: np.ndarray) -> dict:
+    """Deliberately slow numpy/scipy reference for all 24 of `rmv.METRIC_COLS`.
+
+    Structured differently from the kernel on purpose, the same way `_sim_reference` is:
+    `np.polyfit` residuals instead of hand-solved normal equations, `itertools.groupby`
+    instead of running streak counters, `scipy.stats.kendalltau` instead of a pair loop,
+    `np.maximum.accumulate` instead of a rolling peak. Two implementations that share a
+    shape share their bugs.
+
+    `eq2R2` comes back **unclamped**, which the kernel's cannot be -- that is what lets
+    `test_unit5_matches_the_reference_on_random_trades` check that the clamp is only ever
+    removing float noise and is not hiding a wrong 2nd-order solve.
+    """
+    from itertools import groupby
+
+    from scipy import stats
+
+    net = np.ascontiguousarray(trades[:, 3], dtype=np.float64)
+    held = np.ascontiguousarray(trades[:, 1] - trades[:, 0], dtype=np.float64)
+    k = net.size
+    win, lose = net > 0.0, net < 0.0
+
+    def med(a):
+        return float(np.median(a)) if a.size else 0.0
+
+    def longest(sign):
+        runs = (len(list(g)) for key, g in groupby(np.sign(net).astype(int)) if key == sign)
+        return float(max(runs, default=0))
+
+    eq = np.cumsum(net)
+    peak = np.maximum.accumulate(np.concatenate([[0.0], eq]))[1:]  # equity is 0 before trade 1
+    dd = float((eq - peak).min()) if k else 0.0
+
+    def r2(deg):
+        # sstot is measured about the mean, which is what makes this R-squared and not a raw
+        # residual ratio. polyfit gets the *centered* x for conditioning only -- shifting x
+        # changes the coefficients but not the fitted values, so R-squared is untouched.
+        #
+        # The undefined value differs by column and that is deliberate, not an oversight:
+        # eqR2 is screened (`< 80`, `<= 50`) so its sentinel has to FAIL, and eq2R2 is
+        # argmax-picked so its sentinel has to LOSE. See `rmv.metrics`.
+        undefined = 100.0 if deg == 1 else 0.0
+        if k < deg + 1:
+            return undefined
+        y = eq - eq.mean()
+        sstot = float((y * y).sum())
+        if sstot <= 0.0:
+            return undefined
+        x = np.arange(k, dtype=np.float64)
+        x = x - x.mean()
+        res = y - np.polyval(np.polyfit(x, y, deg), x)
+        return 100.0 * (1.0 - float((res * res).sum()) / sstot)
+
+    tau = 0.0
+    if k >= 2:
+        # scipy returns nan when a variable is constant; the kernel returns 0.0 there, so
+        # the mapping is made here rather than loosening the comparison downstream.
+        t = 100.0 * float(stats.kendalltau(np.arange(k), eq, variant="b").statistic)
+        tau = t if np.isfinite(t) else 0.0
+
+    ownp = float(net[win].sum())
+    gloss = float(-net[lose].sum())
+    sd = float(np.std(net, ddof=1)) if k >= 2 else 0.0
+    mean = float(net.mean()) if k else 0.0
+    return {
+        "tnp": float(net.sum()),
+        "nT": float(k),
+        "PF": np.inf if gloss == 0.0 else ownp / gloss,
+        "%P": 100.0 * int(win.sum()) / k if k else 0.0,
+        "mTrd": med(net),
+        "mWTr": med(net[win]),
+        "mLTr": med(net[lose]),
+        "mLb": med(held[lose]) if lose.any() else np.inf,
+        "mWb": med(held[win]) if win.any() else np.inf,
+        "lr": longest(-1),
+        "wr": longest(1),
+        "dd": dd,
+        "llt": float(net[lose].min()) if lose.any() else 0.0,
+        "std": sd,
+        "t": mean / (sd / math.sqrt(k)) if sd > 0.0 else 0.0,
+        "eqR2": r2(1),
+        "eq2R2": r2(2),
+        "ktau": tau,
+        "osnp": float(net.sum()),
+        "ont": float(k),
+        "ownp": ownp,
+        "ownt": float(int(win.sum())),
+        "ollt": float(net[lose].min()) if lose.any() else 0.0,
+        "odd": dd,
+    }
+
+
+def _flat_trades(nets) -> np.ndarray:
+    """A `simulate`-shaped array holding just the nets: every trade one bar long, all long.
+
+    The metric kernel reads `net` and `exit - entry` and nothing else, so this is the whole
+    input for any test about a P&L sequence rather than about the trades that produced it.
+    """
+    nets = np.asarray(nets, dtype=np.float64)
+    out = np.zeros((nets.size, 4), dtype=np.float64)
+    out[:, 0] = np.arange(nets.size, dtype=np.float64) * 2.0
+    out[:, 1] = out[:, 0] + 1.0
+    out[:, 2] = 1.0
+    out[:, 3] = nets
+    return out
+
+
+def _random_trades(rng, k: int | None = None) -> np.ndarray:
+    """A plausible `simulate` output: exit > entry always, dir in {-1, +1}, net float64."""
+    k = int(rng.integers(0, 60)) if k is None else k
+    entry = np.sort(rng.integers(0, 2000, k)).astype(np.float64)
+    held = rng.integers(1, 40, k).astype(np.float64)
+    out = np.empty((k, 4), np.float64)
+    out[:, 0] = entry
+    out[:, 1] = entry + held
+    out[:, 2] = rng.choice([-1.0, 1.0], k)
+    # A mixture, so some draws are all-winners, some all-losers and some near-flat -- the
+    # degenerate branches have to be reachable by chance, not only by construction.
+    scale = float(rng.choice([0.05, 0.5, 5.0]))
+    out[:, 3] = rng.normal(float(rng.uniform(-0.4, 0.4)), scale, k)
+    if rng.random() < 0.15 and k:  # exact zeros, which cost=0 can really produce
+        out[rng.integers(0, k, max(1, k // 5)), 3] = 0.0
+    return out
+
+
+def test_unit5_matches_the_reference_on_random_trades() -> None:
+    """All 24 columns against numpy/scipy over 3000 random trade arrays.
+
+    PLAN Unit 5's done-when. The arrays are drawn to reach the degenerate branches by
+    chance -- 0 trades, 1 trade, all-winners, all-losers, exact zero nets -- and the run
+    asserts each was actually hit, so a later change that made them unreachable would not
+    quietly turn this into a test of the easy path only.
+    """
+    rng = np.random.default_rng(11)
+    worst = {c: 0.0 for c in rmv.METRIC_COLS}
+    seen = {"k0": 0, "k1": 0, "k2": 0, "no_losers": 0, "no_winners": 0, "zero_net": 0}
+    worst_neg_eq2 = 0.0
+    for _ in range(3000):
+        trades = _random_trades(rng)
+        got = rmv.metrics(trades)
+        want = _metrics_reference(trades)
+        net = trades[:, 3]
+        seen["k0"] += len(trades) == 0
+        seen["k1"] += len(trades) == 1
+        seen["k2"] += len(trades) == 2
+        seen["no_losers"] += len(trades) > 0 and not (net < 0).any()
+        seen["no_winners"] += len(trades) > 0 and not (net > 0).any()
+        seen["zero_net"] += bool((net == 0).any())
+        worst_neg_eq2 = min(worst_neg_eq2, want["eq2R2"])
+        for i, col in enumerate(rmv.METRIC_COLS):
+            a, b = float(got[i]), float(want[col])
+            if np.isinf(b):
+                assert np.isinf(a) and np.sign(a) == np.sign(b), f"{col}: {a} vs {b}"
+                continue
+            assert np.isfinite(a), f"{col} is {a} -- SPEC §7 rule 2 bans NaN in kernels"
+            worst[col] = max(worst[col], abs(a - b) / max(1.0, abs(b)))
+    for name, count in seen.items():
+        assert count > 0, f"no random case exercised {name}; the branch is untested"
+    # The unclamped reference is what pins the kernel's `if eq2r2 < 0.0` as noise removal.
+    assert worst_neg_eq2 > -1e-6, (
+        f"the reference's own 2nd-order R2 reached {worst_neg_eq2}, which a least-squares "
+        "fit with an intercept cannot do -- the kernel's clamp would be hiding a real defect"
+    )
+    bad = {c: v for c, v in worst.items() if v > 1e-9}
+    assert not bad, f"columns disagreeing with numpy/scipy by more than 1e-9: {bad}"
+    print(f"    (24 cols x 3000 arrays, worst relative gap "
+          f"{max(worst.values()):.2e} at {max(worst, key=worst.get)})", end="")
+
+
+def test_unit5_hand_built_trade_list() -> None:
+    """One five-trade list with every one of the 24 answers written out by hand.
+
+    PLAN Unit 5's done-when asks for exactly this. The reference above and the kernel could
+    in principle share a misreading of SPEC §6.1; a literal cannot.
+    """
+    trades = np.array([
+        # entry  exit  dir    net
+        [0.0,    2.0,  1.0,   1.00],
+        [3.0,    5.0, -1.0,  -0.50],
+        [6.0,    9.0,  1.0,   2.00],
+        [10.0,  12.0,  1.0,  -0.25],
+        [13.0,  20.0, -1.0,   0.75],
+    ])
+    got = dict(zip(rmv.METRIC_COLS, rmv.metrics(trades)))
+
+    # equity is 0, then 1.00, 0.50, 2.50, 2.25, 3.00 -- peak 1.00 then 2.50, so the worst
+    # excursion is trade 2 taking 1.00 down to 0.50.
+    assert got["tnp"] == 3.0 and got["nT"] == 5.0
+    assert got["ownp"] == 3.75 and got["ownt"] == 3.0          # 1.00 + 2.00 + 0.75
+    assert got["PF"] == 5.0                                     # 3.75 / 0.75
+    assert got["%P"] == 60.0                                    # 3 of 5, on a 0-100 scale
+    assert got["mTrd"] == 0.75                                  # median of all five nets
+    assert got["mWTr"] == 1.0 and got["mLTr"] == -0.375         # -0.375 = mean(-0.50, -0.25)
+    assert got["mWb"] == 3.0 and got["mLb"] == 2.0              # bars held = exit - entry
+    assert got["wr"] == 1.0 and got["lr"] == 1.0                # winners and losers alternate
+    assert got["dd"] == -0.5 and got["llt"] == -0.5             # both stored negative
+    assert abs(got["std"] - math.sqrt(4.075 / 4)) < 1e-15       # ddof=1 about a mean of 0.6
+    assert abs(got["t"] - 0.6 / (got["std"] / math.sqrt(5))) < 1e-13
+    assert abs(got["ktau"] - 60.0) < 1e-13                      # 8 concordant, 2 discordant
+    # Both regressions as literals. `eq2R2 >= eqR2` alone would have admitted anything in
+    # [74.298, 100] -- including the 100.0 an exact-fit bug produces -- which is the
+    # "passes against broken logic" case PLAN §4 names, in the one test whose whole job is
+    # to owe nothing to `_metrics_reference`.
+    assert abs(got["eqR2"] - 74.297752808989) < 1e-11, got["eqR2"]
+    assert abs(got["eq2R2"] - 74.398073836276) < 1e-11, got["eq2R2"]
+    # ...and eqR2 is still the square of Pearson's r between trade index and equity, x100.
+    r = float(np.corrcoef(np.arange(5), np.cumsum(trades[:, 3]))[0, 1])
+    assert abs(got["eqR2"] - 100.0 * r * r) < 1e-12
+    assert got["eq2R2"] > got["eqR2"], "a quadratic cannot fit worse than the line it contains"
+    for is_col, oos_col in (("tnp", "osnp"), ("nT", "ont"), ("llt", "ollt"), ("dd", "odd")):
+        assert got[is_col] == got[oos_col], f"{oos_col} is not {is_col} on the same trades"
+
+
+def test_unit5_degenerate_combos_are_defined() -> None:
+    """0, 1, 2 and 3 trades, all-winners and all-losers -- and what each does to SPEC §5.
+
+    These are not hypothetical: over 34,496 real combos 0.24% traded not at all, 2.3% fewer
+    than twice and 4.8% fewer than three times, so every filter meets them every window.
+    Each assertion below is about a *selection* consequence, not just a returned number.
+    """
+    def row(nets, held=None):
+        nets = np.asarray(nets, float)
+        t = np.zeros((nets.size, 4))
+        t[:, 0] = np.arange(nets.size) * 10.0
+        t[:, 1] = t[:, 0] + (1.0 if held is None else np.asarray(held, float))
+        t[:, 2] = 1.0
+        t[:, 3] = nets
+        return dict(zip(rmv.METRIC_COLS, rmv.metrics(t)))
+
+    # Each sentinel is checked by the SELECTION it forces, not just by its value. The three
+    # sentinels point in three different directions because their consumers do.
+    empty = row([])
+    assert np.isinf(empty["PF"]), "a no-trade row must fail every PF upper bound"
+    assert empty["eqR2"] == 100.0, "a no-trade row must fail CL2's < 80 and CL4's <= 50"
+    assert np.isinf(empty["mLb"]) and np.isinf(empty["mWb"]), (
+        "a no-trade row must sort LAST on mLb -- CL2 and CL4 rank on the smallest"
+    )
+    assert empty["eq2R2"] == 0.0, "a no-trade row must never win meyers2005's max eq2R2"
+    zero_valued = [c for c in rmv.METRIC_COLS if c not in ("PF", "eqR2", "mLb", "mWb")]
+    assert all(empty[c] == 0.0 for c in zero_valued), empty
+    # ...and the three screens it now fails, spelled out, because this is the whole point:
+    assert not (1.0 <= empty["PF"] <= 2.0), "meyers2005 would admit a no-trade row"
+    assert not (empty["PF"] < 4.0 and empty["lr"] < 3.0 and empty["eqR2"] < 80.0), "CL2 would"
+    assert not (empty["lr"] <= 3.0 and empty["eqR2"] <= 50.0), "CL4 would"
+
+    one = row([-1.0])
+    assert one["nT"] == 1.0 and one["mLTr"] == -1.0 and one["llt"] == -1.0
+    assert one["dd"] == -1.0, "equity starts at zero, so a single loser is a full drawdown"
+    assert one["std"] == 0.0 and one["t"] == 0.0, "sd of one sample is undefined, not zero-div"
+    assert one["eq2R2"] == 0.0 and one["ktau"] == 0.0
+    assert one["eqR2"] == 100.0, "one trade is no trend, and must not pass CL4's eqR2 <= 50"
+    assert one["mLb"] == 1.0 and np.isinf(one["mWb"]), "one loser has a real mLb"
+
+    two = row([1.0, 2.0])
+    assert two["eqR2"] == 100.0, "two points determine a line"
+    assert two["eq2R2"] == 0.0, "a quadratic through two points is underdetermined, not exact"
+    assert two["ktau"] == 100.0 and np.isinf(two["PF"])
+    # ...and 100.0 is what makes a two-trade row fail CL2's eqR2 < 80 and CL4's eqR2 <= 50.
+
+    three = row([1.0, -2.0, 4.0])
+    assert three["eq2R2"] > 100.0 - 1e-9, "three points determine a parabola"
+    assert three["eqR2"] < 90.0, "...but not a line"
+
+    winners = row([1.0, 2.0, 3.0])
+    assert np.isinf(winners["PF"]) and winners["mLTr"] == 0.0 and np.isinf(winners["mLb"])
+    assert winners["llt"] == 0.0 and winners["dd"] == 0.0 and winners["%P"] == 100.0
+    # llt and dd being 0.0 on an all-winner row is [M25 Table 1]'s published value, not a
+    # choice: its 12/15/14 week reads ont 4, ownt 4, ollt 0, odd 0.
+    losers = row([-1.0, -2.0])
+    assert losers["PF"] == 0.0 and losers["mWTr"] == 0.0 and np.isinf(losers["mWb"])
+    assert losers["%P"] == 0.0 and losers["ownp"] == 0.0 and losers["ownt"] == 0.0
+    assert losers["lr"] == 2.0 and losers["wr"] == 0.0
+    # And the drawdown of an all-loser row is the FULL cumulative loss, because equity is
+    # zero-based and the running peak starts there. [M25 Table 1] 01/07/15: ont 2,
+    # osnp -2020, odd -2020 -- a peak seeded from the first equity value would give -990.
+    assert losers["dd"] == -3.0 and losers["osnp"] == -3.0 and losers["odd"] == -3.0
+
+    # A net of exactly 0 is neither side, and breaks both streaks. cost=0 makes these real.
+    zeros = row([1.0, 1.0, 0.0, 1.0, 1.0])
+    assert zeros["nT"] == 5.0 and zeros["ownt"] == 4.0 and zeros["%P"] == 80.0
+    assert zeros["wr"] == 2.0, "a zero-net trade must break the winning streak, not extend it"
+    assert zeros["lr"] == 0.0, "...and must not count as a loser either"
+    assert np.isinf(zeros["PF"]) and zeros["mTrd"] == 1.0
+
+
+def test_unit5_median_matches_numpy_including_ties() -> None:
+    """`rmv._median` is the whole metric set's tie-breaking and even-count convention.
+
+    It replaces `np.median` to keep Unit 6's `prange` allocation-free, so it has to agree
+    with it exactly -- including on the even counts where the answer is the mean of two
+    middles, and on the heavy ties an integer bar count produces.
+    """
+    rng = np.random.default_rng(5)
+    buf = np.empty(64, np.float64)
+    for _ in range(20_000):
+        m = int(rng.integers(1, 41))
+        # Integers over a small range, so ties are the common case rather than a corner.
+        x = rng.integers(-5, 6, m).astype(np.float64) / 2.0
+        buf[:m] = x
+        assert rmv._median(buf, m) == float(np.median(x)), f"m={m} {x}"
+        assert np.all(np.diff(buf[:m]) >= 0), "the slice was not left sorted"
+    assert rmv._median(buf, 0) == 0.0, "the empty median must be 0.0, not NaN (SPEC §7 rule 2)"
+    # Reverse-sorted input is insertion sort's worst case; it must still be correct.
+    buf[:9] = np.arange(9, 0, -1, dtype=np.float64)
+    assert rmv._median(buf, 9) == 5.0
+
+
+def test_unit5_ktau_matches_scipy() -> None:
+    """`ktau` is tau-b against trade order, and scipy is the oracle.
+
+    The trade index has no ties, which collapses tau-b to `(C - D) / sqrt((C + D) * nPairs)`.
+    That collapse is only valid on the x side, so the tie cases below are on the equity
+    curve, where they are genuinely reachable whenever `cost` is 0.
+    """
+    from scipy import stats
+
+    rng = np.random.default_rng(19)
+    worst = 0.0
+    for _ in range(2000):
+        k = int(rng.integers(2, 60))
+        nets = rng.integers(-3, 4, k).astype(np.float64)  # integers, so equity ties happen
+        t = _flat_trades(nets)
+        got = float(rmv.metrics(t)[rmv.METRIC_COLS.index("ktau")])
+        want = 100.0 * float(stats.kendalltau(np.arange(k), np.cumsum(nets),
+                                              variant="b").statistic)
+        if not np.isfinite(want):
+            assert got == 0.0, "a constant equity curve must be 0.0, not scipy's nan"
+            continue
+        worst = max(worst, abs(got - want))
+    assert worst < 1e-12, f"worst gap against scipy.stats.kendalltau: {worst}"
+    # A strictly rising and a strictly falling equity curve bracket the scale, which is
+    # x100 and signed -- the same 0-100 magnitude eqR2 and eq2R2 use, so a filter threshold
+    # literal means one thing across all three correlation columns.
+    up = _flat_trades(np.full(6, 1.0))
+    dn = _flat_trades(np.full(6, -1.0))
+    assert rmv.metrics(up)[rmv.METRIC_COLS.index("ktau")] == 100.0
+    assert rmv.metrics(dn)[rmv.METRIC_COLS.index("ktau")] == -100.0
+    print(f"    (worst gap vs scipy over 2000 curves: {worst:.2e})", end="")
+
+
+def test_unit5_equity_regressions_survive_the_dollar_bases() -> None:
+    """⚑ PLAN §1.7 rule 3 and SPEC §7's table, reproduced on *trade-indexed* equity.
+
+    Two claims, and the second is the one that matters. First: the naive one-pass float32
+    `n*Sxy - Sx*Sy` form really does fall apart once the equity curve sits on a dollar base,
+    which is the regime [M25 Table 1]'s $233,000 `NetEq` column lives in. Second: adding
+    that base to `metrics`' own input -- which a pure shift of the equity curve is, exactly
+    -- moves `eqR2`, `eq2R2` and `ktau` by less than a float32 eps, because the kernel
+    mean-centres in float64 before it accumulates anything.
+    """
+    def naive_f32_r2(y):
+        """The form SPEC §7 says goes wrong: uncentred, float32, one pass."""
+        y = y.astype(np.float32)
+        n = np.float32(y.size)
+        sx = sy = sxy = sxx = syy = np.float32(0.0)
+        for i in range(y.size):
+            xi = np.float32(i)
+            sx += xi
+            sy += y[i]
+            sxy += xi * y[i]
+            sxx += xi * xi
+            syy += y[i] * y[i]
+        den = (n * sxx - sx * sx) * (n * syy - sy * sy)
+        if den <= 0:
+            return float("nan")
+        num = n * sxy - sx * sy
+        return 100.0 * float(num * num / den)
+
+    rng = np.random.default_rng(23)
+    cols = [rmv.METRIC_COLS.index(c) for c in ("eqR2", "eq2R2", "ktau")]
+    report, shifted_worst = {}, 0.0
+    for base in (0.0, 100.0, 200_000.0):
+        flips = nonfinite = 0
+        worst_naive = 0.0
+        for _ in range(600):
+            k = int(rng.integers(5, 120))
+            t = _flat_trades(rng.normal(0.02, 0.5, k))
+            plain = rmv.metrics(t)
+            # Adding `base` to the first trade's net adds it to *every* equity value and to
+            # nothing else -- a pure shift of the curve, on the same k points.
+            t[0, 3] += base
+            shifted = rmv.metrics(t)
+            shifted_worst = max(shifted_worst, max(abs(shifted[c] - plain[c]) for c in cols))
+
+            exact = float(plain[cols[0]])
+            naive = naive_f32_r2(np.cumsum(t[:, 3]))
+            if not np.isfinite(naive):
+                nonfinite += 1
+                continue
+            worst_naive = max(worst_naive, abs(naive - exact))
+            flips += (exact <= 50.0) != (naive <= 50.0)
+        report[base] = (worst_naive, flips, nonfinite)
+
+    assert report[0.0][1:] == (0, 0) and report[0.0][0] < 0.01, (
+        f"zero-based should be the safe row of SPEC §7's table, got {report[0.0]}"
+    )
+    assert report[100.0][0] > 0.1, "base $100 should already be visibly wrong in float32"
+    assert report[200_000.0][2] > 100, (
+        "base $200,000 should drive the naive float32 form non-finite -- if it no longer "
+        "does, this test has stopped demonstrating why the kernel centres"
+    )
+    # float32 eps at 100 is 7.6e-6, so this is well below anything the stored column can see.
+    assert shifted_worst < 1e-6, (
+        f"a pure ${200_000:,} shift of the equity curve moved eqR2/eq2R2/ktau by "
+        f"{shifted_worst}; the mean-centring is not doing its job"
+    )
+    for base, (w, f, nf) in report.items():
+        print(f"    (base {base:,.0f}: naive f32 off by {w:.4g}, {f} screen flips, "
+              f"{nf} non-finite)", end="\n" if base != 200_000.0 else "")
+    print(f"    (kernel under a ${200_000:,} shift: {shifted_worst:.2e})", end="")
+
+
+def test_unit5_scale_and_sign_conventions_are_pinned() -> None:
+    """The conventions SPEC §6 does not state and SPEC §5's filters cannot survive wrong.
+
+    Every one of these is a silent failure: a 0-1 `eqR2` passes `< 80` and `<= 50` for every
+    row in the table, and an unsigned `mLTr` inverts which row `min mLTr` picks. None of
+    them raises, and none is caught by comparing against a reference that shares the error.
+    """
+    # A perfectly straight equity line is 100, not 1.0.
+    line = _flat_trades(np.full(20, 0.5))
+    got = dict(zip(rmv.METRIC_COLS, rmv.metrics(line)))
+    assert abs(got["eqR2"] - 100.0) < 1e-9, f"eqR2 is not on a 0-100 scale: {got['eqR2']}"
+    assert abs(got["eq2R2"] - 100.0) < 1e-9, f"eq2R2 is not on a 0-100 scale: {got['eq2R2']}"
+    assert got["%P"] == 100.0, "%P is not on a 0-100 scale"
+
+    # Loss metrics come out negative, which is [M25 Figure 2]'s own convention (LLTr = -3540)
+    # and SPEC §9-E's open reading. Unit 8 derives the magnitude convention with abs(); the
+    # reverse is not derivable, which is why this direction is the one that is stored.
+    mixed = np.array([[0., 1., 1., 3.0], [2., 4., 1., -5.0], [5., 6., 1., -1.0]])
+    got = dict(zip(rmv.METRIC_COLS, rmv.metrics(mixed)))
+    assert got["mLTr"] == -3.0 and got["llt"] == -5.0 and got["dd"] == -6.0
+    assert got["ollt"] == got["llt"] and got["odd"] == got["dd"]
+    assert abs(got["PF"] - 0.5) < 1e-15, "PF is not net gross-profit over net gross-loss"
+
+    # SPEC §9-D's alternative `|r|` reading has to be reachable from what is stored, and it
+    # is -- by transforming the THRESHOLD, which is exact, rather than the column.
+    # `|r| <= 0.50` is `R2 <= 0.25` is `eqR2 <= 25`; `|r| < 0.80` is `eqR2 < 64`.
+    rng = np.random.default_rng(31)
+    flips = 0
+    for _ in range(2000):
+        t = _flat_trades(rng.normal(0.1, 1.0, int(rng.integers(4, 60))))
+        eqr2 = float(rmv.metrics(t)[rmv.METRIC_COLS.index("eqR2")])
+        r = abs(float(np.corrcoef(np.arange(len(t)), np.cumsum(t[:, 3]))[0, 1]))
+        assert abs(math.sqrt(eqr2 / 100.0) - r) < 1e-11, "sqrt(eqR2/100) is not |r|"
+        flips += (r <= 0.50) != (eqr2 <= 25.0) or (r < 0.80) != (eqr2 < 64.0)
+    assert flips == 0, f"the |r| threshold transform disagreed with |r| on {flips} curves"
+
+    # The three degenerate sentinels point in three directions, one per consumer. Asserted
+    # here as well as in the degenerate test so a "tidy them all to 0.0" refactor fails.
+    empty = rmv.metrics(np.zeros((0, 4)))
+    assert float(empty[rmv.METRIC_COLS.index("eqR2")]) == 100.0     # screened -> must fail
+    assert float(empty[rmv.METRIC_COLS.index("eq2R2")]) == 0.0      # argmax -> must lose
+    assert np.isinf(empty[rmv.METRIC_COLS.index("mLb")])            # min-ranked -> must sort last
+    assert np.isinf(empty[rmv.METRIC_COLS.index("PF")])             # upper-bounded -> must fail
+
+    # `std` is the one column the net-vs-gross question provably cannot move: `cost` is a
+    # constant subtracted from every trade, and variance is translation-invariant.
+    t = _flat_trades(rng.normal(0.1, 1.0, 40))
+    gross = t.copy()
+    gross[:, 3] += COST
+    i = rmv.METRIC_COLS.index("std")
+    assert abs(float(rmv.metrics(t)[i]) - float(rmv.metrics(gross)[i])) < 1e-12
+
+    # The 24 columns are PLAN §1.6's two blocks in order, and Unit 7 slices them apart.
+    assert rmv.METRIC_COLS[rmv.IS_COLS] == (
+        "tnp", "nT", "PF", "%P", "mTrd", "mWTr", "mLTr", "mLb", "mWb",
+        "lr", "wr", "dd", "llt", "std", "t", "eqR2", "eq2R2", "ktau",
+    ), "the 18 columns Unit 7 writes to pwfo_is.npy moved"
+    assert rmv.METRIC_COLS[rmv.OOS_COLS] == (
+        "osnp", "ont", "ownp", "ownt", "ollt", "odd",
+    ), "the 6 columns Unit 7 writes to pwfo_oos.npy moved"
+    assert rmv.N_METRICS == 24 and len(set(rmv.METRIC_COLS)) == 24
+
+
+def test_unit5_winner_set_is_net_not_gross() -> None:
+    """⚑ `ownp`/`ownt` count the NET winners, and the two sets genuinely differ.
+
+    SPEC §6.2 reads *"Winning Trades total Net Profits"*, so a trade whose gross cleared but
+    whose `cost` did not is a loser. Measured here rather than asserted in the abstract: the
+    gap is 122 trades at n=6/v=0.5 and 15 at n=12/v=1.0, and a refactor that drifted onto the
+    gross reading would move `ownp` without moving anything that raises.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    mult = rmv.xmult(matrix, bars.gate == 1)
+    seen = []
+    for n, v, gross_want, net_want in ((6, 0.5, 4810, 4688), (12, 1.0, 1517, 1502)):
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        thr = rmv.threshold(v, mult, n)
+        trades = rmv.simulate(matrix[a], bars.close, bars.gate, thr, thr, COST)
+        net = trades[:, 3]
+        gross_winners = int((net + COST > 0).sum())
+        net_winners = int((net > 0).sum())
+        assert (gross_winners, net_winners) == (gross_want, net_want), (
+            f"n={n} v={v}: {gross_winners}/{net_winners} against PLAN's "
+            f"{gross_want}/{net_want} -- the sample or the cost convention moved"
+        )
+        m = dict(zip(rmv.METRIC_COLS, rmv.metrics(trades)))
+        assert m["ownt"] == float(net_winners), "ownt counted the gross winner set"
+        assert abs(m["ownp"] - float(net[net > 0].sum())) < 1e-9
+        assert abs(m["ownp"] / -net[net < 0].sum() - m["PF"]) < 1e-12, (
+            "ownp is not PF's numerator; they are the same sum and must not drift apart"
+        )
+        seen.append((n, v, gross_winners, net_winners))
+    print("    (" + ", ".join(f"n={n} v={v}: {g} gross / {x} net winners"
+                              for n, v, g, x in seen) + ")", end="")
+
+
+def test_unit5_bars_held_is_never_zero_on_real_data() -> None:
+    """⚑ PLAN Unit 5's inherited invariant, checked where the trades are actually produced.
+
+    `mLb` is a rank-and-pick metric in CL2 and CL4, so a zero-bar losing trade would sort to
+    the front of the bottom-k rank and hand the filter a trade that never existed. Unit 4
+    suppresses the entry that would create one; this is the assertion that it stayed
+    suppressed, over a real grid rather than a constructed case.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total, checked, trades_seen = 1638, 0, 0
+    buf = np.empty((total, 4), np.float64)
+    for start in (40_000, 120_000, 200_000):
+        sl = slice(start, start + total)
+        close = np.ascontiguousarray(bars.close[sl])
+        gate = np.ascontiguousarray(bars.gate[sl])
+        rows = np.ascontiguousarray(matrix[:, sl])
+        mult = rmv.xmult(rows, gate == 1)
+        for a in (0, 9, 21):
+            row = np.ascontiguousarray(rows[a])
+            n = int(rmv.N_VALUES[a])
+            for v in (0.25, 1.0, 3.5):
+                thr = rmv.threshold(v, mult, n)
+                k = rmv._simulate(row, close, gate, thr, thr, COST, buf)
+                held = buf[:k, 1] - buf[:k, 0]
+                assert k == 0 or held.min() >= 1.0, f"a {held.min()}-bar trade at n={n} v={v}"
+                assert np.all(np.abs(buf[:k, 2]) == 1.0), "dir outside {-1, +1}"
+                checked += 1
+                trades_seen += k
+    print(f"    ({trades_seen} trades over {checked} combos, none held 0 bars)", end="")
+
+
+def test_unit5_reference_agrees_on_a_real_grid() -> None:
+    """The kernel against numpy/scipy on trades a real window really produced.
+
+    The random arrays above are drawn from a distribution; this is the shape the grid
+    actually emits -- long runs of one sign, heavy ties in the bar counts, equity curves
+    that trend. Cheap enough to run a sample of combos, which is what makes it worth having
+    on top of the 3000 random ones.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total, start = 1638, 150_000
+    sl = slice(start, start + total)
+    close = np.ascontiguousarray(bars.close[sl])
+    gate = np.ascontiguousarray(bars.gate[sl])
+    rows = np.ascontiguousarray(matrix[:, sl])
+    mult = rmv.xmult(rows, gate == 1)
+    buf = np.empty((total, 4), np.float64)
+    worst, combos, trades_seen = 0.0, 0, 0
+    for a in range(0, rmv.N_VALUES.size, 3):
+        row = np.ascontiguousarray(rows[a])
+        n = int(rmv.N_VALUES[a])
+        for i in (1, 5, 11):
+            for j in (2, 7, 13):
+                up = rmv.threshold(0.25 * i, mult, n)
+                dn = rmv.threshold(0.25 * j, mult, n)
+                k = rmv._simulate(row, close, gate, up, dn, COST, buf)
+                trades = buf[:k].copy()
+                got_row = rmv.metrics(trades)
+                want = _metrics_reference(trades)
+                for idx, col in enumerate(rmv.METRIC_COLS):
+                    b = want[col]
+                    if np.isinf(b):
+                        assert np.isinf(got_row[idx]), f"{col} at n={n}"
+                        continue
+                    worst = max(worst, abs(float(got_row[idx]) - b) / max(1.0, abs(b)))
+                combos += 1
+                trades_seen += k
+    assert worst < 1e-9, f"worst relative gap on a real window: {worst}"
+    print(f"    ({combos} real combos, {trades_seen} trades, worst gap {worst:.2e})", end="")
+
+
+def test_unit5_float32_storage_keeps_the_filter_screens() -> None:
+    """Unit 6 stores these as float32; SPEC §5's screens must not move when it does.
+
+    SPEC §7 rule 3 permits float32 *storage* -- the danger it names is float32 accumulation,
+    which the test above covers. This is the other half: a value computed exactly in float64
+    and then rounded to float32 has to land on the same side of `PF < 4`, `eqR2 < 80`,
+    `eqR2 <= 50`, `lr < 3`, `lr <= 3` and `nT >= 16` as the float64 value did.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total, start = 1638, 90_000
+    sl = slice(start, start + total)
+    close = np.ascontiguousarray(bars.close[sl])
+    gate = np.ascontiguousarray(bars.gate[sl])
+    rows = np.ascontiguousarray(matrix[:, sl])
+    mult = rmv.xmult(rows, gate == 1)
+    buf = np.empty((total, 4), np.float64)
+    wide = np.empty(rmv.N_METRICS, np.float64)
+    narrow = np.empty(rmv.N_METRICS, np.float32)
+    scratch = np.empty(total, np.float64)
+    screens = (("PF", "<", 4.0), ("PF", "<=", 2.0), ("PF", ">=", 1.0), ("eqR2", "<", 80.0),
+               ("eqR2", "<=", 50.0), ("lr", "<", 3.0), ("lr", "<=", 3.0), ("nT", ">=", 16.0))
+    flips = {s: 0 for s in screens}
+    combos = 0
+    closest = np.inf
+    for a in range(rmv.N_VALUES.size):
+        row = np.ascontiguousarray(rows[a])
+        n = int(rmv.N_VALUES[a])
+        for i in range(1, 15, 2):
+            for j in range(1, 15, 2):
+                k = rmv._simulate(row, close, gate, rmv.threshold(0.25 * i, mult, n),
+                                  rmv.threshold(0.25 * j, mult, n), COST, buf)
+                # `_metrics` writes straight into Unit 6's float32 row -- the same call it
+                # makes -- so this measures the real store, not a numpy round trip.
+                rmv._metrics(buf[:k], wide, scratch)
+                rmv._metrics(buf[:k], narrow, scratch)
+                for s in screens:
+                    col, op, bound = s
+                    idx = rmv.METRIC_COLS.index(col)
+                    hi, lo = float(wide[idx]), float(narrow[idx])
+                    # Only the continuous columns say anything about margin: `lr` and `nT`
+                    # are small integers, exact in float32, and land *on* their bound often.
+                    if np.isfinite(hi) and col in ("PF", "eqR2") and hi != bound:
+                        closest = min(closest, abs(hi - bound))
+                    cmp = {"<": lambda x: x < bound, "<=": lambda x: x <= bound,
+                           ">=": lambda x: x >= bound}[op]
+                    flips[s] += cmp(hi) != cmp(lo)
+                combos += 1
+    bad = {f"{c}{o}{b}": v for (c, o, b), v in flips.items() if v}
+    assert not bad, f"float32 storage flipped a filter screen: {bad} over {combos} combos"
+    # Not "cannot": the flip needs the float64 value within half a float32 ulp of the bound,
+    # which is 1.9e-6 at eqR2 = 50. The closest any real combo came says how much room there
+    # is; if that ever falls below ~1e-5 this test is one refresh from firing.
+    print(f"    ({combos} combos, 8 screens, 0 flips; closest approach to a bound "
+          f"{closest:.2e})", end="")
+
+
+def test_unit5_degenerate_rows_cannot_reach_the_filters() -> None:
+    """⚑ Both sentinel decisions, measured against a real 4312-combo grid rather than argued.
+
+    Two findings this pins, either of which would have been a silent wrong selection:
+
+    1. `eqR2 = 0.0` for a row with fewer than two trades passes both `eqR2 < 80` (CL2) and
+       `eqR2 <= 50` (CL4). Hundreds of rows per window have `nT < 2`, so CL4's bottom-10
+       `mLb` pool would have been mostly rows that never traded. `eqR2 = 100.0` fails both.
+    2. `eq2R2` is exactly 100 for every `nT == 3` row -- a quadratic through three points is
+       an exact fit -- and `meyers2005` *picks* max `eq2R2`. Its `nT >= 16` screen is what
+       stops that pick collapsing onto a three-trade row, so the screen is load-bearing and
+       not decoration. Recorded here because a later filter written without it would look
+       reasonable and silently select noise.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total = 1638
+    buf = np.empty((total, 4), np.float64)
+    scratch = np.empty(total, np.float64)
+    idx = {c: i for i, c in enumerate(rmv.METRIC_COLS)}
+    report = []
+    for start in (60_000, 150_000):
+        sl = slice(start, start + total)
+        close = np.ascontiguousarray(bars.close[sl])
+        gate = np.ascontiguousarray(bars.gate[sl])
+        rows = np.ascontiguousarray(matrix[:, sl])
+        mult = rmv.xmult(rows, gate == 1)
+        out = np.empty((4312, rmv.N_METRICS), np.float64)
+        c = 0
+        for a in range(rmv.N_VALUES.size):
+            row = np.ascontiguousarray(rows[a])
+            n = int(rmv.N_VALUES[a])
+            for i in range(14):
+                for j in range(14):
+                    k = rmv._simulate(row, close, gate, rmv.threshold(0.25 * (i + 1), mult, n),
+                                      rmv.threshold(0.25 * (j + 1), mult, n), COST, buf)
+                    rmv._metrics(buf[:k], out[c], scratch)
+                    c += 1
+        nt, eq2, eqr2, lr, pf, mlb = (out[:, idx[x]] for x in
+                                      ("nT", "eq2R2", "eqR2", "lr", "PF", "mLb"))
+        thin = nt < 2
+        # (1) no thin row survives any of the three filters' screens.
+        assert not ((lr <= 3) & (eqr2 <= 50) & thin).any(), "CL4 admitted a row with nT < 2"
+        assert not ((pf < 4) & (lr < 3) & (eqr2 < 80) & thin).any(), "CL2 did"
+        assert not ((pf >= 1) & (pf <= 2) & (lr <= 3) & (nt >= 16) & thin).any(), "meyers2005 did"
+        # ...and none of them can enter a bottom-k rank on mLb either.
+        assert np.isinf(mlb[nt == 0]).all(), "a zero-trade row has a finite mLb"
+        # (2) the eq2R2 saturation, and that nT >= 16 is what removes it.
+        top = eq2 >= eq2.max() - 1e-9
+        assert eq2.max() == 100.0 and top.sum() > 0
+        assert (nt[top] == 3).all(), (
+            f"rows at max eq2R2 have nT in {sorted(set(nt[top].astype(int)))}, not all 3 -- "
+            "the exact-fit explanation for the saturation no longer holds"
+        )
+        surv = nt >= 16
+        assert eq2[surv].max() < 100.0, "meyers2005's nT >= 16 screen no longer removes them"
+        report.append((int(thin.sum()), int((nt == 0).sum()), int(top.sum()),
+                       float(eq2[surv].max())))
+    print("    (" + "; ".join(
+        f"{t} rows nT<2 ({z} nT=0) all screened out, {s} rows at eq2R2=100 all nT=3, "
+        f"best survivor {b:.1f}" for t, z, s, b in report) + ")", end="")
+
+
+def test_unit5_buffer_reuse_and_zero_allocation() -> None:
+    """Unit 6 calls `_metrics` inside `prange` with per-thread buffers and forbids allocation.
+
+    Two things a single-call test cannot see: whether a dirty `scratch` or a dirty `out`
+    changes the answer, and whether the kernel allocates. The allocation half needs
+    `NUMBA_NRT_STATS=1` set before numba imports, so it runs in a subprocess.
+    """
+    import os
+
+    rng = np.random.default_rng(41)
+    busy = _random_trades(rng, k=50)
+    quiet = _random_trades(rng, k=3)
+    scratch = np.empty(200, np.float64)
+    out = np.empty(rmv.N_METRICS, np.float64)
+
+    fresh = rmv.metrics(quiet).copy()
+    rmv.metrics(busy, out=out, scratch=scratch)          # dirties both buffers
+    again = rmv.metrics(quiet, out=out, scratch=scratch)
+    assert np.array_equal(fresh, again), "a dirty out/scratch buffer changed the answer"
+    assert again is out, "metrics did not return the caller's buffer"
+
+    # A float32 out row -- what Unit 6 actually passes -- must produce the float64 answer
+    # rounded, not a float32-accumulated one.
+    narrow = np.empty(rmv.N_METRICS, np.float32)
+    rmv._metrics(busy, narrow, scratch)
+    assert np.allclose(narrow, rmv.metrics(busy), rtol=1e-6, atol=1e-6), (
+        "the float32 storage row is not the float64 answer rounded"
+    )
+
+    # Measured njit-to-njit through a driver, which is the call Unit 6 makes. Calling
+    # `_metrics` from the interpreter instead reports 3 allocations *per call* -- one for
+    # each array argument numba has to box at the boundary -- and none of them is the
+    # kernel. Measuring the wrong side of that boundary is how this test lies.
+    src = (
+        "import numpy as np, rmv\n"
+        "from numba import njit\n"
+        "from numba.core.runtime import nrt\n"
+        "@njit(cache=False)\n"
+        "def driver(t, out, scr, reps):\n"
+        "    for _ in range(reps): rmv._metrics(t, out, scr)\n"
+        "rng = np.random.default_rng(0)\n"
+        "t = np.zeros((40, 4)); t[:, 1] = 1.0; t[:, 3] = rng.normal(0, 1, 40)\n"
+        "out = np.empty(rmv.N_METRICS); scr = np.empty(64)\n"
+        "driver(t, out, scr, 1)\n"
+        "a = nrt.rtsys.get_allocation_stats().alloc\n"
+        "driver(t, out, scr, 500)\n"
+        "boxed = nrt.rtsys.get_allocation_stats().alloc - a\n"
+        "b = nrt.rtsys.get_allocation_stats().alloc\n"
+        "for _ in range(500): rmv._metrics(t, out, scr)\n"
+        "print(boxed, nrt.rtsys.get_allocation_stats().alloc - b)\n"
+    )
+    env = {**os.environ, "NUMBA_NRT_STATS": "1", "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True,
+                          cwd=str(Path(__file__).parent), env=env)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    inner, outer = (int(x) for x in proc.stdout.strip().splitlines()[-1].split())
+    assert inner <= 3, (
+        f"{inner} allocations for 500 calls inside njit -- Unit 6's done-when is zero "
+        "allocation inside prange, and np.median / ndarray.sort are exactly what breaks it"
+    )
+    # The interpreter path must still show the boxing, or the driver above was inlined away
+    # and `inner` is measuring nothing. A lower bound, not `== 1500`: the exact count is a
+    # numba implementation detail (3 per call, one per array argument, in 0.65.1) and
+    # pinning it would fail on a numba upgrade with no logic change.
+    assert outer >= 500, (
+        f"only {outer} allocations over 500 interpreted calls -- the boxing that makes the "
+        "njit-to-njit comparison meaningful is gone, so `inner` may be measuring nothing"
+    )
+    print(f"    ({inner} allocations for 500 njit calls; {outer / 500:.0f}/call from the "
+          f"interpreter, all argument boxing)", end="")
+
+
+def test_unit5_rejects_bad_input() -> None:
+    """Each guard is for a caller mistake that would otherwise return a plausible row."""
+    good = _flat_trades([1.0, -1.0, 2.0, -0.5, 0.25])
+
+    def rejects(fragment, **kw):
+        try:
+            rmv.metrics(**kw)
+        except ValueError as exc:
+            assert fragment in str(exc), f"wrong message for {fragment!r}: {exc}"
+            return
+        raise AssertionError(f"accepted input that should raise on {fragment!r}")
+
+    rejects("float64[k, 4]", trades=good[:, :3])                     # dropped a column
+    rejects("float64[k, 4]", trades=good.astype(np.float32))         # wrong dtype
+    rejects("float64[k, 4]", trades=good[:, 3])                      # 1-D, the net column
+    rejects("out must be", trades=good, out=np.empty(23))            # 23, not 24
+    rejects("out must be", trades=good, out=np.empty(24, np.float32))
+    rejects("scratch has", trades=good, scratch=np.empty(4))         # one slot short
+    rejects("scratch must be", trades=good, scratch=np.empty(9, np.float32))
+    rejects("aliases trades", trades=good, scratch=good[:, 3])       # a view of the input
+    # 5 slots for 5 trades is exactly enough, and 0 trades must not demand a buffer at all.
+    rmv.metrics(good, scratch=np.empty(5))
+    rmv.metrics(np.zeros((0, 4)))
+
+
+def test_unit5_budget() -> None:
+    """Simulation plus metrics, one real window's 4312 combos, against Unit 6's 60 ms.
+
+    Unit 4 measured its own half at ~12 ms serial and Unit 6 has to fit both inside 60 ms
+    on one thread before `prange` is allowed to be the reason it passes. The metric pass is
+    O(k^2) in two places -- the insertion-sort medians and the Kendall pair loop -- so it is
+    the trade count, not the bar count, that decides whether this holds.
+    """
+    import time
+
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no SPY cache)", end="")
+        return
+    bars, matrix = got
+    total = 1638
+    buf = np.empty((total, 4), np.float64)
+    scratch = np.empty(total, np.float64)
+    out = np.empty((4312, rmv.N_METRICS), np.float32)
+    k = rmv._simulate(matrix[0, :total].copy(), bars.close[:total].copy(),
+                      bars.gate[:total].copy(), 0.01, 0.01, COST, buf)
+    rmv._metrics(buf[:k], out[0], scratch)  # JIT
+
+    worst = worst_trades = 0.0
+    for start in np.linspace(30_000, len(bars) - total - 1, 4).astype(int):
+        sl = slice(start, start + total)
+        close = np.ascontiguousarray(bars.close[sl])
+        gate = np.ascontiguousarray(bars.gate[sl])
+        rows = np.ascontiguousarray(matrix[:, sl])
+        mult = rmv.xmult(rows, gate == 1)
+        thr = np.array([[rmv.threshold(0.25 * (j + 1), mult, n) for j in range(14)]
+                        for n in rmv.N_VALUES])
+        trades = c = 0
+        begin = time.perf_counter()
+        for a in range(rmv.N_VALUES.size):
+            row = np.ascontiguousarray(rows[a])
+            for i in range(14):
+                for j in range(14):
+                    k = rmv._simulate(row, close, gate, thr[a, i], thr[a, j], COST, buf)
+                    rmv._metrics(buf[:k], out[c], scratch)
+                    trades += k
+                    c += 1
+        elapsed = time.perf_counter() - begin
+        if elapsed > worst:
+            worst, worst_trades = elapsed, trades
+    print(f"    (worst real window {worst * 1000:.0f} ms serial for 4312 simulate+metrics, "
+          f"{worst_trades / 4312:.1f} trades/combo)", end="")
+    assert worst_trades / 4312 > 10, (
+        f"only {worst_trades / 4312:.1f} trades per combo -- this is timing an empty loop"
+    )
+    assert worst < 0.060, (
+        f"{worst * 1000:.0f} ms serial for one window's 4312 simulate+metrics, on one "
+        "thread, against Unit 6's 60 ms budget for the whole window"
+    )
+
 
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
