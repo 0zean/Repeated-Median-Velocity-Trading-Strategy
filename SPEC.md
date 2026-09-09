@@ -650,6 +650,42 @@ the most overfit.
 Filter drift is expected and is a finding, not a defect. [M25 p.11]: the four CL papers found
 four different filters, and *"the current paper's methodology should be run every 6+ months."*
 
+### Pinned in Unit 8 ⚑
+
+The source is silent on three things a filter run cannot avoid deciding. All three change
+the reported result, none of them raises, and each is settled here rather than in the code.
+
+**Nine filters, not three.** §9-D's two `r2` readings and §9-E's two `mLTr` conventions
+are both open and both must be run (PLAN §1.5). They expand `CL2` and `CL4` into four
+variants each. `meyers2005` screens no `r2` column and its pick is an argmax over `eq2R2`,
+so both transforms are no-ops on it and it stays one filter. **Nine is the count that
+enters §6.5's `K`**, and a variant that silently collapses or duplicates moves the
+significance of the whole project — so the expansion drops a transform that changed
+nothing, rather than naming twelve.
+
+**The rank has no direction.** [M25 p.8]'s grammar is `b10mLb`, *"the bottom or minimum 10
+mLb rows"*, and all three baselines rank that way. §6.6 measured what the other direction
+does — a **top**-k on `mLb` puts every no-loser row, `+inf` sentinel and all, at the head
+of a pool it can never be displaced from — so the filter grammar admits `bottom` only. Any
+filter needing the other direction reopens this section first.
+
+**`oW\|oL` is a ratio of dollars, not of counts.** §6.3 col L reads *"Average OOS
+winning trades / average OOS losing trades"*, which is also readable as a count ratio. It is
+not: col F of the same table says *"Average **number** of OOS trades per week"*, so [M25]
+writes "number of" when it means a count, and col L's *"average ... trades"* is the average
+value of one. Ours is therefore `(sum(ownp)/sum(ownt))` over `|(sum(osnp)-sum(ownp))/(sum(ont)
+-sum(ownt))|`, reported positive. ⚑ The losing side is a *difference*, because the six OOS
+columns store only the winners and the total — so §6.6's net-zero trades, which are neither
+winner nor loser, land in the loser count. Measured 0 of 686,565 real trades sit on that
+boundary; `cost = 0` is a legal argument and would produce them.
+
+**The zero-trade convention.** §6.4's two cases are kept distinct on every record: a week
+where a row was selected and fired no signals carries its `N`/`vup`/`vdn`, a week where no
+row passed the screens carries none. Both contribute a 0 to `toNP` and **both stay in the
+denominator of every aggregate** (§9-K). ⚑ Measured over 525 pre-tail SPY windows, case 2
+does not occur at all — no row fails the screens in any of 4725 filter-windows — while
+case 1 runs 92 to 179 of 525 (17.5%–34.1%), two and a half times [M25]'s rate. See §6.4.
+
 ---
 
 ## 6. Metric definitions
@@ -803,6 +839,14 @@ trades [M25 p.10]. For that paper's filter (`%P` = 57) the two conventions diffe
 
 1. **Params selected, no signals fired** — Table 1 shows `N/vup/vdn` filled with `osnp = 0`.
 2. **No row passed the filter** — [M25 p.15 Col G]. No params exist for that week.
+
+⚑ **Measured in Unit 8, and the 13.7 above is this paper's rate, not a bound.** Over 525
+pre-tail SPY windows, `meyers2005` — whose `nT >= 16` screen forces an active row — goes
+silent (case 1) in **9 weeks**, and the other eight baseline filters in **92 to 179 weeks,
+17.5% to 34.1%**, against [M25]'s 71 of 517. Dropping those weeks from `%P`'s denominator
+moves it by **+0.8 points for `meyers2005` and +8.3 to +17.4 for the rest**. Case 2 does
+**not occur once** in 4725 filter-windows: every filter finds a row every week, and the
+distinction therefore lands entirely on case 1 in this sample.
 
 ### 6.5 Significance test — [M25 pp.8–9]
 
@@ -1040,8 +1084,8 @@ question.
 | **A** | Normalization multiplier: [M25 p.7] and Fig 3 use `6.7`; the Appendix p.28 derives `9.693120`. | **Open.** All published CL results used 6.7, so Meyers' effective range was 0.17–2.4 sd. SPY calibrates by the Appendix method; expect the top of the grid to fire rarely. |
 | **B** | [M25 p.7] states 4508 combinations; the stated ranges give 22×14×14 = 4312. `4508 = 23×14×14`. | **Resolved** — use the stated ranges (4312). One of the paper's ranges is off by one N. |
 | **C** | Filter term `p<4` / `p<5` [M25 p.11] is never defined. | **Resolved: it is `pf` (Profit Factor).** [M25 Fig 2 col A p.14] shows `pf<2`, `pf<4` and `pf<5` in that grammar slot, always beside a *separate* `lr<3` term — so `p` cannot mean losing-periods-in-a-row, which is `lr`. |
-| **D** | `r2` vs `r`: [M05 p.6] defines `R22` as *"the correlation coefficient"* (i.e. `r`); [M25 p.15 Col V] writes *"correlation coefficient(R^2)"*. Used interchangeably. | **Open, but narrowed in Unit 5 to two readings, not three.** Both papers define the metric as the correlation between the equity curve and *its own fitted line* — [M05 p.6] *"between the trade Equity line and the 2nd Order Polynomial Line that is fitted to"* it, [M25 p.15 Col V] *"of a straight-line fit to the equity curve"*. For any least-squares fit carrying an intercept `corr(y, ŷ) = +sqrt(R²) ≥ 0`, so a **signed** `r` has no textual support and is deliberately not stored (§6.6). The two live readings are exact transforms of one column: with `eqR2 = 100·R²`, the `\|r\|` reading is obtained by moving the **threshold**, not the data — `CL2`'s `eqR2 < 80` becomes `eqR2 < 64` and `CL4`'s `eqR2 <= 50` becomes `eqR2 <= 25`. No `sqrt`, no second column, no precision loss. Run both. Doubly harmless for `meyers2005`: its pick is an argmax over `eq2R2`, and non-negativity there is a theorem rather than the assumption §1.5 recorded. |
-| **E** | `mLTr` sign: "we want the row that has the smallest value of `mLTr`" [M25 p.8]. | **Open.** [M25 Fig 2] stores loss metrics **negative** (`LLTr = -3540`, `LLp = -6640`, `eqDD = -10970`), under which "smallest" selects the *deepest* median loss — the opposite of the stated intent (*"minimize the effect of large losing trades"*). Run both conventions. |
+| **D** | `r2` vs `r`: [M05 p.6] defines `R22` as *"the correlation coefficient"* (i.e. `r`); [M25 p.15 Col V] writes *"correlation coefficient(R^2)"*. Used interchangeably. | **Open, but narrowed in Unit 5 to two readings, not three.** Both papers define the metric as the correlation between the equity curve and *its own fitted line* — [M05 p.6] *"between the trade Equity line and the 2nd Order Polynomial Line that is fitted to"* it, [M25 p.15 Col V] *"of a straight-line fit to the equity curve"*. For any least-squares fit carrying an intercept `corr(y, ŷ) = +sqrt(R²) ≥ 0`, so a **signed** `r` has no textual support and is deliberately not stored (§6.6). The two live readings are exact transforms of one column: with `eqR2 = 100·R²`, the `\|r\|` reading is obtained by moving the **threshold**, not the data — `CL2`'s `eqR2 < 80` becomes `eqR2 < 64` and `CL4`'s `eqR2 <= 50` becomes `eqR2 <= 25`. No `sqrt`, no second column, no precision loss. Run both. Doubly harmless for `meyers2005`: its pick is an argmax over `eq2R2`, and non-negativity there is a theorem rather than the assumption §1.5 recorded. ⚑ **Both are implemented and the choice flips the sign of the result** (Unit 8): `CL4` returns `toNP` −94.31 as written and **+84.46** under the `\|r\|` reading, over the same 525 windows. Not a detail. |
+| **E** | `mLTr` sign: "we want the row that has the smallest value of `mLTr`" [M25 p.8]. | **Open.** [M25 Fig 2] stores loss metrics **negative** (`LLTr = -3540`, `LLp = -6640`, `eqDD = -10970`), under which "smallest" selects the *deepest* median loss — the opposite of the stated intent (*"minimize the effect of large losing trades"*). Run both conventions. ⚑ **Both are implemented and the choice flips the sign of the result** (Unit 8): `CL2` returns `toNP` +132.11 as stored and **−26.68** under the magnitude reading, over the same 525 windows. It also moves the selected row's median `nT` from 7 to 10 and the silent-week count from 179 to 127. |
 | **F** | [M25 p.4] carries a dated erratum retracting its own first-trade rule: *"(11/10/25) Note: this is no longer true…"* | **Deferred.** Keep the 10:00 gate for v1. §3.1 computes RMedV on the full session anyway, so revisiting is a gate change. |
 | **G** | Strict vs inclusive: [M25 p.8] writes `lr≤3 r2≤50`; p.10 writes `lr<3\|r2<50` for the same filter. [M05 p.6] writes `PF>1` but its Fig 2 caption writes `PF>=1`. | **Resolved by choice:** `CL4` uses `lr <= 3`, `eqR2 <= 50`; `meyers2005` uses `1 <= PF <= 2`. Recorded so the choice is visible. |
 | **H** | First window: [M25 p.4] prose says IS `11/13/14–12/12/14`, OOS `12/16–12/19/14`. [M25 Table 1 p.17] row 1 says IS `11/12/14–12/12/14`, OOS `12/15–12/19/14`. | **Resolved: Table 1 governs** (§4). The prose is wrong on both start dates, and its 4-session OOS week has no holiday to explain it — 12/15–12/19/14 is a full Mon–Fri. |

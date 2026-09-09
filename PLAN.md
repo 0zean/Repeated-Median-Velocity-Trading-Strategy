@@ -276,7 +276,7 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 | ⚑ Same, shipped `run_grid`, 32 threads | < 60 ms | **3.2 ms** (16.6 ms on 1 thread) |
 | Full PWFO, 546 windows, IS+OOS | < 60 s, peak RSS < 1 GB | **~32 s, 226 MB** |
 | ⚑ Same, shipped `pwfo.run`, 551 windows (525 + 26 withheld) | < 60 s, peak RSS < 1 GB | **2.6 s, 411 MB** |
-| One filter over the full table | < 1 s | — |
+| ⚑ One filter over the full table, shipped `pwfo.evaluate` | < 1 s | **10–23 ms** (+ 0.11 s hoist, shared by all nine) |
 | Live per-bar compute | < 1 ms, zero steady-state allocation | — |
 
 **The entire walk-forward is a ~35-second job.** Any design adding a job queue, a database,
@@ -741,7 +741,7 @@ whether the 4312-row equality test can pass against a broken kernel.
 `run(bars, matrix, wins=None, out_dir=OUT_DIR, progress=0) -> list[dict]`, writing
 `pwfo_is.npy` `float32[525, 4312, 18]`, `pwfo_oos.npy` `float32[525, 4312, 6]`,
 `pwfo_tail.npy` `float32[26, 4312, 24]` and the sibling `pwfo_index.json`. 89/89 tests,
-`ruff check .` clean, **29 of 33 mutations killed** (4 provably equivalent, below).
+`ruff check .` clean, **31 of 35 mutations killed** (4 equivalent or deferred, below).
 **2.6 s and 411 MB peak RSS** against a 60 s / 1 GB budget — 4.8 ms/window over 551
 windows, both halves. Re-running is byte-identical across all four files.
 
@@ -803,7 +803,49 @@ start without the tiling guard is caught by the paper-table test, a tail keyed o
 start without the reach guard by the withheld-file test, and a mid-session IS cut by the
 rejection test. (iv) Taking `cost` off the first IS bar instead of the IS mean survives,
 and should: both are IS-only price levels, the tests pin *IS-only* and *0.027 at $600*,
-and which statistic of the IS price the fee is charged on is Unit 9's question.
+and which statistic of the IS price the fee is charged on is Unit 9's question. ⚠ The
+review measured what that costs — up to **0.0016** between the two (window 2025-05-09),
+11% of the width of the observed 0.0153–0.0296 range — so the deferral is a scope call,
+not an immateriality claim, and the number travels with it.
+
+### Review findings, triaged
+
+One adversarial subagent per §4. It reproduced **every** numeric claim above exactly — the
+window census, both exact-start/exact-end counts, the `xmult` extremes and median, the
+0.1429 worst normalized `sd`, the cost range, and the byte-identical re-run *at the full
+525-window scale* rather than the 4-window sample the shipped test uses. Nothing failed to
+reproduce. Timing landed at 2.4–2.5 s and 410.8 MB against the claimed 2.6 s / 411 MB.
+
+- **Fixed — the stored `cost` was never checked against a recomputation, where `xmult`
+  was.** Replacing `cost = window_cost(close)` with the flat `0.027` of Units 4–6 — which
+  silently deletes this unit's per-window cost entirely — passed all 89 tests. The matched
+  `xmult` mutation dies. `cost` is given exactly `xmult`'s discipline by PLAN's own text,
+  so it now gets exactly `xmult`'s test: the stored value equals `window_cost` of this
+  window's IS bars, and is not the flat constant. Both new mutations are killed.
+- **Fixed — the replay test read the index `run` returned, not the index on disk.** Units
+  8, 9 and 11 take the JSON path, and a lossy float round-trip there would move every
+  threshold. Measured lossless over 50 real windows by the reviewer; now exercised.
+- **Fixed — `run(bars, matrix, [])` reported an empty window list as a tail problem**
+  (*"all 0 windows are withheld"*). Unreachable through `windows`, which raises first.
+- **Recorded — `window_cost` does not mask to gated bars, where `rmv.xmult` must.**
+  Deliberate: an ungated bar is not an RMedV value (22.8% at N=3) but is a perfectly good
+  price. Measured worst effect **5.18e-5** over 525 windows, 0.3% of `cost`. In the
+  docstring, not changed — Unit 9 owns the model.
+- **Corrected — "provably equivalent" was too strong for survivors (ii) and (iii).** The
+  equivalence argument itself holds unconditionally. Its *evidence* does not: with
+  `cache/` absent, 9 of the 11 `test_unit7_*` tests skip to PASS, and both combined
+  mutations that justify those two survivors go green. That is the deferred cross-unit
+  skipped-tests-count-as-PASS defect, now Units 1–7, and this is the first unit where it
+  demonstrably weakens a claim rather than only an intention.
+- **Recorded, no change — extending the IS slice one bar into OOS is caught by the
+  `trades` buffer's bound, not by a semantic check.** `t_max` is computed before the leak,
+  so the enlarged window overflows and 7 tests fail. Real defense in depth today; if
+  buffer sizing ever moves per-call, the digest comparison in
+  `test_unit7_xmult_and_cost_see_only_is_bars` is the only remaining net.
+- **The withheld tail was not touched.** The reviewer asserted `len(bars) == 245_025`
+  before every measurement, read `pwfo_index.json` but never `pwfo_tail.npy`, and finished
+  with `pwfo.py` and `test_rmv.py` sha256-identical. Unit 9's comparison counter owes this
+  review nothing.
 
 **Do**
 
@@ -882,7 +924,129 @@ week 11/20–11/24/23); windows where zero rows pass any filter.
 
 ---
 
-### Unit 8 — Filter evaluation
+### Unit 8 — Filter evaluation ✅ **shipped**
+
+**Shipped** in `pwfo.py`: `FILTERS` (SPEC §5's three baselines as data), `OPS`, `R2_COLS`,
+`Z98`, `variants()`, `decode()`, `load_tables()`, `select()`, `evaluate()`, `aggregate()`
+and `run_filters()`. 102/102 tests, `ruff check .` clean, **67 of 70 mutations killed**
+(3 equivalent or inert, below). **10–23 ms per filter** over 525 windows x 4312 combos against a
+1 s budget, after a **0.11 s** hoist of the 7 columns the filters read (63 MB IS + 54 MB
+OOS). 13 tests added.
+
+⚑ **67 of 70 with `cache/` and `pwfo/` present, and 67 of 70 without.** Unit 7's review
+found the deferred skipped-tests-count-as-PASS defect weakening a real claim, so this unit
+was measured against it rather than inheriting it. The first pass scored 61 without the
+generated tables — all four lost kills in `load_tables` — and
+`test_unit8_reads_only_the_two_tables_it_is_handed` now builds its own PWFO directory from
+synthetic bars and takes all four. Every mutation kill here is cache-independent. The
+defect is still open for Units 1–7.
+
+- ⚑ **Nine filters, not three.** SPEC §9-D's two `r2` readings and §9-E's two `mLTr`
+  conventions expand `CL2` and `CL4` into four each; `meyers2005` screens no `r2` column
+  and picks `eq2R2`, so both transforms are no-ops on it and it collapses to one. The
+  dedupe is derived, not asserted — `variants()` drops a transform that changed nothing.
+  **All nine are OOS-touching looks and belong in Unit 9's multiplier.**
+- ⚑ **Both ambiguities flip the sign of the answer.** They are not details to note and
+  move past. `CL4` returns `toNP` **−94.31** as written and **+84.46** under the `|r|`
+  reading; `CL2` returns **+132.11** as written and **−26.68** under the magnitude `mLTr`.
+  Every one of the four readings of each filter is defensible from the source text, and
+  they disagree about whether the strategy makes money.
+- ⚑ **No filter is significant, before Unit 9 does any work.** Over 525 pre-tail weeks the
+  nine `toNP` run **−160.93 to +132.11** per share with `t` from **−1.205 to +1.389**, and
+  that is against a null of *zero* — Unit 9's null is a random filter with a positive mean
+  (SPEC §6.5). `BE` is `inf` for five of the nine and 1149 weeks (22 years) for the best.
+  Six of nine lose money. This is the unit's most important measurement and it is reported
+  here rather than held for the gate.
+- ⚑ **SPEC §6.4 case 2 never happens: no row fails the screens in any of 4725
+  filter-windows.** [M25 p.15 Col G]'s *no params exist for that week* is real in the
+  paper and empty in our sample, so the whole two-zero distinction lands on case 1, and
+  the code path that produces a flat week is only reachable synthetically. It is kept and
+  tested anyway — a tighter filter reaches it immediately.
+- ⚑ **Case 1 is far more common than [M25]'s, and PLAN's 14-point estimate is low.**
+  `meyers2005`, whose `nT >= 16` screen forces an active row, goes silent in 9 of 525
+  weeks; the other eight filters in **92 to 179 (17.5%–34.1%)**, against [M25]'s 71 of 517
+  (13.7%). Dropping those weeks from `%P`'s denominator moves it by **+0.8 points for
+  `meyers2005` and +8.3 to +17.4 for the rest**, above SPEC §6.4's stated 13.7 ceiling —
+  that ceiling is that paper's zero-week rate, not a bound. `CL2` trades in only 346 of
+  525 weeks; `meyers2005` in 516.
+- ⚑ **The tie block is wider than the 24-window sample said.** Over all 525 windows the
+  rows tied at `CL4`'s 10th-smallest `mLb` run **1 to 55** (PLAN said 1–22) and at `CL2`'s
+  50th **1 to 110** (PLAN said 3–33), medians 6 and 9. `pick_tie` — rows sharing the
+  winning `mLTr` inside the kept pool — reaches 26. Both widths ride on every record.
+- ⚑ **`rank` lost its direction knob; the key is `bottom`.** PLAN wrote
+  `rank: (metric, direction, top_k)` and all three baselines rank one way, so the other
+  branch was dead code — and SPEC §6.6 measured what it would do if used: a **top**-k on
+  `mLb` puts every no-loser row, sentinel `+inf` and all, at the head of a pool it can
+  never be displaced from, and a filter picking max `eqR2` selects an `nT <= 2` row in 24
+  of 24 windows. The sanctioned directions are now the only ones spellable. Unit 10
+  reopens this deliberately or not at all.
+- ⚑ **The trade-count floor is surfaced, not patched.** `CL4` selects a row with `nT < 5`
+  in **82 of 525** windows and `CL2` in **120 of 525** (median selected `nT` 12 and 7);
+  `meyers2005` never does, and its median is 28. Faithful to [M25], whose two published
+  filters carry no `nT` screen — so every record ships its selected row's `nT`.
+- **`select` cannot see an OOS column**, because there is no argument through which one
+  could arrive: it takes one window's IS block and a filter. `load_tables` refuses an OOS
+  name outright, which is the only boundary where the separation could go wrong.
+- **`oW|oL` is derived, not stored.** The six OOS columns carry the winners (`ownp`,
+  `ownt`) and the total, so the losing side is the difference — which folds §6.6's
+  net-zero trades, counted as neither, into the loser count. Measured 0 of 686,565 real
+  trades sit on that boundary; `cost = 0` is a legal argument and would produce them.
+  Reported as a magnitude ratio: 1.12–1.36 across the nine, against `%P` of 33.5–47.6.
+  These filters win slightly bigger than they lose and lose more often than they win.
+- **`Z98 = 2.0537489106318225`** is inlined rather than imported: PLAN §2.3 keeps `scipy`
+  out of everything but the test oracle, and the test pins the constant against
+  `scipy.stats.norm.ppf(0.98)`.
+
+**Mutation survivors, all three resolved rather than chased.** (i) Dropping the nan guard
+in `load_tables` and (ii) dropping its `pwfo_is.npy` shape check are guards that never fire
+on a correct table. Two *combined* mutations — break the thing the guard exists for **and**
+remove the guard — were added to show what is left, and both are killed: a nan written into
+the hoisted block fails `test_unit8_budget`'s trade-count assertion, and a window list
+running past the table is caught by the sibling `pwfo_oos.npy` shape check, which the
+mutation leaves standing. ⚠ The nan kill is indirect — it lands on a `mean()` going
+non-finite, not on a semantic nan check — so that guard earns its place by reporting the
+right cause, not by being the only net. (iii) Dropping `eq2R2` from `R2_COLS` survives, and
+should: no baseline *screens* `eq2R2` and a pick is never threshold-shifted, so the member
+is inert today. It stays because what belongs in that tuple is the **scale** — both columns
+are stored ×100 (SPEC §6.6) — and a filter that screens `eq2R2` with it missing would leave
+§9-D silently applying to only half the columns it names.
+
+### Review findings, triaged
+
+One adversarial subagent per §4. It reproduced **every** numeric claim above exactly — the
+nine variants, the `toNP` and `t` ranges, both sign flips, `BE` inf for five of nine, case
+2 at 0 of 4725, the tie widths, the `nT < 5` counts, the `%P` deltas and the trade counts —
+with only the wall-clock hoist figure landing as a range (99.6–118 ms against 0.11 s).
+Nothing failed to reproduce. It found no logic error in the shipped behaviour and no
+look-ahead, and confirmed structurally that `select` has no parameter through which an OOS
+column could arrive.
+
+- **Fixed — `BE`'s floor of one period had no test at all.** Deleting `max(1, ...)` passed
+  all 102 tests. `BE = 0` is reachable and meaningless: one profitable period has no
+  dispersion, so §6.3 col X's formula gives 0 for *"the number of OOS periods you would
+  have to trade"*. Now pinned on a single-week aggregate.
+- **Fixed — `wpr`'s zero boundary was untested where `lpr`'s was.** Changing `p > 0` to
+  `p >= 0` passed all 102 tests: the hand-computed series has its zero between two losers,
+  so it discriminates one streak and not the other, while the docstring claims the rule is
+  symmetric. A second series with a zero between two winners now pins it.
+- **Fixed — `n_sel`'s comment called it "§6.3 col G's complement".** It is not: col G is
+  the periods that *traded*, which is `n_trd`. `n_sel` excludes only case 2. The values
+  were right and the comment could have misled Unit 9 about §6.5's denominators.
+- **Pinned in SPEC — `oW|oL` reads two ways and the code silently chose one.** §6.3 col L's
+  *"average OOS winning trades"* is a dollar average, not a count ratio, because col F of
+  the same table writes *"Average **number** of"* when it means a count. The reading is now
+  in SPEC §5 with that argument, alongside the difference-derived loser side.
+- **Corrected — the silent-week range excluded `meyers2005` while the `%P` range included
+  it.** Both figures were right and the sentence read as though one range explained the
+  other. `meyers2005` goes silent 9 times; the other eight, 92–179.
+- **Recorded, no change — `R2_COLS`'s `eq2R2` member is inert.** Dropping it passes all 102
+  tests, because no baseline *screens* `eq2R2` and a pick is not transformed. Kept with a
+  comment: it is the scale that belongs there, and the day a filter screens `eq2R2` its
+  threshold has to move by the same rule or §9-D quietly stops applying to half the columns
+  it names.
+- **The withheld tail was not touched.** The reviewer never opened, read or hashed
+  `pwfo_tail.npy`; `load_tables` reads only `pwfo_is.npy`, `pwfo_oos.npy` and the index.
+  Unit 9's comparison counter owes this review nothing — but ⚑ it owes Unit 8 nine.
 
 **Do**
 
@@ -975,6 +1139,31 @@ the two zero cases distinctly.
 - The comparison counter owes nothing to Unit 7: no filter has been evaluated and
   `pwfo_oos.npy` has been read only by tests, which compare stored rows against standalone
   replays of the same bars and never rank, screen or aggregate them.
+
+⚑ **From Unit 8: the counter now owes something, and the answer is already in.**
+
+- **Nine filters have been run against `pwfo_oos.npy` over all 525 pre-tail windows**
+  (SPEC §5, "Pinned in Unit 8"). That is the first real entry in this unit's multiplier and
+  it is not the last — §8's cheap A/Bs are further looks at the same columns. **Build the
+  counter file before running anything else**; nine is the number it starts from, not zero.
+- **The gate looks unreachable on this evidence.** The nine `toNP` run −160.93 to +132.11
+  per share with `t` from −1.205 to +1.389, six of nine negative, against a null that is
+  *positive* (§6.5). Do the free power check first — it is one line and it may end the
+  project before the bootstrap is written.
+- **Both open ambiguities flip the sign**, so there is no "the" answer to report: `CL4` is
+  −94.31 as written and +84.46 under §9-D's `|r|` reading; `CL2` is +132.11 as written and
+  −26.68 under §9-E's magnitude `mLTr`. Reporting a favourable reading without the other
+  three is the failure mode §5 is named after.
+- **Every aggregate is already computed** by `pwfo.aggregate` on §9-K's convention (all OOS
+  periods, zero-trade weeks counted as zero) and is net, not gross. What is missing from
+  §6.3 is the bootstrap block (`Prob`, `skew`, `kur`, `v20`, `KTau^2`, `eqR2`, `tkr|bl`) and
+  the row-1 scalars, which are this unit's.
+- **A selected week carries `rank_tie` and `pick_tie`.** Report them: the rows tied at
+  `CL4`'s cut run 1–55 and at `CL2`'s 1–110, so "the bottom 10 by `mLb`" is ten arbitrary
+  rows out of as many as 55. A `toNP` quoted without that width overstates what was chosen.
+- **`pwfo_tail.npy` was not opened.** `load_tables` reads `pwfo_is.npy`, `pwfo_oos.npy` and
+  the index only; the file is byte-identical, and one test overwrites it with unparseable
+  bytes to prove nothing reaches it.
 
 **Do**
 

@@ -3754,6 +3754,452 @@ def test_unit7_budget() -> None:
           f"for {len(wins)}, {nt:.1f} IS trades/combo)", end="")
 
 
+# ---------------------------------------------------------- Filter evaluation (Unit 8)
+
+
+# One row that passes every screen of all three baselines (SPEC §5), so a test plants only
+# what it is actually about. `mLTr` is negative because SPEC §6.6 stores losses signed.
+_BENIGN = {"PF": 1.5, "lr": 1.0, "nT": 20.0, "eqR2": 10.0, "eq2R2": 50.0,
+           "mLb": 5.0, "mLTr": -2.0}
+
+
+def _is_cols(n: int = 4312) -> dict:
+    """One window's IS block with every row benign. Mutate entries to plant an answer."""
+    return {k: np.full(n, v, np.float32) for k, v in _BENIGN.items()}
+
+
+def _one_window(cols: dict, oos_fill: float = 7.0):
+    """`(cols, oos, wins)` for a single synthetic window, shaped as `evaluate` wants it.
+
+    `oos_fill` is a canary: every OOS cell holds a non-zero value, so a "flat week" that
+    is really a silent fallback pick reports 7.0 rather than 0.0 and the test sees it.
+    """
+    n = next(iter(cols.values())).size
+    return ({k: v[None] for k, v in cols.items()},
+            np.full((1, n, 6), oos_fill, np.float32),
+            [{"friday": "2016-02-05", "oos_start": "2016-02-08", "oos_end": "2016-02-12",
+              "xmult": 3.0, "cost": 0.02}])
+
+
+def test_unit8_variants_cover_both_open_ambiguities() -> None:
+    """SPEC §9-D and §9-E, PLAN §1.5: run both readings both ways -- and count them.
+
+    Nine filters, not twelve and not three. The count is Unit 9's comparison multiplier,
+    so a variant silently collapsing (or duplicating) moves the significance of the whole
+    project. `meyers2005` is the one that legitimately collapses: it screens no `r2` column
+    and picks `eq2R2`, so both transforms are no-ops on it -- §9-D's "doubly harmless",
+    checked rather than believed.
+
+    The `r`-reading thresholds are asserted against §9-D's own two literals, 64 and 25.
+    They are derived in `_r_reading` as `v*v/100`; if that were transcribed instead, this
+    is the test that would still be looking at the right numbers.
+    """
+    v = pwfo.variants()
+    assert set(v) == {
+        "meyers2005", "CL2", "CL2 r", "CL2 |mLTr|", "CL2 r |mLTr|",
+        "CL4", "CL4 r", "CL4 |mLTr|", "CL4 r |mLTr|",
+    }, sorted(v)
+    thresh = {name: dict((m, val) for m, _, val in f["screens"]) for name, f in v.items()}
+    assert thresh["CL2"]["eqR2"] == 80.0 and thresh["CL2 r"]["eqR2"] == 64.0
+    assert thresh["CL4"]["eqR2"] == 50.0 and thresh["CL4 r"]["eqR2"] == 25.0
+    # The magnitude reading changes the pick and nothing else.
+    for base in ("CL2", "CL4"):
+        assert v[base]["pick"] == ("mLTr", "min")
+        assert v[f"{base} |mLTr|"]["pick"] == ("|mLTr|", "min")
+        assert v[f"{base} |mLTr|"]["screens"] == v[base]["screens"]
+    # The base dicts are not mutated by the expansion -- every variant is a fresh dict.
+    assert pwfo.FILTERS["CL4"]["screens"] == [("lr", "<=", 3.0), ("eqR2", "<=", 50.0)]
+    assert pwfo.FILTERS["CL4"]["pick"] == ("mLTr", "min")
+
+
+def test_unit8_selects_the_planted_row() -> None:
+    """PLAN Unit 8's first done-when, plus the screens that make it mean something.
+
+    Row 1234 is planted to win each baseline on its own terms. Two decoys are planted to
+    fail only on a screen, so dropping any screen moves the answer:
+
+    - Row 2000 beats 1234 on every rank and pick metric but has `lr = 9`. Every baseline
+      screens `lr`, so all three must ignore it.
+    - Row 3000 scores `eq2R2 = 100` at `nT = 3` -- SPEC §6.6's measured pathology, where a
+      quadratic through three points is an exact fit. Only `meyers2005`'s `nT >= 16` stands
+      between it and the pick, which is why that screen is called load-bearing rather than
+      decoration.
+    """
+    cols = _is_cols()
+    cols["mLb"][1234], cols["mLTr"][1234], cols["eq2R2"][1234] = 1.0, -9.0, 99.0
+    cols["mLb"][2000], cols["mLTr"][2000], cols["eq2R2"][2000] = 0.5, -99.0, 100.0
+    cols["lr"][2000] = 9.0
+    cols["eq2R2"][3000], cols["nT"][3000] = 100.0, 3.0
+    for name in ("meyers2005", "CL2", "CL4"):
+        got = pwfo.select(cols, pwfo.FILTERS[name])
+        assert got is not None and got[0] == 1234, f"{name} picked {got}, not the planted 1234"
+    # Negative control: with the plant removed the answer moves off 1234 entirely.
+    plain = _is_cols()
+    assert all(pwfo.select(plain, f)[0] != 1234 for f in pwfo.FILTERS.values())
+
+
+def test_unit8_the_two_mltr_conventions_pick_different_rows() -> None:
+    """SPEC §9-E: "smallest `mLTr`" reads two ways and they are not the same row.
+
+    `mLTr` is stored negative, so as stored the minimum is the *deepest* median loss --
+    the opposite of [M25 p.8]'s stated intent to minimize the effect of large losing
+    trades. Both rows here sit in every bottom-k, differing only in which end of the
+    signed column they occupy, so a variant expander that quietly produced two copies of
+    the same filter fails here rather than inflating Unit 9's multiplier with a duplicate.
+    """
+    cols = _is_cols()
+    cols["mLb"][[300, 400]] = 1.0
+    cols["mLTr"][300], cols["mLTr"][400] = -9.0, -0.5
+    v = pwfo.variants()
+    for base in ("CL2", "CL4"):
+        assert pwfo.select(cols, v[base])[0] == 300, f"{base} as stored must take the deepest"
+        assert pwfo.select(cols, v[f"{base} |mLTr|"])[0] == 400
+
+
+def test_unit8_the_r_reading_moves_only_the_threshold() -> None:
+    """SPEC §9-D: `eqR2` is `100*R^2`, so reading the literal as `100*|r|` squares it.
+
+    Row 500 has `eqR2 = 30`: inside `CL4`'s `<= 50` and outside `CL4 r`'s `<= 25`. It is
+    the only row with the winning `mLb`, so under one reading it is the answer and under
+    the other it is not in the pool at all -- which is what "decisive for CL4" (PLAN §1.5)
+    means on real column values rather than in the abstract.
+    """
+    cols = _is_cols()
+    cols["mLb"][500], cols["eqR2"][500], cols["mLTr"][500] = 1.0, 30.0, -9.0
+    v = pwfo.variants()
+    assert pwfo.select(cols, v["CL4"])[0] == 500
+    assert pwfo.select(cols, v["CL4 r"])[0] != 500
+    # Same row, same screen, under CL2's looser pair: 30 is inside both 80 and 64.
+    assert pwfo.select(cols, v["CL2"])[0] == 500 and pwfo.select(cols, v["CL2 r"])[0] == 500
+
+
+# (filter, metric, a value just outside the screen, one just inside, what it pins). SPEC §5's
+# three rows are a transcription and SPEC §9-G records strict-vs-inclusive as a *choice*, so
+# every threshold and every edge below is asserted rather than inherited from the source.
+_SCREEN_BOUNDARIES = [
+    ("meyers2005", "PF", 2.5, 2.0, "PF <= 2, inclusive"),
+    ("meyers2005", "PF", 0.5, 1.0, "PF >= 1, inclusive"),
+    ("meyers2005", "lr", 4.0, 3.0, "lr <= 3, inclusive"),
+    ("meyers2005", "nT", 15.0, 16.0, "nT >= 16, inclusive"),
+    ("CL2", "PF", 4.0, 3.9, "PF < 4, strict"),
+    ("CL2", "lr", 3.0, 2.0, "lr < 3, strict"),
+    ("CL2", "eqR2", 80.0, 79.0, "eqR2 < 80, strict"),
+    ("CL4", "lr", 4.0, 3.0, "lr <= 3, inclusive"),
+    ("CL4", "eqR2", 51.0, 50.0, "eqR2 <= 50, inclusive"),
+]
+
+
+def test_unit8_every_screen_threshold_is_load_bearing() -> None:
+    """SPEC §5's nine screens, each at its own boundary and each in both directions.
+
+    Row 123 is planted to win every rank and pick outright, so the *only* thing keeping it
+    out is the screen under test. Moving that screen by one step in either direction --
+    relaxing the value, or flipping strict against inclusive -- changes the answer here.
+
+    This is what SPEC §9-G's "resolved by choice" costs to keep honest: `lr<=3 r2<=50` on
+    [M25 p.8] and `lr<3|r2<50` on p.10 are the same filter in the source, and only a test
+    at the boundary records which one this project actually runs.
+    """
+    for name, metric, outside, inside, what in _SCREEN_BOUNDARIES:
+        for value, want in ((outside, False), (inside, True)):
+            cols = _is_cols(512)
+            cols["mLb"][123], cols["mLTr"][123], cols["eq2R2"][123] = 1.0, -9.0, 99.0
+            cols[metric][123] = value
+            got = pwfo.select(cols, pwfo.FILTERS[name])
+            assert got is not None, f"{name}: the benign table screened itself out"
+            assert (got[0] == 123) is want, (
+                f"{name} {what}: {metric}={value} on the dominant row {'lost' if want else 'won'}"
+            )
+
+
+def test_unit8_no_eligible_row_is_a_flat_week() -> None:
+    """PLAN Unit 8's second done-when: no crash, and above all no fallback pick.
+
+    Every OOS cell holds 7.0, so a week that silently fell back to some row would report
+    7.0 rather than 0.0. SPEC §6.4 case 2 -- [M25 p.15 Col G], no params exist for that
+    week -- and it must still occupy a row in the aggregate's denominator (§9-K).
+    """
+    cols = _is_cols(64)
+    cols["lr"][:] = 9.0  # fails the `lr` screen every baseline carries
+    for name, f in pwfo.variants().items():
+        assert pwfo.select(cols, f) is None, f"{name} found a row in a fully screened-out table"
+    week, = pwfo.evaluate(pwfo.FILTERS["CL4"], *_one_window(cols))
+    assert week["row"] is None and week["n"] is None
+    assert not week["selected"] and not week["traded"]
+    assert all(week[c] == 0.0 for c in rmv.METRIC_COLS[rmv.OOS_COLS]), week
+    agg = pwfo.aggregate([week])
+    assert (agg["n"], agg["n_sel"], agg["n_trd"], agg["toNP"]) == (1, 0, 0, 0.0)
+
+
+def test_unit8_ties_break_on_the_lowest_combo_index() -> None:
+    """PLAN's review focus: tie-breaking determinism, and the tie width that goes with it.
+
+    ⚑ From Unit 5: `mLb` is a median of small integer bar counts, so the bottom-k is
+    mostly a tie-break over a block far wider than k. Here 40 rows share the smallest `mLb` and all
+    of them share `mLTr`, so `CL4` returns ten arbitrary rows and picks the first -- the
+    lowest combo index, SPEC §3.3's `a`-major order.
+
+    `CL2` asks for 50 from a block of 40, so its cut falls on the *benign* value and its
+    `rank_tie` is the whole rest of the table. That is not a defect to smooth over: it is
+    the honest width of "the bottom 50 by `mLb`" when the column has no resolution left,
+    and reporting it is the point.
+    """
+    cols = _is_cols(4312)
+    cols["mLb"][100:140] = 1.0
+    row, rank_tie, pick_tie = pwfo.select(cols, pwfo.FILTERS["CL4"])
+    assert (row, rank_tie, pick_tie) == (100, 40, 10)
+    row, rank_tie, pick_tie = pwfo.select(cols, pwfo.FILTERS["CL2"])
+    assert (row, rank_tie, pick_tie) == (0, 4312 - 40, 50)
+    # The pick must not inherit the rank's internal ordering: reversing which rows carry
+    # the winning `mLb` moves the answer to the new lowest index and nowhere else.
+    cols = _is_cols(4312)
+    cols["mLb"][4000:4040] = 1.0
+    assert pwfo.select(cols, pwfo.FILTERS["CL4"])[0] == 4000
+
+
+def test_unit8_degenerate_rows_cannot_be_selected() -> None:
+    """SPEC §6.6: each sentinel is fail-safe in exactly the direction these filters use.
+
+    A no-trade row carries `PF = +inf`, `eqR2 = 100`, `mLb = +inf`, `eq2R2 = 0`. Here the
+    whole table is that row except for one honest candidate, and every one of the nine
+    variants has to find the honest one. The `+inf` in `mLb` is the load-bearing part:
+    `0.0` there would put every no-loser row at the head of a bottom-k pool it could then
+    never be displaced from.
+    """
+    n = 512
+    cols = {"PF": np.full(n, np.inf, np.float32), "lr": np.zeros(n, np.float32),
+            "nT": np.zeros(n, np.float32), "eqR2": np.full(n, 100.0, np.float32),
+            "eq2R2": np.zeros(n, np.float32), "mLb": np.full(n, np.inf, np.float32),
+            "mLTr": np.zeros(n, np.float32)}
+    for k, v in _BENIGN.items():
+        cols[k][77] = v
+    for name, f in pwfo.variants().items():
+        got = pwfo.select(cols, f)
+        assert got is not None and got[0] == 77, f"{name} picked {got} out of a degenerate table"
+    # And with no honest row at all, every filter declines rather than taking a sentinel.
+    for k, v in _BENIGN.items():
+        cols[k][77] = {"PF": np.inf, "lr": 0.0, "nT": 0.0, "eqR2": 100.0,
+                       "eq2R2": 0.0, "mLb": np.inf, "mLTr": 0.0}[k]
+    assert all(pwfo.select(cols, f) is None for f in pwfo.variants().values())
+
+
+def test_unit8_zero_cases_stay_distinct_and_both_count() -> None:
+    """SPEC §6.4's two zeros, PLAN Unit 8's convention to pin. They are not the same thing.
+
+    Case 1, *params selected, no signals fired*: [M25 Table 1]'s 01/14/15, 01/21/15 and
+    01/28/15 carry `N`/`vup`/`vdn` filled with every OOS metric at 0. Case 2, *no row
+    passed the filter*: [M25 p.15 Col G]. Both contribute a 0 to `toNP` and both stay in
+    the denominator (SPEC §9-K), but only case 1 has parameters to report.
+    """
+    cols = _is_cols(64)
+    silent, oos, wins = _one_window(cols, oos_fill=0.0)  # a row passes; it just never fires
+    week, = pwfo.evaluate(pwfo.FILTERS["CL4"], silent, oos, wins)
+    assert week["selected"] and not week["traded"]
+    assert week["row"] == 0 and week["n"] is not None and week["nT"] == _BENIGN["nT"]
+
+    blocked = _is_cols(64)
+    blocked["lr"][:] = 9.0
+    nothing, = pwfo.evaluate(pwfo.FILTERS["CL4"], *_one_window(blocked))
+    assert not nothing["selected"] and not nothing["traded"] and nothing["n"] is None
+
+    agg = pwfo.aggregate([week, nothing])
+    assert (agg["n"], agg["n_sel"], agg["n_trd"]) == (2, 1, 0)
+    assert agg["%P"] == 0.0  # over all periods, not over the zero of them that traded
+
+
+def test_unit8_aggregates_match_a_hand_computation() -> None:
+    """SPEC §6.3's thirteen, against arithmetic done by hand rather than by the same code.
+
+    The series is chosen so every convention SPEC §6.6 pins is visible in the answer: a
+    zero period breaks both streaks, drawdown runs off a zero baseline rather than off the
+    first equity value, dispersion is `ddof=1`, and `%P` counts a non-trading period in
+    the denominator.
+    """
+    p = [10.0, -4.0, 0.0, -3.0, -1.0]
+    ont, ownt, ownp = [4.0, 2.0, 0.0, 3.0, 1.0], [3.0, 0.0, 0.0, 1.0, 0.0], [14.0, 0.0, 0.0, 2.0, 0.0]
+    weeks = [{"osnp": a, "ont": b, "ownt": c, "ownp": d, "selected": True}
+             for a, b, c, d in zip(p, ont, ownt, ownp)]
+    a = pwfo.aggregate(weeks)
+    assert (a["n"], a["n_sel"], a["n_trd"]) == (5, 5, 4)
+    assert a["toNP"] == 2.0 and a["avg"] == 0.4
+    # sum of squared deviations from 0.4 is 125.2; ddof=1 divides by 4.
+    assert abs(a["std"] - math.sqrt(31.3)) < 1e-12
+    assert abs(a["t"] - 0.4 / (math.sqrt(31.3) / math.sqrt(5))) < 1e-12
+    assert a["%P"] == 20.0  # one of five periods, the zero counted as a period
+    assert a["%Wtr"] == 40.0  # 4 winning trades of 10
+    assert abs(a["oW|oL"] - (16.0 / 4.0) / (14.0 / 6.0)) < 1e-12
+    assert (a["wpr"], a["lpr"]) == (1, 2)  # the zero at index 2 breaks the losing streak
+    # equity 10, 6, 6, 3, 2 against a peak of 10 seeded at zero -> -8, not -4 off the open.
+    assert a["eqDD"] == -8.0 and a["LLp"] == -4.0 and a["Blw"] == 4
+    assert a["BE"] == math.ceil((pwfo.Z98 * math.sqrt(31.3) / 0.4) ** 2) == 826
+    # A filter that does not make money never breaks even.
+    assert pwfo.aggregate([dict(w, osnp=-abs(w["osnp"])) for w in weeks])["BE"] == math.inf
+
+    from scipy.stats import norm  # PLAN §2.3: scipy is the oracle, never the implementation
+    assert abs(pwfo.Z98 - float(norm.ppf(0.98))) < 1e-12
+
+    # ⚑ Drawdown off a **zero baseline** (SPEC §6.6) is only visible on a series that opens
+    # at a loss. [M25 Table 1] settles it rather than leaving it to taste: on its all-loser
+    # weeks `odd` equals the full cumulative loss, where a peak seeded from the first equity
+    # value would report the smaller drop that follows it.
+    down = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "selected": True}
+                           for v in (-5.0, 3.0, -2.0)])
+    assert down["eqDD"] == -5.0, down  # equity -5, -2, -4 against a peak of 0, not of -5
+    assert down["LLp"] == -5.0 and down["Blw"] == 3
+    # And an all-winner filter has no largest losing period at all: [M25 Table 1]'s 12/15/14
+    # publishes `ollt` and `odd` at 0, not at the smallest win of the week.
+    up = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 1.0, "ownp": v, "selected": True}
+                         for v in (2.0, 5.0, 1.0)])
+    assert (up["LLp"], up["eqDD"], up["Blw"]) == (0.0, 0.0, 0)
+
+    # ⚑ A zero period breaks the *winning* streak too, and only a series with a zero between
+    # two winners can show it -- the series above has one isolated positive and would read
+    # the same either way. §6.6's partition is symmetric and so is this.
+    flat = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "selected": True}
+                           for v in (3.0, 0.0, 2.0, -1.0)])
+    assert (flat["wpr"], flat["lpr"]) == (1, 1), flat
+    # A single profitable period has no dispersion at all, so §6.3 col X's formula collapses
+    # to zero -- which is not an answer to "how many periods would you have to trade". One.
+    lone = pwfo.aggregate([{"osnp": 5.0, "ont": 1.0, "ownt": 1.0, "ownp": 5.0,
+                            "selected": True}])
+    assert lone["std"] == 0.0 and lone["BE"] == 1, lone
+
+
+def test_unit8_decodes_every_combo_to_its_parameters() -> None:
+    """SPEC §3.3: the stored table records no parameters, so the index *is* the mapping.
+
+    Checked over all 4312 rather than on samples -- Units 8, 9 and 11 all read a winning
+    row back through this, and it is four lines of `divmod` with nothing else to catch it.
+    """
+    seen = set()
+    nv = rmv.V_VALUES.size
+    for c in range(rmv.N_VALUES.size * nv**2):
+        n, vup, vdn = pwfo.decode(c)
+        a = int(np.flatnonzero(rmv.N_VALUES == n)[0])
+        i = int(np.flatnonzero(rmv.V_VALUES == vup)[0])
+        j = int(np.flatnonzero(rmv.V_VALUES == vdn)[0])
+        assert a * nv**2 + i * nv + j == c
+        seen.add((n, vup, vdn))
+    assert len(seen) == 4312
+    assert pwfo.decode(0) == (3, 0.25, 0.25)
+    assert pwfo.decode(4311) == (24, 3.5, 3.5)
+
+
+def test_unit8_reads_only_the_two_tables_it_is_handed() -> None:
+    """PLAN §2.1's structural claim, end to end on a real PWFO directory.
+
+    Everything at the file boundary at once, none of which a synthetic column dict can
+    show, and ⚑ none of it needing `cache/` -- the whole directory is built here from
+    synthetic bars. That is deliberate: Unit 7's review found the deferred
+    skipped-tests-count-as-PASS defect weakening a real claim, and measured on this unit,
+    every mutation that only `test_unit8_budget` could kill lives in `load_tables`. This
+    test takes all of them, so the unit's file-boundary evidence does not evaporate with
+    the cache.
+
+    - The withheld table is written (under a stand-in boundary partway through the sample)
+      and then replaced with bytes `np.load` cannot parse, so anything that so much as
+      opens it raises. ⚑ The real tail stays closed until Unit 9's last action; these are
+      2016 bars and nothing is spent.
+    - Its rows are in `pwfo_index.json` and must be dropped: the pre-tail window list is
+      shorter than the index, and a filter run over the wrong one is a shape error.
+    - The hoist is checked against `pwfo_is.npy`'s own named columns, so a positional
+      mapping -- which silently scores `tnp` as `mLTr` -- fails rather than ranks.
+    - The evaluator is asked for an OOS column by name and has to refuse, which is what
+      "structurally cannot screen on OOS" reduces to at the only boundary where it could
+      go wrong.
+    - Every selected row's stored OOS metrics are re-read off `pwfo_oos.npy` independently,
+      so a record built from the wrong window or the wrong row fails here.
+    """
+    bars = _synth_bars("2016-01-04", "2016-05-31")
+    matrix = rmv.rmv_all_n(bars.close)
+    wins = pwfo.windows(bars)
+    real_start = pwfo.TAIL_START
+    pwfo.TAIL_START = np.datetime64(str(wins[-5].friday)) + np.timedelta64(7, "D")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            index = pwfo.run(bars, matrix, wins, tmp)
+            pre = [w for w in index if w["file"] == "is"]
+            assert 0 < len(pre) < len(index), (len(pre), len(index))
+            assert (Path(tmp) / "pwfo_tail.npy").exists()
+            (Path(tmp) / "pwfo_tail.npy").write_bytes(b"opening this is a Unit 9 action")
+
+            stored = np.load(Path(tmp) / "pwfo_is.npy")
+            is_names = json.loads(
+                (Path(tmp) / "pwfo_index.json").read_text(encoding="utf-8"))["is_cols"]
+            cols, _, got_wins = pwfo.load_tables(["mLTr", "nT"], tmp)
+            assert len(got_wins) == len(pre) and stored.shape[0] == len(pre)
+            for m in ("mLTr", "nT"):
+                assert np.array_equal(cols[m], stored[:, :, is_names.index(m)]), m
+
+            res = pwfo.run_filters(out_dir=tmp)
+            assert len(res) == 9
+            oos = np.load(Path(tmp) / "pwfo_oos.npy")
+            names = rmv.METRIC_COLS[rmv.OOS_COLS]
+            checked = 0
+            for name, r in res.items():
+                assert len(r["weeks"]) == len(pre), f"{name}: {len(r['weeks'])} of {len(pre)}"
+                for k, (week, w) in enumerate(zip(r["weeks"], pre)):
+                    assert week["friday"] == w["friday"] and week["cost"] == w["cost"]
+                    if week["selected"]:
+                        got = [week[c] for c in names]
+                        assert got == [float(v) for v in oos[k, week["row"]]], (name, k)
+                        assert week["nT"] == week["nT"], f"{name} window {k} selected on a nan"
+                        checked += 1
+            assert checked > 0
+            try:
+                pwfo.load_tables(["osnp"], tmp)
+            except KeyError:
+                pass
+            else:
+                raise AssertionError("load_tables handed out an OOS column to the selector")
+    finally:
+        pwfo.TAIL_START = real_start
+    print(f"    ({checked} selections re-read off pwfo_oos.npy over {len(pre)} pre-tail of "
+          f"{len(index)} windows)", end="")
+
+
+def test_unit8_budget() -> None:
+    """PLAN Unit 8's third done-when -- < 1 s per filter over the full table -- and the
+    properties that only the real 525 windows can show.
+
+    The trade-count assert is Unit 4's and Unit 7's, for the same reason: a table of empty
+    weeks would satisfy every timing budget and every structural check in this unit.
+    """
+    if not (pwfo.OUT_DIR / "pwfo_is.npy").exists():
+        print("    (skipped: no pwfo tables)", end="")
+        return
+    import time
+
+    names = sorted({"nT", *(pwfo._base(m) for f in pwfo.variants().values()
+                            for m in pwfo._metrics(f))})
+    begin = time.perf_counter()
+    cols, oos, wins = pwfo.load_tables(names)
+    hoist = time.perf_counter() - begin
+    assert float(cols["nT"].mean()) > 10.0, "this is timing an empty grid"
+
+    worst, deltas, floors = 0.0, [], []
+    for name, f in pwfo.variants().items():
+        begin = time.perf_counter()
+        weeks = pwfo.evaluate(f, cols, oos, wins)
+        worst = max(worst, time.perf_counter() - begin)
+        agg = pwfo.aggregate(weeks)
+        assert agg["n"] == len(wins) and agg["n_sel"] + agg["n_trd"] > 0
+        # ⚑ Every selected row carries its own `nT`, so a three-trade week is reported as
+        # one rather than returned silently (PLAN Unit 8, from Unit 5).
+        assert all(w["nT"] > 0 for w in weeks if w["selected"])
+        floors.append(sum(w["selected"] and w["nT"] < 5 for w in weeks))
+        traded = [w["osnp"] for w in weeks if w["traded"]]
+        if traded:  # SPEC §6.4: dropping the silent weeks from the denominator moves `%P`
+            deltas.append(100.0 * sum(v > 0 for v in traded) / len(traded) - agg["%P"])
+    assert worst < 1.0, f"{worst * 1000:.0f} ms for one filter against the 1 s budget"
+    assert max(deltas) > 0.0, "the two zero cases are indistinguishable in this sample"
+    print(f"    ({hoist * 1000:.0f} ms hoist of {len(names)} columns, {worst * 1000:.0f} ms "
+          f"worst filter over {len(wins)} windows; nT<5 in {min(floors)}-{max(floors)} of "
+          f"{len(wins)}; %P moves +{min(deltas):.1f}..+{max(deltas):.1f} pts if the silent "
+          "weeks are dropped)", end="")
+
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

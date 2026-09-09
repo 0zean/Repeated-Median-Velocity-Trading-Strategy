@@ -13,6 +13,8 @@ evaluator opens only `pwfo_is.npy` to select and `pwfo_oos.npy` to score.
 from __future__ import annotations
 
 import json
+import math
+import operator
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -282,6 +284,336 @@ def run(
         "windows": index,
     }, indent=1), encoding="utf-8")
     return index
+
+
+# ------------------------------------------------------------- Filters (PLAN §3 Unit 8)
+
+# SPEC §5's three baselines, as data. `screens` are ANDed; `bottom` narrows to the k
+# *smallest* by one metric; `pick` takes the extreme of another. [M25 p.8]: "b10mLb means
+# the bottom or minimum 10 mLb rows". A metric written `|x|` is `abs(col x)`
+# -- SPEC §9-E's magnitude reading of a column stored signed (§6.6), which is the only
+# transform any of this needs and the reason there is no expression language here.
+#
+# `1 <= PF <= 2` is two screens because that is what it is; SPEC §9-G records the inclusive
+# reading as a choice, not a transcription.
+#
+# ⚑ `bottom` has no direction knob. PLAN §3 Unit 8 wrote `rank: (metric, direction, top_k)`
+# and all three baselines rank one way, so the other branch was dead code -- and SPEC §6.6
+# measured what it would do if used: a **top**-k on `mLb` puts every no-loser row, sentinel
+# `+inf` and all, at the head of a pool it can then never be displaced from, and a filter
+# picking max `eqR2` selects an `nT <= 2` row in 24 of 24 real windows. The sanctioned
+# directions are the only ones spellable here. Unit 10 reopens this deliberately or not at
+# all.
+FILTERS: dict[str, dict] = {
+    # [M05 p.6]. No rank -- the screens are the pool and the pick is over all of it.
+    "meyers2005": {
+        "screens": [("PF", ">=", 1.0), ("PF", "<=", 2.0), ("lr", "<=", 3.0),
+                    ("nT", ">=", 16.0)],
+        "pick": ("eq2R2", "max"),
+    },
+    # [M25 p.11], `b50mLb|pf<4|lr<3r2<80-mLTr`.
+    "CL2": {
+        "screens": [("PF", "<", 4.0), ("lr", "<", 3.0), ("eqR2", "<", 80.0)],
+        "bottom": ("mLb", 50),
+        "pick": ("mLTr", "min"),
+    },
+    # [M25 p.8], `b10mLb|lr<=3r2<=50-mLTr`. SPEC §9-J: this is the paper's chosen filter.
+    "CL4": {
+        "screens": [("lr", "<=", 3.0), ("eqR2", "<=", 50.0)],
+        "bottom": ("mLb", 10),
+        "pick": ("mLTr", "min"),
+    },
+}
+
+OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
+
+# The two columns stored as 100*R^2 (SPEC §6.6). Only these move under §9-D's `|r|`
+# reading. ⚑ `eq2R2` is inert today and deliberately kept: no baseline *screens* it --
+# `meyers2005` only picks on it, and a pick is not transformed -- so dropping it changes
+# nothing this unit can measure. It is the scale that belongs here, not the usage: the
+# day a filter screens `eq2R2`, its threshold has to move by the same rule or §9-D
+# quietly stops applying to half the columns it names.
+R2_COLS = ("eqR2", "eq2R2")
+
+# scipy.stats.norm.ppf(0.98). PLAN §2.3 keeps scipy out of everything but the test oracle,
+# and `test_unit8_aggregates_match_a_hand_computation` pins this against it.
+Z98 = 2.0537489106318225
+
+
+def _base(metric: str) -> str:
+    """`|mLTr|` -> `mLTr`; anything else unchanged."""
+    return metric[1:-1] if metric.startswith("|") else metric
+
+
+def _col(cols: dict, metric: str) -> np.ndarray:
+    return np.abs(cols[_base(metric)]) if metric.startswith("|") else cols[metric]
+
+
+def _metrics(filt: dict):
+    """Every metric name a filter reads, screens through pick."""
+    return ([m for m, _, _ in filt["screens"]]
+            + ([filt["bottom"][0]] if "bottom" in filt else []) + [filt["pick"][0]])
+
+
+def _r_reading(filt: dict) -> dict:
+    """SPEC §9-D's `|r|` reading of an `r2` screen: move the threshold, not the data.
+
+    With `eqR2 = 100*R^2`, reading a literal `80` as `100*|r|` means `R^2 < 0.64`, i.e.
+    `eqR2 < 64` -- exact in float32, no `sqrt`, no second column. Derived here rather than
+    transcribed so the two readings cannot drift apart. Screens on nothing in `R2_COLS`
+    come back unchanged, which is how `meyers2005` collapses to one variant.
+    """
+    return {**filt, "screens": [(m, o, v * v / 100.0 if m in R2_COLS else v)
+                                for m, o, v in filt["screens"]]}
+
+
+def _magnitude(filt: dict) -> dict:
+    """SPEC §9-E's other convention: "smallest `mLTr`" as shallowest, not deepest.
+
+    `mLTr` is stored negative (§6.6), so `min mLTr` as stored selects the *deepest* median
+    loss -- the opposite of [M25 p.8]'s stated intent. `min |mLTr|` is the intent reading.
+    The reverse derivation does not exist, which is why the sign is stored.
+    """
+    m, direction = filt["pick"]
+    return filt if m != "mLTr" else {**filt, "pick": (f"|{m}|", direction)}
+
+
+def variants(filters: dict | None = None) -> dict[str, dict]:
+    """Expand SPEC §9-D and §9-E's two open ambiguities. PLAN §1.5 says run both, both ways.
+
+    Nine filters out of three, not twelve: a variant is dropped when the transform is a
+    no-op on that filter. `meyers2005` screens no `r2` column and picks `eq2R2`, so both
+    ambiguities collapse for it -- which is §9-D's "doubly harmless", derived rather than
+    asserted. ⚑ All nine are OOS-touching looks and count in PLAN §Unit 9's multiplier.
+    """
+    out: dict[str, dict] = {}
+    for name, f in (FILTERS if filters is None else filters).items():
+        seen: list[dict] = []
+        for suffix, g in (("", f), (" r", _r_reading(f)), (" |mLTr|", _magnitude(f)),
+                          (" r |mLTr|", _magnitude(_r_reading(f)))):
+            if g not in seen:
+                seen.append(g)
+                out[name + suffix] = g
+    return out
+
+
+def decode(c: int) -> tuple[int, float, float]:
+    """Combo index -> `(n, vup, vdn)`. SPEC §3.3, the only record of the mapping."""
+    a, r = divmod(int(c), rmv.V_VALUES.size**2)
+    i, j = divmod(r, rmv.V_VALUES.size)
+    return int(rmv.N_VALUES[a]), float(rmv.V_VALUES[i]), float(rmv.V_VALUES[j])
+
+
+def load_tables(names: list[str], out_dir: Path | str = OUT_DIR):
+    """Hoist the named IS columns and all six OOS columns. Returns `(cols, oos, wins)`.
+
+    `cols` maps each name to `float32[windows, combos]`, `oos` is `float32[windows, 6]`-
+    indexable as `oos[window, combo]`, and `wins` is the pre-tail slice of the on-disk
+    index in row order. PLAN §2.1's second option: a row-major scan reads one metric with
+    a 96-byte stride, so the eight columns a filter needs are lifted in one pass -- 63 MB
+    for the IS block, 52 MB for OOS.
+
+    Column names, the window count and the row order all come from `pwfo_index.json`
+    rather than from `rmv` -- the file on disk is the contract Units 8, 9 and 11 read, and
+    a table written by an older column layout has to fail here rather than silently score
+    the wrong column. ⚑ `pwfo_tail.npy` is not opened; the withheld set is Unit 9's last
+    action, and the index's tail rows are dropped by `file == "is"`.
+    """
+    out_dir = Path(out_dir)
+    index = json.loads((out_dir / "pwfo_index.json").read_text(encoding="utf-8"))
+    wins = [w for w in index["windows"] if w["file"] == "is"]
+    if [w["row"] for w in wins] != list(range(len(wins))):
+        raise ValueError("pwfo_index.json's pre-tail rows are not 0..n-1 in order")
+    is_names, oos_names = index["is_cols"], index["oos_cols"]
+    missing = [n for n in names if n not in is_names]
+    if missing:
+        raise KeyError(f"{missing} are not IS columns; pwfo_is.npy holds {is_names}")
+
+    shape = (len(wins), index["n_combos"])
+    mm = np.load(out_dir / "pwfo_is.npy", mmap_mode="r")
+    try:
+        if mm.shape != (*shape, len(is_names)):
+            raise ValueError(f"pwfo_is.npy is {mm.shape}, index says {(*shape, len(is_names))}")
+        block = np.asarray(mm[:, :, [is_names.index(n) for n in names]])
+    finally:
+        mm._mmap.close()  # Unit 7's Windows handle leak, same cause and same fix
+    # Every sentinel in SPEC §6.6 is a finite value or +inf; a nan would pass every screen's
+    # negation silently and win an argmin outright, so it is rejected at the file boundary.
+    if np.isnan(block).any():
+        raise ValueError("pwfo_is.npy holds nan in a filter column")
+    oos = np.load(out_dir / "pwfo_oos.npy")
+    if oos.shape != (*shape, len(oos_names)):
+        raise ValueError(f"pwfo_oos.npy is {oos.shape}, index says {(*shape, len(oos_names))}")
+    return {n: block[:, :, k] for k, n in enumerate(names)}, oos, wins
+
+
+def select(cols: dict, filt: dict) -> tuple[int, int, int] | None:
+    """One window's chosen row: `(combo, rank_tie, pick_tie)`, or None if nothing passed.
+
+    `cols` maps metric -> `float32[n_combos]` for a **single** window's IS row block. That
+    is the whole of PLAN §2.1's "structurally cannot screen on OOS": there is no argument
+    here through which an OOS column could arrive, so the separation is a signature rather
+    than a review question.
+
+    Determinism, PLAN's review focus. `flatnonzero` is ascending, `argsort` is stable, and
+    the surviving pool is re-sorted into combo order before the pick -- so every tie at
+    either stage breaks on the lowest combo index, i.e. SPEC §3.3's `a`-major order, and
+    the pick does not depend on how the rank happened to order its own ties.
+
+    ⚑ Both tie widths are returned because the rank is mostly a tie-break and the tie block
+    is large (PLAN Unit 8, from Unit 5): `mLb` is a median of small integer bar counts, so
+    "the bottom 10 by `mLb`" is in practice ten arbitrary rows out of a block that can hold
+    many more. `rank_tie` counts the eligible rows sharing the k-th ranked value, `pick_tie`
+    the surviving rows sharing the winning pick value. A tie-break rule cannot fix a
+    resolution problem, so the width is reported rather than hidden.
+    """
+    ok = np.ones(next(iter(cols.values())).size, dtype=bool)
+    for m, op, v in filt["screens"]:
+        ok &= OPS[op](_col(cols, m), v)
+    idx = np.flatnonzero(ok)
+    if idx.size == 0:
+        return None
+
+    rank_tie = 0
+    if "bottom" in filt:
+        m, k = filt["bottom"]
+        vals = _col(cols, m)[idx]
+        order = np.argsort(vals, kind="stable")
+        cut = vals[order[min(k, idx.size) - 1]]
+        rank_tie = int(np.count_nonzero(vals == cut))
+        idx = np.sort(idx[order[:k]])
+
+    m, direction = filt["pick"]
+    vals = _col(cols, m)[idx]
+    best = int(np.argmin(vals) if direction == "min" else np.argmax(vals))
+    return int(idx[best]), rank_tie, int(np.count_nonzero(vals == vals[best]))
+
+
+def evaluate(filt: dict, cols: dict, oos: np.ndarray, wins: list[dict]) -> list[dict]:
+    """One record per OOS window: what the filter picked and what that pick then scored.
+
+    ⚑ The two zero cases are kept apart, which is this unit's to pin (PLAN Unit 8, SPEC
+    §6.4). `selected` is false when **no row passed the screens** -- [M25 p.15 Col G], no
+    params exist for that week. `traded` is false when a row *was* selected and fired no
+    signals -- [M25 Table 1]'s 01/14/15, 01/21/15 and 01/28/15, which carry `N`/`vup`/`vdn`
+    filled with every OOS metric at 0. Both contribute a 0 to `toNP` and both stay in the
+    denominator (SPEC §9-K); conflating them is worth up to 13.7 points of `%P`.
+
+    ⚑ `nT` rides along on every record even though only `meyers2005` screens it. SPEC §6.6
+    measured `CL4` and `CL2` each selecting a row with `nT < 5` in 5 of 24 windows, and
+    that is faithful to [M25] -- neither published filter has a trade-count floor -- so it
+    is a property to surface, not a defect to patch.
+    """
+    oos_names = rmv.METRIC_COLS[rmv.OOS_COLS]
+    out = []
+    for k, w in enumerate(wins):
+        got = select({m: c[k] for m, c in cols.items()}, filt)
+        rec = {"friday": w["friday"], "oos_start": w["oos_start"], "oos_end": w["oos_end"],
+               "xmult": w["xmult"], "cost": w["cost"]}
+        if got is None:
+            rec.update(row=None, n=None, vup=None, vdn=None, nT=0.0, rank_tie=0,
+                       pick_tie=0, selected=False, **dict.fromkeys(oos_names, 0.0))
+        else:
+            c, rank_tie, pick_tie = got
+            n, vup, vdn = decode(c)
+            rec.update(row=c, n=n, vup=vup, vdn=vdn, nT=float(cols["nT"][k, c]),
+                       rank_tie=rank_tie, pick_tie=pick_tie, selected=True,
+                       **{nm: float(v) for nm, v in zip(oos_names, oos[k, c])})
+        rec["traded"] = rec["ont"] > 0
+        out.append(rec)
+    return out
+
+
+def _longest(mask) -> int:
+    """Longest run of True. 525 elements; a loop is the readable one."""
+    best = run = 0
+    for v in mask:
+        run = run + 1 if v else 0
+        best = max(best, run)
+    return best
+
+
+def aggregate(weeks: list[dict]) -> dict:
+    """SPEC §6.3's aggregates over one filter's OOS periods. PLAN Unit 8's thirteen.
+
+    ⚠ Four of these names collide with §6.1's per-combination metrics (SPEC §6.6): `%P`,
+    `std` and `t` here are **per OOS period**, where the same names in a `weeks` record are
+    per trade within one window. Unit 9 prints both blocks and has to disambiguate.
+
+    Conventions, all pinned upstream rather than chosen here:
+
+    - **Every window is a period**, selected or not, traded or not, contributing its 0
+      (SPEC §9-K). [M25] divides its filter's total by the 446 weeks it traded while
+      defining the null over all 517; one denominator on both sides is the only internally
+      consistent reading, and it is what decides the Unit 9 gate.
+    - **`toNP` is already net.** Cost lives inside `_simulate` per trade, so there is no
+      `toGP - trades*cost` step here and no gross column to report (SPEC §6.6).
+    - **Dispersion is `ddof=1`**, matching §1.2's `xmult` and §6.6's per-combination `std`.
+    - **Drawdown runs off a zero baseline**, so an opening losing week is already a
+      drawdown -- [M25 Table 1]'s all-loser weeks settle this. `eqDD` and `LLp` come back
+      negative, matching the sign convention for every other loss metric.
+    - **A zero period breaks both streaks**, exactly as a zero-net trade does in §6.6's
+      winner/loser partition. `wpr + lpr` therefore need not cover the sample.
+
+    ⚑ `oW|oL` is derived, not stored. The six OOS columns carry winners (`ownp`, `ownt`)
+    and the total (`osnp`, `ont`), so the losing side is the difference -- which folds the
+    net-zero trades that §6.6 counts as neither into the loser count. Measured 0 of 686,565
+    real trades sit on that boundary, but `cost = 0` is a legal argument and would produce
+    them. Reported as a magnitude ratio, both sides positive.
+    """
+    g = lambda k: np.array([w[k] for w in weeks], dtype=np.float64)  # noqa: E731
+    p, ont, ownt, ownp = g("osnp"), g("ont"), g("ownt"), g("ownp")
+    n = p.size
+    avg = float(p.mean()) if n else 0.0
+    std = float(p.std(ddof=1)) if n > 1 else 0.0
+    eq = np.cumsum(p)
+    peak = np.maximum(np.maximum.accumulate(eq), 0.0) if n else eq
+    nt, nw = float(ont.sum()), float(ownt.sum())
+    nl, wsum = nt - nw, float(ownp.sum())
+    lsum = float(p.sum()) - wsum
+    return {
+        "n": n,
+        # ⚑ These are not complements. `n_trd` is §6.3 col G, the periods that traded.
+        # `n_sel` excludes only §6.4 case 2 -- a selected week that fired no signals is
+        # counted in `n_sel` and not in `n_trd`, which is the whole point of keeping the
+        # two zeros apart. `n - n_trd` is case 1 + case 2 together.
+        "n_sel": sum(w["selected"] for w in weeks),
+        "n_trd": int(np.count_nonzero(ont > 0)),
+        "toNP": float(p.sum()),
+        "avg": avg,
+        "std": std,
+        "t": avg / (std / math.sqrt(n)) if std > 0.0 and n > 1 else 0.0,
+        "%P": 100.0 * float(np.count_nonzero(p > 0)) / n if n else 0.0,
+        "%Wtr": 100.0 * nw / nt if nt else 0.0,
+        "oW|oL": (wsum / nw) / abs(lsum / nl) if nw and nl and lsum else math.inf,
+        "wpr": _longest(p > 0),
+        "lpr": _longest(p < 0),
+        "Blw": _longest(eq < peak),
+        "eqDD": float((eq - peak).min()) if n else 0.0,
+        "LLp": min(0.0, float(p.min())) if n else 0.0,
+        # §6.3 col X: periods needed for a 98% chance equity is above zero, assuming
+        # normality. n*avg / (std*sqrt(n)) = Z98 solves to (Z98*std/avg)^2. A filter that
+        # does not make money never breaks even, hence inf rather than a large number.
+        "BE": max(1, math.ceil((Z98 * std / avg) ** 2)) if avg > 0.0 else math.inf,
+    }
+
+
+def run_filters(filters: dict | None = None, out_dir: Path | str = OUT_DIR) -> dict:
+    """Every filter against the stored pre-tail tables. `{name: {weeks, agg, filt}}`.
+
+    One hoist shared by all of them -- the columns are the union of what they read, plus
+    `nT`, which every record surfaces. ⚑ Each entry is one OOS-touching comparison and
+    belongs in PLAN §Unit 9's multiplier.
+    """
+    filters = variants() if filters is None else filters
+    names = sorted({"nT", *(_base(m) for f in filters.values() for m in _metrics(f))})
+    cols, oos, wins = load_tables(names, out_dir)
+    out = {}
+    for name, f in filters.items():
+        weeks = evaluate(f, cols, oos, wins)
+        out[name] = {"filt": f, "weeks": weeks, "agg": aggregate(weeks)}
+    return out
+
 
 
 if __name__ == "__main__":
