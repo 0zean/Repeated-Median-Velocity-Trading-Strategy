@@ -6,6 +6,8 @@ One test function per unit of work (see PLAN.md §3).
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import math
 import re
 import shutil
@@ -20,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 import data
+import pwfo
 import rmv
 
 ROOT = Path(__file__).parent
@@ -995,7 +998,9 @@ XMULT_FROZEN_2016_17 = 7.183306
 # PLAN §3 Unit 9: the final 6 months are written once and not opened until the project's last
 # action. Unit 3 stops here even though sd(RMedV) is a property of the data rather than an OOS
 # result -- the tail is cheap to respect and expensive to un-spend.
-TAIL_START = datetime(2026, 3, 1, tzinfo=timezone.utc)
+# One date, one definition: PLAN Unit 7 requires the driver and the tests to withhold
+# exactly the same bars, and `pwfo.TAIL_START` is what the driver classifies windows on.
+TAIL_START = pd.Timestamp(pwfo.TAIL_START, tz="UTC").to_pydatetime()
 
 
 @functools.cache
@@ -3236,6 +3241,517 @@ def test_unit6_budget() -> None:
     assert worst < 0.060, (
         f"{worst * 1000:.1f} ms for one window's 4312 combos against the 60 ms budget"
     )
+
+
+# ---------------------------------------------------------------- PWFO driver (Unit 7)
+
+
+def _synth_bars(first: str, last: str) -> data.Bars:
+    """Complete 08:00-15:55 ET sessions on every weekday in `[first, last]`, no holidays.
+
+    Real bars cannot pin SPEC §4's window arithmetic: [M25 Table 1]'s two anchor rows are
+    2014 and 2023 and the SPY cache starts in 2016. A synthetic calendar covering the
+    paper's own dates can, and it needs no cache at all.
+    """
+    ts = np.concatenate([
+        pd.date_range((d + pd.Timedelta(hours=8)).tz_localize(data.ET),
+                      periods=96, freq="5min").asi8
+        for d in pd.bdate_range(first, last)
+    ])
+    rng = np.random.default_rng(7)
+    close = (500.0 + np.cumsum(rng.normal(0.0, 0.05, ts.size))).astype(np.float32)
+    return data.Bars(ts=ts, close=close, gate=data.build_gate(ts))
+
+
+def _et_days(bars: data.Bars) -> np.ndarray:
+    """Each bar's ET calendar date as `datetime64[D]`. Vectorized; 245k bars is 5 ms."""
+    return data.to_et(bars.ts).normalize().tz_localize(None).values.astype("datetime64[D]")
+
+
+def _win_dates(day: np.ndarray, w) -> tuple:
+    """The four ET dates a window actually covers, read back off its own bars."""
+    return day[w.is_lo], day[w.is_hi - 1], day[w.oos_lo], day[w.oos_hi - 1]
+
+
+def test_unit7_windows_reproduce_the_paper_table() -> None:
+    """SPEC §4: both [M25 Table 1] anchor rows, to the day. The off-by-one guard.
+
+    IS is a 30-day *delta* -- 31 days inclusive -- and reading "30 calendar days ending
+    Friday" the obvious way lands one day late on every window. Only a test against the
+    published dates catches that: every other done-when in this unit -- the leakage guard,
+    the tiling, the byte-identical re-run, the budget -- passes just as happily on a
+    30-day-inclusive span.
+
+    [M25] p.4's prose disagrees with its own Table 1 here, saying 11/13 and 12/16 against
+    the table's 11/12 and 12/15. SPEC §9-H pins the table as governing, so the prose's
+    dates are asserted **absent** rather than merely not asserted.
+    """
+    seen = []
+    for first, last, friday, want in (
+        ("2014-10-01", "2015-01-15", "2014-12-12",
+         ("2014-11-12", "2014-12-12", "2014-12-15", "2014-12-19")),
+        ("2023-09-01", "2023-12-15", "2023-11-17",
+         ("2023-10-18", "2023-11-17", "2023-11-20", "2023-11-24")),
+    ):
+        bars = _synth_bars(first, last)
+        wins = pwfo.windows(bars)
+        hit = [w for w in wins if str(w.friday) == friday]
+        assert len(hit) == 1, f"{friday} is not an anchor Friday of {len(wins)} windows"
+        got = tuple(str(d) for d in _win_dates(_et_days(bars), hit[0]))
+        assert got == want, f"{friday}: window spans {got}, [M25 Table 1] says {want}"
+        seen.append(got)
+    # [M25] p.4's prose. A 30-day-inclusive IS span produces exactly these two.
+    assert seen[0][0] != "2014-11-13" and seen[1][0] != "2023-10-19"
+
+
+def test_unit7_windows_tile_the_timeline_without_leaking() -> None:
+    """PLAN Unit 7's three structural done-whens, re-derived rather than re-asserted.
+
+    `windows` raises on all three itself, so a test that only called it would pass against
+    a generator that emitted nothing. This rebuilds every window's span from the ET
+    calendar independently, checks the OOS weeks partition their range exactly once, and
+    pins by date the holiday case the review focus names: Thanksgiving week 11/20-11/24/23
+    is a real window that trades four sessions, not five.
+
+    The `is_start` census is the second guard against the off-by-one. `friday - 30 days` is
+    always a **Wednesday** (30 mod 7 = 2), so it is a session except on the handful of
+    Wednesday holidays; a 30-day-inclusive span would land on a Thursday every time and
+    the exact-hit rate would be 0%, not 98%.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, _ = got
+    wins = pwfo.windows(bars)
+    day = _et_days(bars)
+    d30, d3, d7 = (np.timedelta64(k, "D") for k in (30, 3, 7))
+
+    covered = np.zeros(len(bars), dtype=np.int8)
+    exact_start = exact_end = 0
+    for w in wins:
+        f = np.datetime64(w.friday)
+        lo, hi, olo, ohi = _win_dates(day, w)
+        # Both halves are inclusive date ranges anchored on the Friday, checked here
+        # without reference to the bar bounds `windows` derived them from. A span can
+        # start late or end early only by falling on a holiday, never by more than one.
+        assert f - d30 <= lo <= f - d30 + np.timedelta64(4, "D"), f"{f}: IS starts {lo}"
+        assert f - np.timedelta64(3, "D") <= hi <= f, f"{f}: IS ends {hi}"
+        assert f + d3 <= olo <= f + np.timedelta64(5, "D"), f"{f}: OOS starts {olo}"
+        assert f + np.timedelta64(4, "D") <= ohi <= f + d7, f"{f}: OOS ends {ohi}"
+        assert bars.ts[w.is_hi - 1] < bars.ts[w.oos_lo], f"{f}: IS runs into its own OOS"
+        assert bars.gate[w.is_hi - 1] == 0 and bars.gate[w.oos_hi - 1] == 0
+        exact_start += lo == f - d30
+        exact_end += hi == f
+        covered[w.oos_lo:w.oos_hi] += 1
+
+    assert exact_start / len(wins) > 0.9, (
+        f"IS starts on `friday - 30 days` in only {exact_start}/{len(wins)} windows -- "
+        "a 30-day-inclusive span would be 0"
+    )
+    span = slice(wins[0].oos_lo, wins[-1].oos_hi)
+    assert np.all(covered[span] == 1), (
+        f"{int(np.count_nonzero(covered[span] != 1))} bars inside the OOS range are "
+        f"covered {sorted(set(covered[span].tolist()))} times, not exactly once"
+    )
+    assert not covered[: wins[0].oos_lo].any() and not covered[wins[-1].oos_hi :].any()
+
+    thx = [w for w in wins if str(w.friday) == "2023-11-17"]
+    assert len(thx) == 1, "the Thanksgiving-week window is missing"
+    sessions = np.unique(day[thx[0].oos_lo : thx[0].oos_hi]).size
+    assert sessions == 4, f"11/20-11/24/23 has {sessions} sessions, not 4 -- SPEC §4"
+    print(f"    ({len(wins)} windows {wins[0].friday}..{wins[-1].friday}; OOS tiles once; "
+          f"IS starts exact in {exact_start}, ends exact in {exact_end})", end="")
+
+
+def test_unit7_rejects_a_window_half_cut_mid_session() -> None:
+    """PLAN Unit 7, from Unit 4: a slice not ending on an ungated bar is rejected.
+
+    `_simulate` treats the last bar of *any* slice as the last gated bar of a run -- no
+    entry there, and an open position force-closed at the edge. That is right at a session
+    boundary, where the windowed and the full-sample answers coincide, and silently wrong
+    one bar earlier: the window loses an entry and force-closes at 13:00 instead of 15:55,
+    with every other check in this unit still green. Date-anchored slicing makes it
+    structural; this pins that data truncated mid-session is caught rather than absorbed.
+    """
+    bars = _synth_bars("2014-10-01", "2015-01-15")
+    assert pwfo.windows(bars), "the uncut synthetic calendar must be accepted"
+    et = data.to_et(bars.ts)
+    # Drop everything from 13:00 on one Friday. Its last bar is then 12:55, which the gate
+    # holds open, and it is the last bar of the 12/12 window's IS half.
+    keep = ~((_et_days(bars) == np.datetime64("2014-12-12")) & (et.hour >= 13))
+    assert 0 < (~keep).sum() < len(bars)
+    cut = data.Bars(bars.ts[keep], bars.close[keep], bars.gate[keep])
+    try:
+        pwfo.windows(cut)
+    except ValueError as exc:
+        assert "gated bar" in str(exc), f"rejected for the wrong reason: {exc}"
+    else:
+        raise AssertionError("a window half ending mid-session was accepted")
+
+
+def test_unit7_is_and_oos_files_hold_different_runs() -> None:
+    """PLAN Unit 7, from Unit 5: the canary, and proof it fires.
+
+    `_metrics` fills all 24 columns on every call, and `osnp`/`ont`/`ollt`/`odd` come out
+    byte-identical to `tnp`/`nT`/`llt`/`dd`. So writing `out_is[:, OOS_COLS]` into
+    `pwfo_oos.npy` yields a file of plausible OOS metrics that are really IS metrics --
+    and the leakage guard, the byte-identical re-run and the non-empty table all still
+    pass. PLAN §2.1's "structurally impossible" is weaker than it reads.
+
+    Fed a **periodic** series whose second half repeats the first exactly, the two runs
+    genuinely coincide, so that is the one input on which the canary must raise. Then the
+    same comparison on real windows, to show it is not vacuous there.
+    """
+    p = 480
+    rng = np.random.default_rng(11)
+    one = (500.0 + np.cumsum(rng.normal(0.0, 0.05, p))).astype(np.float32)
+    g = np.ones(p, np.int8)
+    g[-1] = 0
+    bars = data.Bars(np.arange(2 * p, dtype=np.int64) * data.BAR_NS,
+                     np.tile(one, 2), np.tile(g, 2))
+    matrix = np.tile(rmv.rmv_all_n(one), 2)
+    w = pwfo.Window(np.datetime64("2020-01-03"), 0, p, p, 2 * p)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            pwfo.run(bars, matrix, [w], tmp)
+        except AssertionError as exc:
+            assert "OOS block" in str(exc), f"raised for the wrong reason: {exc}"
+        else:
+            raise AssertionError("two identical runs were written as an IS and an OOS run")
+
+    got = _real_bars()
+    if got is None:
+        print("    (canary fires; real half skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    wins = pwfo.windows(bars)[300:304]
+    with tempfile.TemporaryDirectory() as tmp:
+        pwfo.run(bars, matrix, wins, tmp)
+        is_t = np.load(Path(tmp) / "pwfo_is.npy")
+        oos_t = np.load(Path(tmp) / "pwfo_oos.npy")
+    tie = float(np.mean(is_t[:, :, 0] == oos_t[:, :, 0]))
+    assert tie < 0.05, f"{tie * 100:.1f}% of rows have osnp == tnp -- one run, not two"
+    print(f"    (canary fires on a periodic series; {tie * 100:.2f}% tnp==osnp over 4 "
+          "real windows)", end="")
+
+
+def test_unit7_xmult_and_cost_see_only_is_bars() -> None:
+    """PLAN Unit 7: `xmult` and `cost` are both selection inputs, and both IS-only.
+
+    Each enters every IS metric and so the filter's choice of row, not merely the reported
+    P&L, and deriving either from OOS bars would leak a price level backwards into a row
+    that was already picked. Perturbing **only** the OOS half of one window must leave
+    both constants and the whole IS table bit-identical while moving the OOS table --
+    a stronger statement than reading the code, since `run` takes both slices itself.
+
+    One window, not four: consecutive windows overlap by construction (window k+1's 31-day
+    IS span contains window k's OOS week), so a multi-window perturbation would rewrite IS
+    bars as well and the test would pass for the wrong reason.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    w = pwfo.windows(bars)[200]
+
+    close = bars.close.copy()  # never mutate the cached arrays _real_bars hands out
+    m2 = matrix.copy()
+    close[w.oos_lo:w.oos_hi] += np.float32(3.0)
+    m2[:, w.oos_lo:w.oos_hi] *= np.float32(1.5)
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        base = pwfo.run(bars, matrix, [w], a)
+        pert = pwfo.run(data.Bars(bars.ts, close, bars.gate), m2, [w], b)
+        digest = {k: {n: hashlib.sha256((Path(k) / n).read_bytes()).hexdigest()
+                      for n in ("pwfo_is.npy", "pwfo_oos.npy")} for k in (a, b)}
+    assert base[0]["xmult"] == pert[0]["xmult"], "xmult moved when only OOS bars changed"
+    assert base[0]["cost"] == pert[0]["cost"], "cost moved when only OOS bars changed"
+    # And what the stored `xmult` was fitted on. "IS-only" is two claims, and the checks
+    # above make only the first: `rmv.xmult` also requires the `gate == 1` mask, because
+    # warmup zeros and bars whose window straddles a session gap are not RMedV values and
+    # including them inflates `sd` by 22.8% at N=3 (PLAN Unit 3). An unmasked fit is
+    # IS-only, self-consistent on replay, and a silent ~20% error in every threshold.
+    rows = matrix[:, w.is_lo:w.is_hi]
+    gated = bars.gate[w.is_lo:w.is_hi] == 1
+    assert base[0]["xmult"] == rmv.xmult(rows, gated), "the stored xmult is not the IS fit"
+    unmasked = rmv.xmult(rows, np.ones(rows.shape[1], bool))
+    assert base[0]["xmult"] != unmasked, (
+        f"masked and unmasked xmult agree ({unmasked}) -- the mask assertion is vacuous"
+    )
+    # The same check for `cost`, which PLAN Unit 7 gives exactly `xmult`'s discipline and
+    # which nothing else here pins to *this* window: every other assertion reads it back
+    # out of the index and would agree with any constant, so replacing the call with the
+    # flat 0.027 of Units 4-6 passed the whole suite. Found by the §4 review.
+    assert base[0]["cost"] == pwfo.window_cost(bars.close[w.is_lo:w.is_hi]), (
+        "the stored cost is not this window's own IS cost"
+    )
+    assert base[0]["cost"] != 0.027, (
+        f"this window's cost is {base[0]['cost']}, the flat SPEC §3.2 constant, so the "
+        "assertion above cannot tell a per-window cost from a hardcoded one"
+    )
+    # And the formula itself, at SPEC §3.2's own anchor: $0.01 slippage + $0.017 SEC/TAF
+    # at SPY $600. Nothing else in this unit is sensitive to `cost`'s *value* -- every
+    # other check reads it back out of the index and would agree with any constant.
+    at_anchor = pwfo.window_cost(np.full(8, 600.0, np.float32))
+    assert abs(at_anchor - 0.027) < 1e-12, f"cost at SPY $600 is {at_anchor}, not 0.027"
+    assert pwfo.window_cost(np.full(8, 300.0, np.float32)) < at_anchor, (
+        "cost does not fall with the price level -- the SEC/TAF term is charged on "
+        "notional and SPY ran $180 to $650 across this sample (SPEC §3.2)"
+    )
+    assert digest[a]["pwfo_is.npy"] == digest[b]["pwfo_is.npy"], (
+        "the IS table moved when only OOS bars changed -- look-ahead"
+    )
+    assert digest[a]["pwfo_oos.npy"] != digest[b]["pwfo_oos.npy"], (
+        "the OOS table did not move when OOS bars did -- the perturbation missed the "
+        "window, so every assertion above is vacuous"
+    )
+
+
+def test_unit7_normalized_is_sd_is_within_tolerance() -> None:
+    """PLAN Unit 7's done-when: normalized IS `sd` within ±0.15 for N>=5, every window.
+
+    This is what says the per-window refit did its job -- the single 0.25..3.50 grid means
+    the same thing at N=5 and at N=24 in *this* window, not on average over the sample.
+    N=3 and N=4 sit outside the claim (and at the noisy end of `xmult`'s own N<=20
+    average); they are measured and printed rather than asserted.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    wins = pwfo.windows(bars)  # every window, not a sample: the done-when says every
+    ns = rmv.N_VALUES
+    sel = ns >= 5
+    worst = worst_low = 0.0
+    at = None
+    for w in wins:
+        rows = matrix[:, w.is_lo:w.is_hi]
+        mask = bars.gate[w.is_lo:w.is_hi] == 1
+        d = np.abs(_norm_sd(rows[:, mask].astype(np.float64), ns, rmv.xmult(rows, mask)) - 1.0)
+        if d[sel].max() > worst:
+            worst, at = float(d[sel].max()), w.friday
+        worst_low = max(worst_low, float(d[~sel].max()))
+    assert worst <= 0.15, f"normalized IS sd is off by {worst:.3f} at {at} for some N>=5"
+    print(f"    (worst |sd-1| {worst:.4f} at {at} over {len(wins)} windows; {worst_low:.4f} "
+          "at N=3-4, outside the claim)", end="")
+
+
+def test_unit7_stored_rows_replay_standalone() -> None:
+    """PLAN Unit 7's done-when: a randomly chosen row reproduces when replayed standalone.
+
+    Replayed through the **guarded public** `simulate` + `metrics`, which share no buffer,
+    no combo ordering and no threshold hoisting with the kernel path `run` uses. That also
+    makes this what pins that `c = a * 196 + i * 14 + j` maps back to the parameters SPEC
+    §3.3 says it does, and that the stored `xmult` and `cost` are between them enough to
+    reproduce a stored row from the bars.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    wins = pwfo.windows(bars)[120:124]
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+    n_v = vs.size
+    rng = np.random.default_rng(7)
+    with tempfile.TemporaryDirectory() as tmp:
+        pwfo.run(bars, matrix, wins, tmp)
+        tables = (np.load(Path(tmp) / "pwfo_is.npy"), np.load(Path(tmp) / "pwfo_oos.npy"))
+        # Off the persisted index, not the dict `run` returned: that is the path Units 8,
+        # 9 and 11 take, and a lossy float round-trip through JSON would move every
+        # threshold. Measured lossless over 50 real windows' `xmult` by the §4 review.
+        idx = json.loads((Path(tmp) / "pwfo_index.json").read_text(encoding="utf-8"))["windows"]
+    checked = 0
+    for k, (w, e) in enumerate(zip(wins, idx)):
+        for c in rng.integers(0, ns.size * n_v * n_v, 3):
+            a, r = divmod(int(c), n_v * n_v)
+            i, j = divmod(r, n_v)
+            up = rmv.threshold(vs[i], e["xmult"], ns[a])
+            dn = rmv.threshold(vs[j], e["xmult"], ns[a])
+            for (lo, hi), table, cols in (((w.is_lo, w.is_hi), tables[0], rmv.IS_COLS),
+                                          ((w.oos_lo, w.oos_hi), tables[1], rmv.OOS_COLS)):
+                trades = rmv.simulate(np.ascontiguousarray(matrix[a, lo:hi]),
+                                      bars.close[lo:hi], bars.gate[lo:hi], up, dn, e["cost"])
+                want = np.asarray(rmv.metrics(trades), np.float32)[cols]
+                assert np.array_equal(table[k, int(c)], want), (
+                    f"{e['friday']} combo {c} (n={ns[a]}, vup={vs[i]}, vdn={vs[j]}): "
+                    f"stored {table[k, int(c)]} != standalone replay {want}"
+                )
+                checked += 1
+    assert checked == 24
+    print(f"    ({checked} stored rows replayed exactly through the public path)", end="")
+
+
+def test_unit7_buffers_are_allocated_once_for_the_longest_window() -> None:
+    """PLAN Unit 7, from Unit 6: one set of buffers, sized for the **longest** window.
+
+    Two failure modes, one test. Sizing from `wins[0]` raises on the first longer window
+    -- real IS halves run 1824 to 2208 bars, so the shorter-first order below is not
+    hypothetical -- and reallocating per window churns the allocator 1100 times for
+    1.55 MB apiece. Counted on the `trades` buffer's exact shape, which nothing else in
+    the call graph allocates.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    wins = pwfo.windows(bars)
+    lengths = sorted({w.is_hi - w.is_lo for w in wins})
+    assert len(lengths) > 1, "every window is the same length -- this test proves nothing"
+    short = next(w for w in wins if w.is_hi - w.is_lo == lengths[0])
+    longest = next(w for w in wins if w.is_hi - w.is_lo == lengths[-1])
+    order = [short, longest, short, longest, short, longest]
+    want = (rmv.N_VALUES.size, int(lengths[-1]), 4)
+
+    seen: list[tuple] = []
+    real = np.empty
+
+    def counted(shape, *a, **k):
+        seen.append(tuple(shape) if isinstance(shape, (tuple, list)) else (shape,))
+        return real(shape, *a, **k)
+
+    np.empty = counted
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            pwfo.run(bars, matrix, order, tmp)
+    finally:
+        np.empty = real
+    n = sum(s == want for s in seen)
+    assert n == 1, (
+        f"{n} allocations of the {want} trades buffer over {len(order)} windows; one is "
+        "allocate-once, six is per-window churn, zero is a buffer sized some other way"
+    )
+    print(f"    (1 x {want} trades buffer over {len(order)} windows of {lengths[0]}-"
+          f"{lengths[-1]} bars)", end="")
+
+
+def test_unit7_rerun_is_byte_identical() -> None:
+    """PLAN Unit 7's done-when. Also what makes every other hash in this unit worth taking.
+
+    `_run_grid` is `parallel=True`, so this is the statement that thread scheduling does
+    not reach the output: each `prange` iteration writes its own 196 rows and nothing
+    reduces across them (PLAN Unit 6). All files, not only the tables -- the index carries
+    `xmult` and `cost`, and a replay is reproducible only if those are stable too.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    wins = pwfo.windows(bars)[400:404]
+    digests = []
+    for _ in range(2):
+        with tempfile.TemporaryDirectory() as tmp:
+            pwfo.run(bars, matrix, wins, tmp)
+            digests.append({p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                            for p in sorted(Path(tmp).iterdir())})
+    # `_real_bars` is truncated before the withheld tail, so a tail file must not appear.
+    assert set(digests[0]) == {"pwfo_index.json", "pwfo_is.npy", "pwfo_oos.npy"}, digests[0]
+    assert digests[0] == digests[1], (
+        "re-running produced different bytes in "
+        f"{[k for k in digests[0] if digests[0][k] != digests[1][k]]}"
+    )
+
+
+def test_unit7_tail_windows_carry_both_blocks_of_their_own_runs() -> None:
+    """PLAN Unit 7: `pwfo_tail.npy` holds all 24 columns, and each block is its own run.
+
+    The withheld file is written once and not opened again until Unit 9's last action, so
+    it is the one output nothing downstream will ever sanity-check before it is used to
+    decide whether the strategy works. Every other test here drives the pre-tail branch --
+    `_real_bars` truncates before the real tail -- which leaves four lines of the driver
+    unexercised.
+
+    A stand-in `TAIL_START` in the middle of the sample runs that branch on bars that are
+    not withheld, so nothing is spent. Both blocks are then replayed standalone: the IS
+    block against the IS half's bars, the OOS block against the OOS half's.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    bars, matrix = got
+    sel = pwfo.windows(bars)[200:204]
+    ns, vs = rmv.N_VALUES, rmv.V_VALUES
+    n_v = vs.size
+    rng = np.random.default_rng(3)
+
+    real_start = pwfo.TAIL_START
+    # The first window's OOS week ends the day before this, so 0 is kept and 1..3 are
+    # "withheld" -- one of each branch, and the boundary itself under test.
+    pwfo.TAIL_START = np.datetime64(str(sel[1].friday)) + np.timedelta64(7, "D")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = pwfo.run(bars, matrix, sel, tmp)
+            names = sorted(p.name for p in Path(tmp).iterdir())
+            tail = np.load(Path(tmp) / "pwfo_tail.npy")
+            n_pre = len(np.load(Path(tmp) / "pwfo_is.npy"))
+    finally:
+        pwfo.TAIL_START = real_start
+
+    assert names == ["pwfo_index.json", "pwfo_is.npy", "pwfo_oos.npy", "pwfo_tail.npy"]
+    kinds = [e["file"] for e in idx]
+    assert kinds == ["is", "tail", "tail", "tail"], kinds
+    assert n_pre == 1 and tail.shape == (3, ns.size * n_v * n_v, rmv.N_METRICS), tail.shape
+
+    checked = 0
+    for e, w in zip(idx, sel):
+        if e["file"] != "tail":
+            continue
+        for c in rng.integers(0, ns.size * n_v * n_v, 2):
+            a, r = divmod(int(c), n_v * n_v)
+            i, j = divmod(r, n_v)
+            up = rmv.threshold(vs[i], e["xmult"], ns[a])
+            dn = rmv.threshold(vs[j], e["xmult"], ns[a])
+            want = np.empty(rmv.N_METRICS, np.float32)
+            for (lo, hi), cols in (((w.is_lo, w.is_hi), rmv.IS_COLS),
+                                   ((w.oos_lo, w.oos_hi), rmv.OOS_COLS)):
+                trades = rmv.simulate(np.ascontiguousarray(matrix[a, lo:hi]),
+                                      bars.close[lo:hi], bars.gate[lo:hi], up, dn, e["cost"])
+                want[cols] = np.asarray(rmv.metrics(trades), np.float32)[cols]
+            assert np.array_equal(tail[e["row"], int(c)], want), (
+                f"{e['friday']} combo {c}: stored {tail[e['row'], int(c)]} != {want} -- "
+                "one of the two blocks in the withheld file is the other run's"
+            )
+            checked += 1
+    assert checked == 6
+    print(f"    ({checked} withheld rows carry both blocks of their own runs)", end="")
+
+
+def test_unit7_budget() -> None:
+    """PLAN Unit 7's budget: the whole walk-forward in < 60 s.
+
+    Timed on real windows with the kernels warm and extrapolated to the full sample; the
+    alternative is a test that writes 220 MB on every run. The trade-count assert is
+    Unit 4's, for the same reason: threshold density drives the cost, so a grid that made
+    no trades would time an empty loop and come in under any budget at all.
+    """
+    got = _real_bars()
+    if got is None:
+        print("    (skipped: no cache)", end="")
+        return
+    import time
+
+    bars, matrix = got
+    wins = pwfo.windows(bars)
+    sample = wins[::40]
+    with tempfile.TemporaryDirectory() as tmp:
+        pwfo.run(bars, matrix, wins[:2], tmp)  # warm the JIT
+        begin = time.perf_counter()
+        pwfo.run(bars, matrix, sample, tmp)
+        per = (time.perf_counter() - begin) / len(sample)
+        nt = float(np.load(Path(tmp) / "pwfo_is.npy")[:, :, 1].mean())
+    full = per * len(wins)
+    assert nt > 10, f"only {nt:.1f} IS trades per combo -- this is timing an empty grid"
+    assert full < 60.0, (
+        f"{per * 1000:.0f} ms/window x {len(wins)} windows = {full:.0f} s against the "
+        "60 s budget"
+    )
+    print(f"    ({per * 1000:.1f} ms/window over {len(sample)} real windows -> {full:.1f} s "
+          f"for {len(wins)}, {nt:.1f} IS trades/combo)", end="")
 
 
 def main() -> int:

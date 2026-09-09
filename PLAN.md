@@ -275,6 +275,7 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 | Grid, one IS window (4312 × 1638) | < 60 ms | **43 ms** (prototype) |
 | ⚑ Same, shipped `run_grid`, 32 threads | < 60 ms | **3.2 ms** (16.6 ms on 1 thread) |
 | Full PWFO, 546 windows, IS+OOS | < 60 s, peak RSS < 1 GB | **~32 s, 226 MB** |
+| ⚑ Same, shipped `pwfo.run`, 551 windows (525 + 26 withheld) | < 60 s, peak RSS < 1 GB | **2.6 s, 411 MB** |
 | One filter over the full table | < 1 s | — |
 | Live per-bar compute | < 1 ms, zero steady-state allocation | — |
 
@@ -733,7 +734,76 @@ whether the 4312-row equality test can pass against a broken kernel.
 
 ---
 
-### Unit 7 — PWFO driver (`pwfo.py`)
+### Unit 7 — PWFO driver (`pwfo.py`) ✅ **shipped**
+
+**Shipped** in `pwfo.py`: `TAIL_START`, the `Window` namedtuple, `windows(bars)`,
+`window_cost(close)` and
+`run(bars, matrix, wins=None, out_dir=OUT_DIR, progress=0) -> list[dict]`, writing
+`pwfo_is.npy` `float32[525, 4312, 18]`, `pwfo_oos.npy` `float32[525, 4312, 6]`,
+`pwfo_tail.npy` `float32[26, 4312, 24]` and the sibling `pwfo_index.json`. 89/89 tests,
+`ruff check .` clean, **29 of 33 mutations killed** (4 provably equivalent, below).
+**2.6 s and 411 MB peak RSS** against a 60 s / 1 GB budget — 4.8 ms/window over 551
+windows, both halves. Re-running is byte-identical across all four files.
+
+- **551 windows**, IS 1824–2208 bars and OOS 372–480: **525 pre-tail**, 2016-02-05 to
+  2026-02-20, and **26 withheld**. A window is emitted only when its IS start is at or
+  after the first bar's date and its OOS Friday at or before the last, so the partial
+  week at each end of the sample is dropped rather than run short.
+- ⚑ **`friday - 30 days` is always a Wednesday** (30 mod 7 = 2), which is what makes
+  SPEC §4's 31-day-inclusive span checkable on real data without the paper's calendar:
+  the IS half starts exactly there in **518 of 525** windows and ends exactly on its own
+  Friday in **510**, the remainder being Wednesday and Friday holidays. A 30-day-inclusive
+  span would score 0 on the first census. The two [M25 Table 1] rows are pinned literally
+  against a synthetic 2014 and 2023 calendar, because the SPY cache starts in 2016.
+- ⚑ **The withheld set is keyed on the OOS *end*, not its start.** Identical here —
+  2026-03-01 is a Sunday and no Mon–Fri week straddles it — and still correct the day
+  someone moves `TAIL_START` into the middle of a week. `run` also asserts on the *bars*
+  that no window it files as pre-tail reaches the withheld period, and refuses a run in
+  which every window is withheld rather than writing a loadable, empty `pwfo_is.npy`.
+- ⚑ **`xmult` swings 20.25× across windows** — 0.692 (2025-04-25) to 14.013 (2017-10-13),
+  median 3.050. SPEC §1.2.1 measured 6.45× *per year*; per week it is three times wider,
+  and the extremes are the April 2025 selloff and the quietest October on record. That is
+  the strongest evidence yet for refitting, and it is also why the OOS run must reuse the
+  IS multiplier: the two halves are one week apart and can still differ by a factor.
+- ⚑ **Normalized IS `sd` holds, with 0.007 to spare.** Worst `|sd - 1|` over N>=5 across
+  all 525 windows is **0.1429** (2017-12-29) against the ±0.15 done-when — held in 100%,
+  but not comfortably. N=3–4 reach 0.2100 and are outside the claim. Anything that widens
+  the IS window or narrows `xmult`'s N<=20 average should re-measure this first.
+- ⚑ **`cost` is now per window and notional-scaled**: `SLIP + SEC_TAF_PER_DOLLAR *
+  mean(IS close)`, running **0.0153 to 0.0296** (1.93×) against the flat 0.027 Units 4–6
+  used. SPEC §3.2's own two numbers are read as $0.017 at SPY $600; the rate *and* the
+  anchor stay Unit 9's to verify, and this unit fixes only which bars the price level
+  comes off — the half that can leak. Deriving it from OOS prices would push a price
+  level backwards into a row that was already picked.
+- ⚑ **The canary has to read the files, not the buffers.** PLAN's wording ("assert
+  `pwfo_oos[:, 0] != pwfo_is[:, 0]`") is on the *stored* columns and it is right: the
+  first implementation compared `out_oos` against `out_is` in memory, which catches the
+  two halves being one run and misses the other half of the same defect — a correct pair
+  of runs written to the wrong file. Reading back off the memmaps catches both, and
+  mutations 15–18 (each of the four block/file swaps, IS and tail) are all killed by it.
+- ⚑ **`run` leaked its memmap handles on the exception path.** numpy offers no public
+  close, so on Windows a caller's `TemporaryDirectory` could not be deleted and every
+  failure inside the loop surfaced as `NotADirectoryError` with its own cause hidden —
+  which is exactly how six mutation kills first reported. `mm._mmap.close()` in a
+  `finally`; `_mmap` is private and there is no alternative.
+- **11 tests added**, plus `_synth_bars` / `_et_days` / `_win_dates` helpers, and
+  `test_rmv.TAIL_START` now derives from `pwfo.TAIL_START` so the driver and the suite
+  cannot withhold different bars.
+- ⚑ **PLAN §2.1's column-major option was not taken.** The tables are
+  `[windows, combos, cols]`, which is what streams contiguously one window at a time;
+  §2.1's stated alternative — Unit 8 hoisting its ~8 needed columns into RAM once — is
+  64 MB and one pass, against restructuring the writer.
+
+**Mutation survivors, all four resolved rather than chased.** (i) The leakage guard's
+`<` → `<=` and (ii) dropping the tiling guard and (iii) dropping the pre-tail reach guard
+are guards that never fire on a correct generator, so removing one alone changes nothing.
+Three *combined* mutations — break the thing **and** remove the guard that catches it —
+were added to prove that is what is happening, and all three are killed: a Tuesday OOS
+start without the tiling guard is caught by the paper-table test, a tail keyed on the OOS
+start without the reach guard by the withheld-file test, and a mid-session IS cut by the
+rejection test. (iv) Taking `cost` off the first IS bar instead of the IS mean survives,
+and should: both are IS-only price levels, the tests pin *IS-only* and *0.027 at $600*,
+and which statistic of the IS price the fee is charged on is Unit 9's question.
 
 **Do**
 
@@ -868,12 +938,43 @@ deterministic (a-major combo order, §2.1) but "the bottom 10 by `mLb`" is in pr
 arbitrary rows drawn from that block. Report the tie width alongside the selection; a
 tie-break rule cannot fix a resolution problem.
 
+⚑ **From Unit 7: what is actually on disk.**
+
+- `pwfo_is.npy` is `float32[525, 4312, 18]` and `pwfo_oos.npy` `float32[525, 4312, 6]`,
+  same window ordering, row-major `[window, combo, col]`. Column names, `n_combos`, the
+  four dates per window, its IS/OOS bar counts and its `xmult` and `cost` are in
+  `pwfo_index.json`; `pwfo_is` carries no 19th column and no parameter columns.
+- A row's parameters come from SPEC §3.3's index alone: `a, r = divmod(c, 196)`,
+  `i, j = divmod(r, 14)`, then `n = N_VALUES[a]`, `vup = V_VALUES[i]`, `vdn = V_VALUES[j]`.
+- ⚑ **Hoist the ~8 columns the filter needs into RAM once.** PLAN §2.1 offered
+  column-major storage *or* this, and Unit 7 took this: a row-major scan reads each metric
+  with a 96-byte stride. Eight columns over 525 windows is 64 MB and one pass.
+- ⚑ `cost` is no longer the constant 0.027 Units 4–6 tested against — it runs 0.0153 to
+  0.0296 across windows, so IS P&L columns are not comparable across windows on a
+  per-dollar basis without it. It is in the index, per window.
+
 **Review focus** Tie-breaking determinism; the no-eligible-rows path; whether aggregates treat
 the two zero cases distinctly.
 
 ---
 
 ### Unit 9 — Significance, costs, report
+
+⚑ **From Unit 7: three things this unit inherits.**
+
+- `pwfo_tail.npy` is `float32[26, 4312, 24]` — 26 windows, IS columns 0:18 from the IS run
+  and OOS columns 18:24 from the OOS run, written 2026-09-08 and **not opened since**. Its
+  first OOS week starts 2026-03-02. The withheld set is keyed on each window's OOS *end*.
+- The cost model is now `SLIP + SEC_TAF_PER_DOLLAR * mean(IS close)` per window, read off
+  SPEC §3.2 as $0.01 slippage plus $0.017 SEC/TAF **at SPY $600**. That anchor is an
+  inference from the one sentence in §3.2 that states both numbers, and it is not sourced.
+  This unit's existing obligation to verify (not re-apply) the cost model now has a
+  specific target: the FINRA TAF per-share schedule, the SEC Section 31 rate for each year
+  in the sample, and whether folding them into one notional-scaled scalar is defensible at
+  all. Measured spread as shipped: 0.0153 to 0.0296.
+- The comparison counter owes nothing to Unit 7: no filter has been evaluated and
+  `pwfo_oos.npy` has been read only by tests, which compare stored rows against standalone
+  replays of the same bars and never rank, screen or aggregate them.
 
 **Do**
 

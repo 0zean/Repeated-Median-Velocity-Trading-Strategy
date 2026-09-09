@@ -596,6 +596,29 @@ cheap.
 
 **Invariant:** `max(IS timestamp) < min(OOS timestamp)` for every window.
 
+⚑ **Pinned in Unit 7 — the generator's boundary rules.** The scheme above leaves four
+things open, and each is the `<=`/`+1 day` class this section already warns about.
+
+- Both spans are **inclusive date ranges** in ET, not bar counts: IS is
+  `[friday - 30 days, friday]` and OOS is `[friday + 3, friday + 7]`. Since 30 mod 7 = 2,
+  `friday - 30 days` is always a **Wednesday** — measured on SPY 2016–2026, the IS half
+  begins exactly there in 518 of 525 windows and ends exactly on its Friday in 510, the
+  rest being Wednesday and Friday holidays. Under the 30-day-*inclusive* misreading the
+  first figure is 0 of 525, which is what makes the census a usable check.
+- A window is emitted only when its IS start is at or after the first bar's date **and**
+  its OOS Friday at or before the last: the partial week at each end of the sample is
+  dropped, never run short. Consecutive Fridays then make the OOS weeks partition their
+  own range exactly once — no overlap, no gap — which the generator asserts.
+- Because both halves are date ranges they end on the last bar of a session, which is
+  ungated by construction (the gate closes at 15:55 or `session_close - 5`, and the last
+  bar opens there). That is load-bearing, not incidental: `_simulate` treats the last bar
+  of any slice as the last gated bar of a run, so a window cut by bar count or at a
+  mid-session timestamp silently loses an entry and force-closes at the cut. The generator
+  asserts `gate[-1] == 0` on both halves and rejects the series otherwise.
+- The final 6 months are withheld on each window's **OOS end**, so a window contributes to
+  `pwfo_tail.npy` if *any* of its OOS bars is in the tail. Identical to keying on the OOS
+  start while the boundary falls on a weekend, and still correct if it moves.
+
 [M25] ran 546 weeks of CL (12/19/2014–5/30/2025), used 517 for the filter search, and withheld
 the final 29 weeks (11/15/24–5/30/25) as a genuinely untouched future period [M25 p.8].
 
