@@ -1404,7 +1404,7 @@ threshold *before* committing to Units 10–13.
 
 ---
 
-### Unit 10 — Region portfolio, not filter search ✅ **shipped — the region reproduces; the tail is still shut**
+### Unit 10 — Region portfolio, not filter search ✅ **shipped — the tail was opened once and the hypothesis PASSED**
 
 **Shipped** in `pwfo.py`: `REGION`, `sym_dir()`, `window_notional()`, `region_mask()`,
 `region_weeks()`, `run_region()`, `_align()`, `_bps_row()`, `region_report()`,
@@ -1693,11 +1693,48 @@ reviewer's found **nine survivors** in surface I had not probed — all three of
 - **`--force` and `--full` are the only flags**, parsed by membership. A third would want a
   real parser, which PLAN §5 pins at "a third caller appears".
 
-⚑ **The withheld tail is still unopened and is now the only clean test the project has.**
-Every number in this unit was measured on data Unit 9 already read, and the region was chosen
-by reading SPY's own OOS marginals — that contamination is real and is not argued away by the
-breadth of the region or by both halves being positive. Open the tail **once**, after
-freezing, exactly as Rev 1 specified.
+#### ⚑ The withheld tail, opened once on 2026-09-10. **PASS.**
+
+    ⚑ WITHHELD TAIL OPENED -- 26 weeks, 2026-02-27..2026-08-21, K = 14 after this look
+
+    pre-registered test (PLAN §3 Unit 10): equal-weight n >= 5, vup, vdn in [0.75, 2.75],
+    no IS filter, SPY+QQQ 50/50
+      toNP +240.0 bps over 26 withheld weeks, t +0.799  ->  PASS
+
+Both pre-registered conditions hold: `toNP > 0` after costs, and `t > 0`. `comparisons.json`
+gained exactly one entry, `unit10_region_tail#0`, K = 13 → **14**. The full §6.3 block was
+**not** printed — it stays behind `--full`, so nothing beyond these two numbers has been read
+off the holdout and the deferred vol-state hypothesis is still clean.
+
+⚑ **What this does and does not establish.** The honest reading, stated before anyone builds
+on it:
+
+| | pre-tail, 525 wk | withheld, 26 wk |
+|---|---|---|
+| bps/week | 7.30 | **9.23** |
+| sd | 60.36 | 58.9 |
+| annualised Sharpe | 0.87 | **1.13** |
+| t | 2.77 | 0.799 |
+
+- **The holdout did not degrade — it came in slightly ahead.** If the pre-tail effect had held
+  *exactly*, 26 weeks would have produced `t = 0.615`; the observed 0.799 is a shade above
+  that. Overfitting's signature is decay toward zero out of sample, and there is none here.
+- ⚠ **This is not a significant result and could not have been one.** `t = 2.06` is the bar
+  at n = 26, and an 0.87-Sharpe strategy needs roughly **150 weeks** to clear it. The
+  pre-registration set sign-based criteria precisely because a 6-month holdout has no power
+  to do more — so "PASS" means *consistent with the edge persisting*, not *the edge is
+  confirmed*. Anyone quoting this as validation is quoting it wrong.
+- **What the test genuinely bought** is that the region was frozen in writing before the data
+  was read, K is recorded, and the one number that came back was the one named in advance.
+  That rules out the failure mode Unit 9's diagnosis was about — a result manufactured by
+  selection — which no amount of further pre-tail work could have done.
+- The contamination note stands and is not retired by the PASS: the region was chosen by
+  reading SPY's own pre-tail OOS marginals across at least fifteen boundary variants, and
+  those looks are not in `comparisons.json`. The 26 weeks are clean; the 525 are not.
+
+**The tail is now spent.** There is no second withheld set. Any further parameter or region
+question is answered on data that has been read, and Unit 11 onward is forward-testing —
+paper first, per §3 Unit 13's go/no-go.
 
 **Anti-goal** Do not re-derive the region from the tail, and do not widen the search when the
 tail disappoints. Do not add money management to rescue a result: sizing reshapes a
