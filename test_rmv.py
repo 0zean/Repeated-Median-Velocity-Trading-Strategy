@@ -4637,6 +4637,481 @@ def test_unit9_report_carries_every_spec_63_column() -> None:
     print(f"    ({len(pwfo.R63)} §6.3 columns, {n_win} Table 1 rows)", end="")
 
 
+def test_unit10_region_is_the_frozen_cube() -> None:
+    """PLAN §3 Unit 10's static prior, checked over all 4312 combos rather than sampled.
+
+    The region *is* the hypothesis -- there is no selection step left to absorb a mistake
+    in it -- so every boundary is pinned in both directions. All three are inclusive, and
+    the `v` bounds apply to `vup` and `vdn` **separately**: `(5, 0.75, 2.75)` is a corner
+    of the cube and is in, where a band-around-the-diagonal reading would drop it.
+
+    ⚑ The count is asserted as a product of the two axes, not as the literal 1620, so a
+    grid that gained an `N` or a `v` fails here instead of silently re-scoping the claim.
+    """
+    n_min, v_lo, v_hi = pwfo.REGION
+    assert (n_min, v_lo, v_hi) == (5, 0.75, 2.75), pwfo.REGION
+    mask = pwfo.region_mask()
+    assert mask.dtype == bool and mask.size == rmv.N_VALUES.size * rmv.V_VALUES.size**2
+
+    idx = {}
+    for c in range(mask.size):
+        n, vup, vdn = pwfo.decode(c)
+        idx[(n, vup, vdn)] = c
+        want = bool(n >= n_min and v_lo <= vup <= v_hi and v_lo <= vdn <= v_hi)
+        assert bool(mask[c]) is want, (c, n, vup, vdn, bool(mask[c]))
+
+    n_ax = int(np.count_nonzero(rmv.N_VALUES >= n_min))
+    v_ax = int(np.count_nonzero((rmv.V_VALUES >= v_lo) & (rmv.V_VALUES <= v_hi)))
+    assert int(mask.sum()) == n_ax * v_ax**2 == 1620, (int(mask.sum()), n_ax, v_ax)
+
+    for p in ((5, 0.75, 2.75), (5, 2.75, 0.75), (24, 0.75, 0.75), (24, 2.75, 2.75)):
+        assert mask[idx[p]], f"{p} is a corner of the region and must be inside"
+    for p in ((4, 1.0, 1.0), (5, 0.5, 1.0), (5, 1.0, 0.5), (5, 3.0, 1.0), (5, 1.0, 3.0)):
+        assert not mask[idx[p]], f"{p} is one grid step outside and must be excluded"
+    # A narrower region is a subset, so the bounds narrow the same cube rather than
+    # re-anchoring it -- which is what makes PLAN's fifteen-boundary scan comparable.
+    inner = pwfo.region_mask(14, 1.0, 2.5)
+    assert inner.sum() < mask.sum() and not (inner & ~mask).any()
+    print(f"    ({int(mask.sum())} combos = {n_ax} N x {v_ax} vup x {v_ax} vdn, all "
+          f"{mask.size} checked)", end="")
+
+
+def test_unit10_equal_weight_reads_only_its_own_region() -> None:
+    """PLAN §3 Unit 10's portfolio, end to end on a real PWFO directory.
+
+    The unit's whole claim is that the selection step is *gone*, and three things have to
+    be true at the file boundary for that to mean anything -- none of which a synthetic
+    column dict can show:
+
+    - **No IS metric is read.** `pwfo_is.npy` is overwritten with nan, which every screen
+      in Unit 8 would silently fail and every `argmin` would win outright. The region
+      result must be bit-identical to the same run against the untouched file.
+    - **The withheld tail stays shut.** `pwfo_tail.npy` is replaced with bytes `np.load`
+      cannot parse, so anything that so much as opens it raises. ⚑ These are 2016 synthetic
+      bars under a stand-in boundary; the real tail is untouched and nothing is spent.
+    - **Only the region's combos are averaged.** Every combo outside the mask is planted
+      with a value 5 orders of magnitude larger, so a mask that is inverted, off by one
+      row, or ignored entirely fails by six digits rather than by a rounding error.
+
+    `aggregate` is Unit 8's and is not re-derived here; what is checked is that the six OOS
+    columns handed to it are the region's equal-weight mean and that `bps` divides by the
+    notional `window_cost` was charged against.
+    """
+    bars = _synth_bars("2016-01-04", "2016-05-31")
+    matrix = rmv.rmv_all_n(bars.close)
+    wins = pwfo.windows(bars)
+    real_start = pwfo.TAIL_START
+    pwfo.TAIL_START = np.datetime64(str(wins[-5].friday)) + np.timedelta64(7, "D")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            index = pwfo.run(bars, matrix, wins, tmp)
+            pre = [w for w in index if w["file"] == "is"]
+            assert 0 < len(pre) < len(index), (len(pre), len(index))
+
+            mask = pwfo.region_mask(10, 1.0, 1.5)
+            oos = np.load(Path(tmp) / "pwfo_oos.npy")
+            names = rmv.METRIC_COLS[rmv.OOS_COLS]
+            clean = pwfo.run_region(tmp, (10, 1.0, 1.5))
+            real = oos[:, mask].mean(axis=1, dtype=np.float64)
+            for k, wk in enumerate(clean["weeks"]):
+                assert [wk[c] for c in names] == [float(v) for v in real[k]], k
+
+            (Path(tmp) / "pwfo_tail.npy").write_bytes(b"the tail is the project's last act")
+            blind = np.load(Path(tmp) / "pwfo_is.npy")
+            blind[:] = np.nan
+            np.save(Path(tmp) / "pwfo_is.npy", blind)
+            assert pwfo.run_region(tmp, (10, 1.0, 1.5))["agg"] == clean["agg"], \
+                "the region result moved when the IS table did -- an IS column is being read"
+
+            rng = np.random.default_rng(11)
+            plant = rng.integers(-8, 9, oos.shape).astype(np.float32)
+            plant[:, ~mask] = 1e6
+            np.save(Path(tmp) / "pwfo_oos.npy", plant)
+
+            got = pwfo.run_region(tmp, (10, 1.0, 1.5))
+            assert got["combos"] == int(mask.sum()) == 15 * 3**2
+            assert len(got["weeks"]) == len(pre)
+            want = plant[:, mask].mean(axis=1, dtype=np.float64)
+            for k, (wk, w) in enumerate(zip(got["weeks"], pre)):
+                assert wk["friday"] == w["friday"] and wk["cost"] == w["cost"]
+                assert wk["selected"] is True, "no screens, so every week is selected"
+                assert [wk[c] for c in names] == [float(v) for v in want[k]], k
+                assert abs(wk["osnp"]) < 1e3, f"window {k} averaged in an out-of-region combo"
+            assert abs(got["agg"]["toNP"] - float(want[:, 0].sum())) < 1e-9
+            assert got["agg"]["n_sel"] == got["agg"]["n"] == len(pre)
+            assert all(abs(b - 1e4 * wk["osnp"] / pwfo.window_notional(wk["cost"])) < 1e-9
+                       for b, wk in zip(got["bps"], got["weeks"]))
+            # Both `region_weeks` guards, on the door itself: `run_region` now takes a
+            # region tuple and builds the mask, so these are unreachable through it.
+            for bad, why in ((np.zeros(mask.size, bool), "an empty region"),
+                             (np.ones(mask.size + 1, bool), "a mask of the wrong width")):
+                try:
+                    pwfo.region_weeks(plant, pre, bad)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"{why} was accepted")
+            # A region naming no combo at all is the same refusal through the front door.
+            try:
+                pwfo.run_region(tmp, (99, 1.0, 1.5))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a region matching no combo was accepted")
+
+            # SPEC §3.2's cost is affine in the IS price level, so the level comes back out
+            # of it exactly -- which is the only thing standing between per-share and bps.
+            for px in (12.5, 180.0, 650.0):
+                c = pwfo.window_cost(np.full(8, px, dtype=np.float32))
+                assert abs(pwfo.window_notional(c) - px) < 1e-9, px
+
+            legs = {"AAA": got, "BBB": pwfo.run_region(tmp, (10, 1.0, 1.25))}
+            text = pwfo.region_report(legs)
+            for col, key in pwfo.R63:
+                assert (f"{col} {key}" in text) is (key != "Prob"), key
+            blend = 0.5 * (legs["AAA"]["bps"] + legs["BBB"]["bps"])
+            row = next(ln for ln in text.splitlines() if ln.strip().startswith("50%/50%"))
+            assert row.split()[1] == f"{blend.sum() / 100:.1f}%", row
+            # The weights are used, not assumed: all of it on one leg is that leg.
+            solo = pwfo.region_report(legs, {"AAA": 1.0, "BBB": 0.0})
+            row = next(ln for ln in solo.splitlines() if ln.strip().startswith("100%/0%"))
+            assert row.split()[1] == f"{legs['AAA']['bps'].sum() / 100:.1f}%", row
+            try:
+                pwfo.region_report(legs, {"AAA": 0.7, "BBB": 0.7})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("weights that do not sum to 1 were accepted")
+    finally:
+        pwfo.TAIL_START = real_start
+    print(f"    ({int(mask.sum())}-combo region over {len(pre)} pre-tail windows; IS nan'd, "
+          f"tail unreadable, {int((~mask).sum())} combos poisoned)", end="")
+
+
+def test_unit10_the_tail_door_is_separate_and_reads_withheld_rows() -> None:
+    """PLAN §3 Unit 10's last step, exercised on synthetic bars so the real tail stays shut.
+
+    ⚑ These are 2016 synthetic bars under a stand-in `TAIL_START`; nothing here reads
+    `pwfo/pwfo_tail.npy` and nothing is spent. What has to hold before the one real run:
+
+    - `load_tail_oos` returns the **withheld** rows, in index order, and not the pre-tail
+      table's -- the two differ only in row count and a reader that opened the wrong file
+      would still return a plausible table of the right width.
+    - The six OOS columns are taken **by name** out of the tail's 24. A positional slice
+      would hand back `tnp` and its IS siblings under OOS names, which is `run`'s canary
+      defect at the only other boundary where it can happen, and every downstream number
+      would look ordinary.
+    - `load_tables` still cannot reach the tail, so Units 8 and 9's contract survives the
+      new door being cut next to it.
+    - The blend refuses legs that do not cover the same weeks. Truncating to the shortest
+      leg is not alignment, and a paired portfolio built out of mismatched weeks is a
+      shuffled one with a plausible Sharpe.
+    """
+    bars = _synth_bars("2016-01-04", "2016-05-31")
+    matrix = rmv.rmv_all_n(bars.close)
+    wins = pwfo.windows(bars)
+    real_start = pwfo.TAIL_START
+    pwfo.TAIL_START = np.datetime64(str(wins[-5].friday)) + np.timedelta64(7, "D")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            index = pwfo.run(bars, matrix, wins, tmp)
+            withheld = [w for w in index if w["file"] == "tail"]
+            pre = [w for w in index if w["file"] == "is"]
+            assert 0 < len(withheld) < len(index) and len(pre) != len(withheld)
+
+            oos, got = pwfo.load_tail_oos(tmp)
+            assert [w["friday"] for w in got] == [w["friday"] for w in withheld]
+            assert oos.shape[0] == len(withheld)
+            stored = np.load(Path(tmp) / "pwfo_tail.npy")
+            tail_names = json.loads(
+                (Path(tmp) / "pwfo_index.json").read_text(encoding="utf-8"))["tail_cols"]
+            names = rmv.METRIC_COLS[rmv.OOS_COLS]
+            for k, nm in enumerate(names):
+                assert np.array_equal(oos[:, :, k], stored[:, :, tail_names.index(nm)]), nm
+            # The IS block of the same rows is right there and must not be what came back.
+            assert not np.array_equal(oos[:, :, 0], stored[:, :, 0]), \
+                "the OOS columns were sliced positionally out of the 24-column tail table"
+
+            mask = pwfo.region_mask(10, 1.0, 1.5)
+            r = pwfo.run_region(tmp, (10, 1.0, 1.5), tail=True)
+            want = oos[:, mask].mean(axis=1, dtype=np.float64)
+            assert len(r["weeks"]) == len(withheld)
+            for k, (wk, w) in enumerate(zip(r["weeks"], withheld)):
+                assert wk["friday"] == w["friday"] and wk["cost"] == w["cost"]
+                assert [wk[c] for c in names] == [float(v) for v in want[k]], k
+            v = pwfo.region_verdict({"only": r})
+            assert v["weeks"] == len(withheld)
+            assert abs(v["toNP"] - float(r["bps"].sum())) < 1e-9
+
+            # The two pre-registered conditions on planted series, because the real one
+            # cannot separate them. ⚑ `t` and `toNP` carry the **same sign** -- `t` is
+            # `mean/sd*sqrt(n)` and `toNP` is `mean*n` -- so `toNP > 0` is redundant against
+            # `t > 0` and is kept only because the pre-registration states both. The one
+            # case where they part is zero dispersion: every week identical and positive is
+            # a sum that passes and a `t` that is not a test at all, and that must fail.
+            # ⚑ `weeks` is not decoration: the alignment guard now lives in
+            # `region_verdict` too, so a stub leg without weeks cannot be scored.
+            leg = lambda a: {"bps": np.array(a, dtype=np.float64),  # noqa: E731
+                             "weeks": [{"friday": f"w{k}"} for k in range(len(a))]}
+            assert pwfo.region_verdict({"x": leg([1.0, 2.0, -0.5, 4.0])})["passed"]
+            assert not pwfo.region_verdict({"x": leg([-1.0, -2.0, 0.5, -4.0])})["passed"]
+            flat_up = pwfo.region_verdict({"x": leg([2.0, 2.0, 2.0, 2.0])})
+            assert flat_up["toNP"] > 0.0 and flat_up["t"] == 0.0
+            assert not flat_up["passed"], "zero dispersion is not a positive t"
+            # And the blend is weighted before it is scored, not after.
+            two = {"a": leg([4.0, 4.0, 4.0, -1.0]), "b": leg([0.0, 0.0, 0.0, 0.0])}
+            assert abs(pwfo.region_verdict(two)["toNP"] - 5.5) < 1e-12
+            assert abs(pwfo.region_verdict(two, {"a": 1.0, "b": 0.0})["toNP"] - 11.0) < 1e-12
+            # ⚑ And the verdict refuses a misaligned pair, not just the report. Unit 10's
+            # review found the guard on the printed table and absent from the number the
+            # pre-registration is judged by, which is the wrong way round.
+            skew = {"a": leg([1.0, 1.0]), "b": {"bps": np.array([1.0, 1.0]),
+                    "weeks": [{"friday": "z0"}, {"friday": "z1"}]}}
+            for fn in (pwfo.region_verdict, pwfo.region_report):
+                try:
+                    fn(skew)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"{fn.__name__} blended two different sets of weeks")
+
+            # The pre-tail door is unchanged and still cannot see any of it.
+            flat = pwfo.run_region(tmp, (10, 1.0, 1.5))
+            assert len(flat["weeks"]) == len(pre)
+            assert {w["friday"] for w in flat["weeks"]}.isdisjoint(
+                {w["friday"] for w in r["weeks"]})
+            try:
+                pwfo.region_report({"tail": r, "pre": flat})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a blend across two different sets of weeks was accepted")
+
+        # ⚑ A run that withheld nothing writes no `pwfo_tail.npy` at all -- which is what
+        # QQQ's first, pre-tail-only run did. The door has to say so, not die on a missing
+        # file: without the guard this is a `FileNotFoundError` from three frames down.
+        pwfo.TAIL_START = np.datetime64(str(wins[-1].friday)) + np.timedelta64(365, "D")
+        with tempfile.TemporaryDirectory() as tmp:
+            pwfo.run(bars, matrix, wins, tmp)
+            assert not (Path(tmp) / "pwfo_tail.npy").exists()
+            try:
+                pwfo.load_tail_oos(tmp)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("an empty withheld set came back as a table")
+    finally:
+        pwfo.TAIL_START = real_start
+    print(f"    ({len(withheld)} withheld rows by name out of {len(tail_names)} tail "
+          f"columns; {len(pre)} pre-tail still unreachable)", end="")
+
+
+def test_unit10_the_reported_columns_are_numbers_not_labels() -> None:
+    """`_bps_row`'s seven columns and `sym_dir`'s mapping, against hand computation.
+
+    ⚑ Unit 10's review found six of the seven columns asserted by nothing: the suite checked
+    the cumulative figure and took `sd`, `Sharpe`, `t` and the half-split on trust, so
+    `sqrt(52)` -> `sqrt(252)`, `ddof=1` -> `ddof=0`, `sqrt(n)` -> `n` and `//2` -> `//3` all
+    survived. The printed `t` sits beside the pre-registered `t` in the same output and
+    nothing cross-checked them, so that equality is pinned here too.
+
+    `sym_dir` had no test at all, and the mutant that ignores its argument sends QQQ's PWFO
+    into `pwfo/` -- overwriting the withheld table the whole project rests on.
+    """
+    r = np.array([3.0, -1.0, 4.0, -1.0, 5.0, -9.0], dtype=np.float64)
+    row = pwfo._bps_row("lbl", r).split()
+    sd = float(r.std(ddof=1))
+    want = [f"{r.sum() / 100:.1f}%", f"{r.mean():.2f}", f"{sd:.2f}",
+            f"{r.mean() / sd * math.sqrt(52):.2f}",
+            f"{r.mean() / sd * math.sqrt(r.size):.2f}",
+            f"{r[:3].sum() / 100:.1f}%", f"{r[3:].sum() / 100:.1f}%"]
+    assert row[0] == "lbl" and row[1:] == want, (row, want)
+    # A one-week series has no dispersion to divide by and must not raise.
+    assert pwfo._bps_row("one", np.array([2.0])).split()[3] == "0.00"
+
+    leg = {"bps": r, "region": pwfo.REGION, "combos": 1620,
+           "agg": {k: 0.0 for _, k in pwfo.R63},
+           "weeks": [{"friday": f"d{k}", "oos_start": f"2020-01-0{k}", "oos_end": "2020-01-31"}
+                     for k in range(r.size)]}
+    printed = pwfo.region_report({"x": leg}).splitlines()
+    # The bps block, not the header -- both name the leg and only one carries numbers.
+    body = printed[next(i for i, ln in enumerate(printed) if "net on notional" in ln):]
+    blend = next(ln for ln in body if ln.split()[:1] == ["x"])
+    assert float(blend.split()[5]) == float(f"{r.mean() / sd * math.sqrt(r.size):.2f}")
+    # The report's t and the verdict's t are computed in two places and must agree.
+    assert abs(pwfo.region_verdict({"x": leg})["t"] - r.mean() / sd * math.sqrt(r.size)) < 1e-12
+
+    # The header describes the leg, not the module constant: a report run on any other
+    # region printed the frozen one and misdescribed itself (Unit 10 review, finding 11).
+    head = pwfo.region_report({"y": dict(leg, region=(14, 1.0, 2.5), combos=7)}).splitlines()[1]
+    assert "n >= 14" in head and "[1.0, 2.5]" in head and "7/4312" in head, head
+    assert "n >= 5" not in head and str(pwfo.REGION[2]) not in head, head
+
+    # Legs of unequal length align on the common prefix -- the *shorter*, not the longer.
+    short = dict(leg, bps=r[:3], weeks=leg["weeks"][:3])
+    assert pwfo.region_verdict({"x": leg, "y": short})["weeks"] == 3
+    assert abs(pwfo.region_verdict({"x": leg, "y": short})["toNP"] - float(r[:3].sum())) < 1e-12
+
+    assert pwfo.sym_dir("SPY") == pwfo.OUT_DIR, "SPY's directory is the one Units 7-9 wrote"
+    for sym in ("QQQ", "IWM"):
+        got = pwfo.sym_dir(sym)
+        assert got != pwfo.OUT_DIR and got.name == f"{pwfo.OUT_DIR.name}_{sym.lower()}"
+        assert got.parent == pwfo.OUT_DIR.parent
+    assert pwfo.sym_dir("QQQ", "/tmp/x").name == "x_qqq"
+    for bad in ("../evil", "a/b", "C:/abs"):
+        try:
+            pwfo.sym_dir(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"sym_dir({bad!r}) escaped its parent")
+    print(f"    (7 bps columns hand-checked; sym_dir SPY->{pwfo.sym_dir('SPY').name}, "
+          f"QQQ->{pwfo.sym_dir('QQQ').name})", end="")
+
+
+def test_unit10_the_tail_preflight_refuses_before_it_reads() -> None:
+    """`tail_windows` and `load_tail_oos`'s guards -- the code on the irreversible path.
+
+    ⚑ Unit 10's review deleted each of `load_tail_oos`'s three integrity guards in turn and
+    the suite passed every time: no test planted a nan in a tail table, a wrong-shaped one,
+    or an out-of-order tail index. The one function that reads the holdout had its column
+    lookup covered and nothing else.
+
+    `tail_windows` exists because of the ordering defect the same review found: the arm read
+    both holdout tables and only *then* discovered a leg had none, spending the withheld set
+    and recording nothing. Everything abortable has to be reachable from the index alone, so
+    each refusal here is checked with the `.npy` files present and readable.
+    """
+    bars = _synth_bars("2016-01-04", "2016-05-31")
+    matrix = rmv.rmv_all_n(bars.close)
+    wins = pwfo.windows(bars)
+    real_start = pwfo.TAIL_START
+    pwfo.TAIL_START = np.datetime64(str(wins[-5].friday)) + np.timedelta64(7, "D")
+    try:
+        with tempfile.TemporaryDirectory() as root:
+            a, b = Path(root) / "a", Path(root) / "b"
+            for d in (a, b):
+                pwfo.run(bars, matrix, wins, d)
+            fr = pwfo.tail_windows({"A": a, "B": b})
+            assert fr == [w["friday"] for w in json.loads(
+                (a / "pwfo_index.json").read_text(encoding="utf-8"))["windows"]
+                if w["file"] == "tail"]
+            assert len(fr) == 5 and fr == sorted(fr)
+
+            def refuses(why, mutate, where=b):
+                keep = (where / "pwfo_index.json").read_text(encoding="utf-8")
+                book = json.loads(keep)
+                mutate(book)
+                (where / "pwfo_index.json").write_text(json.dumps(book), encoding="utf-8")
+                try:
+                    pwfo.tail_windows({"A": a, "B": b})
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"tail_windows accepted {why}")
+                finally:
+                    (where / "pwfo_index.json").write_text(keep, encoding="utf-8")
+
+            def drop_one(book):
+                for w in book["windows"]:
+                    if w["file"] == "tail":
+                        w["file"] = "is"
+                        return
+            refuses("legs withholding different weeks", drop_one)
+            # ⚑ On its own, not only against a disagreeing sibling: with one leg there is
+            # nothing to disagree with and an empty tail would come back as a valid answer.
+            solo = json.loads((b / "pwfo_index.json").read_text(encoding="utf-8"))
+            keep_b = (b / "pwfo_index.json").read_text(encoding="utf-8")
+            for w in solo["windows"]:
+                w["file"] = "is"
+            (b / "pwfo_index.json").write_text(json.dumps(solo), encoding="utf-8")
+            try:
+                pwfo.tail_windows({"B": b})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a lone leg withholding nothing was accepted")
+            (b / "pwfo_index.json").write_text(keep_b, encoding="utf-8")
+            refuses("a leg withholding nothing",
+                    lambda bk: [w.update(file="is") for w in bk["windows"]])
+
+            def shift(book):
+                for w in book["windows"]:
+                    if w["file"] == "tail":
+                        w["friday"] = "1999-01-01"
+            refuses("legs whose withheld Fridays disagree", shift)
+            try:
+                pwfo.tail_windows({"A": a, "MISSING": Path(root) / "nope"})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("tail_windows accepted a directory with no tables")
+            # An index that promises withheld rows with no table behind them.
+            (b / "pwfo_tail.npy").rename(b / "stash.npy")
+            try:
+                pwfo.tail_windows({"A": a, "B": b})
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("tail_windows accepted an index with no tail table")
+            (b / "stash.npy").rename(b / "pwfo_tail.npy")
+
+            # `load_tail_oos`' own three guards, each with everything else intact.
+            good = pwfo.load_tail_oos(a)[0]
+            path = a / "pwfo_index.json"
+            keep = path.read_text(encoding="utf-8")
+            book = json.loads(keep)
+            book["windows"] = [w for w in book["windows"] if w["file"] != "tail"] + [
+                dict(w, row=9) for w in book["windows"] if w["file"] == "tail"]
+            path.write_text(json.dumps(book), encoding="utf-8")
+            for why in ("tail rows out of order",):
+                try:
+                    pwfo.load_tail_oos(a)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f"load_tail_oos accepted {why}")
+            path.write_text(keep, encoding="utf-8")
+
+            book = json.loads(keep)
+            book["n_combos"] = 7
+            path.write_text(json.dumps(book), encoding="utf-8")
+            try:
+                pwfo.load_tail_oos(a)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("load_tail_oos accepted a table of the wrong shape")
+            path.write_text(keep, encoding="utf-8")
+
+            poisoned = np.load(a / "pwfo_tail.npy")
+            poisoned[0, 0, rmv.OOS_COLS.start] = np.nan
+            np.save(a / "pwfo_tail.npy", poisoned)
+            try:
+                pwfo.load_tail_oos(a)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("load_tail_oos returned a tail holding nan")
+            assert not np.isnan(good).any(), "the unpoisoned read was already nan"
+    finally:
+        pwfo.TAIL_START = real_start
+
+    # ⚑ A region look appends. The nine filters stay idempotent; the holdout does not, so a
+    # corrective re-run after a code change is visible in the ledger instead of free.
+    with tempfile.TemporaryDirectory() as tmp:
+        c = Path(tmp) / "comparisons.json"
+        assert pwfo.count_look("f", path=c) == 1 and pwfo.count_look("f", path=c) == 1
+        assert pwfo.count_look("t", kind="region", path=c, unique=True) == 2
+        assert pwfo.count_look("t", kind="region", path=c, unique=True) == 3
+        assert pwfo.count_look("t", kind="region", path=c, unique=True) == 4
+        book = json.loads(c.read_text(encoding="utf-8"))["looks"]
+        assert sorted(book) == ["f", "t#0", "t#1", "t#2"], sorted(book)
+        assert all(book[k]["kind"] == "region" for k in book if k != "f")
+    print(f"    ({len(fr)} withheld Fridays agreed; 6 preflight refusals, 3 load guards, "
+          f"region looks append)", end="")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

@@ -242,7 +242,12 @@ Why this shape:
   Costs one extra `open_memmap`. `pwfo_tail` implements §3-Unit 9's withheld period the same way.
 - ⚑ Store filter-relevant columns **column-major** (`[cols, windows, combos]`), or have Unit 8
   hoist its ~8 needed columns into RAM once. A row-major scan reads each metric with a
-  96-byte stride — ~16× read amplification at Unit 10's ~2000 filters.
+  96-byte stride — ~16× read amplification at Unit 10's then-planned ~2000 filters.
+  ⚑ Moot: that search was cancelled, and Unit 10's `run_region` hoists **zero** IS columns.
+  ⚠ With an empty name list `load_tables` checks no *column name* — `missing` is vacuously
+  empty and the nan guard runs on a zero-width array. The structural claim (no IS metric
+  reaches the region path) is real and is pinned by nan-filling `pwfo_is.npy`; the
+  bookkeeping claim is not. Unit 10 review, finding 13.
 
 ### 2.2 Persistence
 
@@ -1126,7 +1131,7 @@ the two zero cases distinctly.
 
 ### Unit 9 — Significance, costs, report ✅ **shipped — the gate fails 3 of 3**
 
-**Shipped** in `pwfo.py`: `count_look()` and the committed `comparisons.json`; `_moments()`,
+**Shipped** in `pwfo.py`: `count_look()` and `comparisons.json` (⚑ described as committed here and in `count_look`'s docstring, but only actually committed in Unit 10 — see that unit's review); `_moments()`,
 `_ktau()`, `_lin_r2()` and SPEC §6.3's eleven remaining columns folded into `aggregate()`;
 `bootstrap()`, `null_moments()`, `significance()`; `shuffled_oos()`, `displace()`;
 `spy_weekly()`, `R63`, `gate()`, `report()`. `python pwfo.py report` writes the deliverable
@@ -1399,7 +1404,82 @@ threshold *before* committing to Units 10–13.
 
 ---
 
-### Unit 10 — Region portfolio, not filter search — ⚑ **rewritten after diagnosis; the filter search is cancelled. Not built.**
+### Unit 10 — Region portfolio, not filter search ✅ **shipped — the region reproduces; the tail is still shut**
+
+**Shipped** in `pwfo.py`: `REGION`, `sym_dir()`, `window_notional()`, `region_mask()`,
+`region_weeks()`, `run_region()`, `_align()`, `_bps_row()`, `region_report()`,
+`load_tail_oos()`, `tail_windows()`, `region_verdict()`, `count_look(unique=)`, and three CLI
+arms — `python pwfo.py region` prints the deliverable off the stored pre-tail tables,
+`python pwfo.py <SYM>` runs the PWFO for a second symbol into `pwfo_<sym>/`, and
+`python pwfo.py tail` is the pre-registered one-shot.
+**116/116 tests**, `ruff check .` clean, **34 of 34 mutations killed**, 5 tests added.
+`pwfo_qqq/` holds QQQ's 525 pre-tail windows on the same 525 Fridays as SPY's, byte-for-byte
+window alignment asserted. The withheld tail was not opened — sha256 `629122d198949afd…`
+unchanged, and `UNIT9_REPORT.txt` still reproduces byte-identically.
+
+**Both done-when conditions are met.** Off `pwfo/pwfo_oos.npy` through the shipped path:
+
+| | combos | weeks | gross $ | net $ | t | Sharpe |
+|---|---|---|---|---|---|---|
+| `run_region()`, SPY | 1620 | 525 | 175.36 | **124.29** | **2.3865** | 0.75 |
+| the diagnosis scratch script | 1620 | 525 | 175.36 | 124.29 | 2.39 | 0.75 |
+
+QQQ, the same 1620 combos and the same 525 weeks, never refit: gross 192.43, **net 147.69,
+t = 2.65**.
+
+⚑ **The bps figures moved by ~2%, and the shipped ones are the right ones.** The diagnosis
+sized each week on the mean close of *that OOS week*; `window_notional` recovers the price
+level from the stored `cost`, which `window_cost` charged at the **31-day IS mean close** —
+stale by construction and in the direction that cannot leak. ⚑ It is *not* the Friday close a
+live position would be sized on: over the 525 pre-tail SPY windows `(IS mean − Friday close) /
+close` runs **−9.99% to +26.03%**, median −1.04%, so individual weeks move by up to 44 bps and
+the largest errors sit in exactly the high-vol weeks the anti-goal says carry the payoff.
+Immaterial to the statistic — blended `t` is **2.7726** on the IS mean against **2.7744** on the
+Friday close, sum 3834 against 3913 bps — so this is a labelling correction, not a numbers one.
+Everything scale-free is unchanged.
+
+| | sum bps | bps/wk | sd | Sharpe | t | h1 | h2 |
+|---|---|---|---|---|---|---|---|
+| SPY | 30.3% | 5.76 | 55.13 | 0.75 | 2.40 | 10.8% | 19.5% |
+| QQQ | 46.4% | 8.84 | 71.99 | 0.89 | 2.81 | 16.7% | 29.7% |
+| **50/50** | **38.3%** | 7.30 | 60.36 | **0.87** | **2.77** | 13.7% | 24.6% |
+
+Leg correlation +0.800; max drawdown −8.3% of notional; worst week −2.10%; 49.3% of weeks
+positive; **four** negative years of eleven — 2016 −1.2%, **2017 −0.2%**, 2019 −3.5%, and a
+−1.9% stub 2026. ⚑ "sum bps" is the **arithmetic** sum of weekly bps, not a compounded
+return: compounding the same 525 weeks gives 45.3% against 38.3%, and −8.04% drawdown against
+−8.33%. Understating is the conservative direction and the whole report is internally
+consistent in arithmetic space, but the number is a sum, not a return.
+
+- ⚑ **`run_region` hoists zero IS columns.** `load_tables([])` still runs the shape check at
+  the file boundary and returns an empty `cols`, so "the selection step
+  is gone" is a signature rather than a claim — pinned by a test that fills `pwfo_is.npy`
+  with nan and requires the aggregate not to move. Hoisting even `nT` fails it.
+- ⚑ **Equal weight is the *mean* of the six OOS columns**, not the sum: holding 1/M of each
+  combo makes net, trade count, winners, largest loser and drawdown all average. `LLTr` and
+  `eqDD` therefore read portfolio-weighted, not worst-leg, and `aggregate` inherits that.
+  `selected` is true on every window by construction — no screens, so SPEC §6.4's case 1
+  cannot arise and `n_sel == n`; case 2 still can.
+- ⚑ **`Prob` is absent from `region_report` and that is the point.** SPEC §6.5's `K`
+  multiplier corrects for hypotheses examined; the pre-registered claim contains no
+  selection to correct for. `comparisons.json` is untouched at **K = 13**.
+- **The region is a cube, checked over all 4312 combos.** `n >= 5` and each of `vup`, `vdn`
+  in [0.75, 2.75] *separately* — 20 N × 9 × 9 = 1620. All three bounds inclusive, pinned in
+  both directions; a band-around-the-diagonal reading would drop the corners.
+- **QQQ's cache stopped at 2026-02-27, one day before `TAIL_START`**, so its first run
+  withheld 0 windows and wrote no `pwfo_tail.npy` — the diagnosis fetched QQQ pre-tail only.
+  ⚑ **Writing a tail table is not opening one.** Unit 7 wrote SPY's and the project has
+  treated the tail as shut for three units; the `__main__` arm prints the withheld *count*
+  and reads `xmult` and `cost` off `pre` alone. QQQ was therefore refreshed through the tail
+  and re-run full-range on the same footing as SPY. The opening is the *read*, below.
+- PLAN §5 pinned "multi-asset abstraction" at *a second symbol is actually traded*. It is,
+  and the whole of the abstraction is `sys.argv[1]` and `sym_dir`. `pwfo_*/` is gitignored.
+
+**Still open, and it is the only thing left in this unit:** the withheld tail, against the
+pre-registration below, exactly once. Not run. It needs QQQ bars fetched through
+2026-08-31, a QQQ PWFO over the full range, and `run_region` pointed at both tail tables —
+and every one of those steps reads data no measurement above has seen.
+
 
 Rev 1 of this unit was a bounded filter search, unblocked by Unit 9's failed gate and flagged
 as the unit most likely to manufacture a false positive. **It is cancelled.** Diagnosis
@@ -1507,11 +1587,14 @@ The SPY-derived region, unchanged, on seven other symbols over the same 525 week
 
 #### What this unit builds instead
 
-**Do** Freeze the region as a *static prior*, trade it as an equal-weight portfolio, and run
-the existing PWFO machinery with the selection step removed. No search, no generated filter
+**Do** ✅ Freeze the region as a *static prior*, trade it as an equal-weight portfolio, and
+run the existing PWFO machinery with the selection step removed. No search, no generated filter
 space, no addition to `K` beyond the pre-registration below.
 
-Measured shape of the deliverable, 50/50 SPY+QQQ, sized in bps of notional:
+⚑ **Superseded — the diagnosis figures, kept for the record.** These size each week on the
+mean close of *that OOS week*; the shipped `window_notional` uses the IS mean, which is the
+non-leaking direction, and the shipped table above is the one to cite. Differences are ~2% on
+the level and nil on everything scale-free.
 
 | | cum ret | bps/wk | sd | Sharpe | t | h1 | h2 |
 |---|---|---|---|---|---|---|---|
@@ -1520,7 +1603,7 @@ Measured shape of the deliverable, 50/50 SPY+QQQ, sized in bps of notional:
 | **50/50** | **39.2%** | 7.46 | 61.71 | **0.87** | **2.77** | 13.5% | 25.7% |
 
 Leg correlation 0.80; max drawdown −8.7% of notional; worst week −2.31%; two losing years in
-eleven. Intraday only, so overnight risk is zero and Reg-T day-trading leverage applies to the
+eleven. (Shipped: +0.800, −8.3%, −2.10%, **four** losing years.) Intraday only, so overnight risk is zero and Reg-T day-trading leverage applies to the
 whole of it.
 
 ⚑ **Pre-register this, verbatim, before running anything against the tail:**
@@ -1532,9 +1615,83 @@ whole of it.
 
 One hypothesis, one direction, one number. Add **exactly one** entry to `comparisons.json`.
 
-**Done when** the region portfolio reproduces the +124.29 / t = 2.39 SPY figure from the
-stored `pwfo/` tables through the shipped code path rather than through a scratch script, and
-a QQQ PWFO run exists alongside SPY's.
+**Done when** ✅ **both met.** `run_region()` returns net 124.29 at t = 2.3865 off the stored
+`pwfo/` tables through the shipped code path, and `pwfo_qqq/` holds QQQ's 525 windows on
+the same Fridays.
+
+#### Adversarial review (PLAN §4) — 22 findings, 10 fixed, 8 deferred, 0 rejected
+
+⚑ **Four findings blocked the one-shot and are fixed.** None was an arithmetic error; all
+four were about the *arm* rather than the numbers, which is exactly the class a unit-level
+test does not catch:
+
+1. **The holdout was read before the look was recorded.** The arm loaded both tail tables and
+   only then discovered a leg had none — demonstrated on synthetic dirs: both tables opened,
+   `ValueError` raised, `count_look` never reached, `comparisons.json` still at 13. An
+   unrecorded spend. Fixed: `tail_windows()` validates both legs from `pwfo_index.json`
+   **only** — present, non-empty, table on disk, identical Friday lists — and `count_look`
+   runs before the first `load_tail_oos`.
+2. **The verdict printed last.** Any raise inside the §6.3 formatter after `count_look` left
+   the holdout spent, `K` incremented, and nothing on stdout. Fixed: the pre-registered
+   `toNP`/`t`/PASS-FAIL line prints first, the table second.
+3. **`count_look` is idempotent by key**, so a fix-and-rerun of the tail was free — measured
+   14/14/14 over three calls. Idempotence is right for nine deterministic filters and wrong
+   for a holdout that can be looked at once. Fixed: `unique=True` appends `#0`, `#1`, … so a
+   second read is visible in the ledger. Unit 10's tail arm is the only caller.
+4. **`comparisons.json` was never committed**, while `count_look`'s docstring and §3 Unit 9
+   both claimed it was. A `git clean` would have reset `K` to 1 with no error. Fixed by
+   committing it; both claims corrected.
+
+Six more fixed in the same pass: the alignment guard moved into `region_verdict` (it guarded
+the printed table and not the number the pre-registration is judged by — two legs a year
+apart blended silently to `passed: True`); the report header now describes each leg's own
+region instead of printing the frozen `REGION` regardless; `sym_dir` gained a test (the mutant
+that ignores its argument sends QQQ's PWFO into `pwfo/` and destroys the sealed table);
+the regeneration arm now **refuses to overwrite an existing `pwfo_tail.npy`** without
+`--force`, because a warning in a handoff note is not a guard; the CLI dispatches on exact
+`argv[1]` (`"tail" in sys.argv` fired on `python pwfo.py SPY tail`, and arm precedence made
+`python pwfo.py tail report` silently run the *report*); and the full §6.3 block on the
+holdout now sits behind `--full`, since it is ~70 numbers where one was pre-registered and it
+is precisely the seed for hypothesis #2.
+
+⚑ **The review's mutation pass was the useful half.** My own 17 mutants all died; the
+reviewer's found **nine survivors** in surface I had not probed — all three of
+`load_tail_oos`'s integrity guards (nan, shape, row order) deletable with the suite green,
+`sym_dir` untested entirely, and four of `_bps_row`'s seven columns free to change
+(`sqrt(52)`→`sqrt(252)`, `sqrt(n)`→`n`, `ddof=1`→`0`, `//2`→`//3`) — including the printed
+`t` that sits beside the verdict's `t` with nothing cross-checking them. **Now 34 of 34.**
+
+**Deferred, recorded not fixed:**
+
+- **`LLTr` no longer denotes a trade.** Under equal weight the weekly `ollt` is the mean over
+  1620 combos of each combo's largest loser, so §6.3 col O (SPY −14.18) is not a loss any leg
+  took. `odd` is the same and is inert. The rest of §6.3 survives cleanly: `toGP` is exact by
+  linearity, and `aoTr`, `ao#T`, `%Wtr`, `oW|oL` stay meaningful as ratios of sums.
+- **Col G (`n_trd`) is structurally 525.** `ont` is a mean over 1620 combos and is zero only
+  if every one is silent; measured minimum 0.206 (SPY). SPEC §6.4's case 2 is unreachable at
+  M = 1620 while remaining correct in principle.
+- **Modelled cost is an upper bound, in the result's favour.** The portfolio charges
+  `cost · mean(ont)`, i.e. as if all 1620 fractional legs fill independently; a real
+  implementation nets them into one order and pays the spread on the net change only. Gross
+  is exact. Same direction for the denominator: a 1/M-per-combo book has gross exposure
+  ≤ 1 share, so `window_notional` over-states capital deployed.
+- **The pre-tail path names its OOS columns from `rmv`, positionally**, while the tail door
+  looks them up by name from the index — the opposite of `load_tables`' own stated contract.
+  Inherited from Unit 8's `evaluate`; no live failure while one `run` writes both files.
+- **`_align` accepts a common *prefix* only.** A leg whose cache *starts* later is a
+  legitimately blendable pair it refuses. Intersect on Friday if that ever arises.
+- **`window_notional` re-derives a price level from current module constants against a stored
+  cost.** Numerically exact today (max relative error 4.4e-08 over all 525 real costs), but
+  `pwfo_index.json` stores `cost` without `SLIP`/`SEC_TAF_PER_DOLLAR`, so the day SPEC §3.2's
+  acknowledged-broken fee model is fixed, every stored table's bps silently rescales. Stamping
+  the constants into the index would require regenerating `pwfo/` — which destroys the sealed
+  tail — so it waits for the next full run.
+- **The withheld period's price level has been on disk since Unit 7.** `pwfo_index.json`
+  carries all 26 tail windows' `xmult` and `cost`, and `window_notional` now turns the second
+  into a 2026-03..08 mean close in one line. Nothing has printed them and the hypothesis does
+  not depend on price level, but "the tail is sealed" means the `.npy`, not the index.
+- **`--force` and `--full` are the only flags**, parsed by membership. A third would want a
+  real parser, which PLAN §5 pins at "a third caller appears".
 
 ⚑ **The withheld tail is still unopened and is now the only clean test the project has.**
 Every number in this unit was measured on data Unit 9 already read, and the region was chosen
@@ -1545,8 +1702,9 @@ freezing, exactly as Rev 1 specified.
 **Anti-goal** Do not re-derive the region from the tail, and do not widen the search when the
 tail disappoints. Do not add money management to rescue a result: sizing reshapes a
 distribution, it cannot create edge, and naive vol-targeting would actively hurt here — the
-payoff is long-volatility (skew +1.99; 2018 +13.7% and 2022 +13.0% against 2017 +0.1%, 2019
-−3.3%), so scaling down into vol cuts exactly the profitable weeks.
+payoff is long-volatility (skew +1.99; **2018 +13.6% and 2022 +12.5% against 2017 −0.2%,
+2019 −3.5%** — shipped figures; the diagnosis had +13.7/+13.0 against +0.1/−3.3, and 2017's
+sign was the wrong way round), so scaling down into vol cuts exactly the profitable weeks.
 
 **Deferred, pre-registered, not built:** a trailing-realized-vol *state* filter. Weekly net by
 trailing-vol quintile runs **−3.3, +2.5, +6.3, +12.2, +11.2 bps**, monotone; skipping the

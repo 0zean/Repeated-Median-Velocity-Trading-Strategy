@@ -1,0 +1,58 @@
+{
+ "looks": {
+  "CL2": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL2 r": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL2 r |mLTr|": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL2 |mLTr|": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL4": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL4 r": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL4 r |mLTr|": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "CL4 |mLTr|": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "meyers2005": {
+   "first": "2026-09-08",
+   "kind": "filter"
+  },
+  "unit3-tail-second-moment": {
+   "first": "2026-09-05",
+   "kind": "tail",
+   "note": "PLAN Unit 3: second-moment calibration read bars inside the withheld span"
+  },
+  "unit5-review-tail-probe": {
+   "first": "2026-09-06",
+   "kind": "tail",
+   "note": "PLAN Unit 5 review: per-combo trades and a filter selection over 2 windows"
+  },
+  "unit9-displaced-alignment-k+50": {
+   "first": "2026-09-09",
+   "kind": "falsification"
+  },
+  "unit9-shuffled-oos-falsification": {
+   "first": "2026-09-09",
+   "kind": "falsification"
+  }
+ }
+}

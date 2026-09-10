@@ -642,10 +642,12 @@ def aggregate(weeks: list[dict]) -> dict:
 COUNTER = Path(__file__).parent / "comparisons.json"
 
 
-def count_look(keys, kind: str = "filter", path: Path | str = COUNTER) -> int:
+def count_look(keys, kind: str = "filter", path: Path | str = COUNTER,
+               unique: bool = False) -> int:
     """Record OOS-touching looks; return `K`, SPEC §6.5 step 4's multiplier.
 
-    The file is the record, not this function: `comparisons.json` is committed and already
+    The file is the record, not this function: `comparisons.json` is committed (⚑ it was not,
+    until Unit 10's review caught the claim) and already
     holds Unit 8's nine filter variants and the two accidental reads of the withheld tail
     that PLAN §3 Unit 9 names. Nothing on disk could have reconstructed those -- `K` is a
     fact about what was *examined*, and no artifact carries it -- so they are data, seeded
@@ -658,11 +660,21 @@ def count_look(keys, kind: str = "filter", path: Path | str = COUNTER) -> int:
     function of how many times someone ran the script. Re-running is idempotent here; a
     new filter, a new ambiguity reading or a new A/B is not, which is the property PLAN
     actually wants and the one "it's a 35-second run" threatens.
+
+    ⚑ `unique=True` inverts that, and Unit 10's tail arm is the only caller. Idempotence is
+    right for a deterministic re-evaluation of the same nine filters; it is **wrong** for the
+    withheld set, where a second run after a code change is a genuinely new look at data that
+    can only be looked at once. Keys suffixed `#0`, `#1`, ... so the ledger shows a re-read
+    happened instead of silently absorbing it. Unit 10's review found the idempotent version
+    would have made a corrective re-run free.
     """
     path = Path(path)
     book = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"looks": {}}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     for k in ([keys] if isinstance(keys, str) else keys):
+        if unique:
+            k = next(f"{k}#{i}" for i in range(len(book["looks"]) + 1)
+                     if f"{k}#{i}" not in book["looks"])
         book["looks"].setdefault(k, {"kind": kind, "first": now})
     path.write_text(json.dumps(book, indent=1, sort_keys=True), encoding="utf-8")
     return len(book["looks"])
@@ -999,7 +1011,279 @@ def report(res: dict, oos: np.ndarray, wins: list[dict], spy: np.ndarray,
     return "\n".join(L)
 
 
-if __name__ == "__main__" and "report" in sys.argv:
+# ------------------------------------------- Region portfolio (PLAN §3 Unit 10)
+
+# ⚑ The frozen static prior: `n >= 5` with `vup` and `vdn` both in [0.75, 2.75], 1620 of
+# the 4312 combos. Not a search result and not refit -- read off SPY's own pre-tail OOS
+# marginals during the 2026-09-09 diagnosis, which is a contamination the withheld tail
+# exists to answer and not one the breadth of the region argues away (PLAN §3 Unit 10).
+# A constant, so widening it is a visible edit rather than an argument.
+REGION = (5, 0.75, 2.75)
+
+
+def sym_dir(symbol: str, out_dir: Path | str = OUT_DIR) -> Path:
+    """Where one symbol's PWFO tables live. SPY keeps `pwfo/`; every other is suffixed.
+
+    SPY's directory stays unsuffixed because it is the one Units 7-9 already wrote, and
+    renaming it would invalidate `pwfo_tail.npy`'s recorded sha256 for no gain.
+    """
+    out_dir = Path(out_dir)
+    return out_dir if symbol == "SPY" else out_dir.with_name(f"{out_dir.name}_{symbol.lower()}")
+
+
+def window_notional(cost: float) -> float:
+    """The IS price level `window_cost` charged against, recovered from the stored `cost`.
+
+    Exact inverse of `window_cost`, so a per-share result becomes bps of notional off the
+    index alone with no second pass over the bars. The IS mean is a week stale against the
+    OOS week it sizes -- which is the direction that cannot leak, and is what a live
+    position sized on Friday's close would actually have to use.
+    """
+    return (cost - SLIP) / SEC_TAF_PER_DOLLAR
+
+
+def region_mask(n_min: int = REGION[0], v_lo: float = REGION[1],
+                v_hi: float = REGION[2]) -> np.ndarray:
+    """`bool[n_combos]` over SPEC §3.3's combo order: the combos inside a parameter region.
+
+    Built by asking `decode` rather than by re-deriving its `divmod`, so the mask cannot
+    drift from the mapping every other reader of the table uses. Both `v` bounds are
+    inclusive and are applied to `vup` and `vdn` separately, which keeps the region a cube
+    and not a band around the diagonal.
+    """
+    n, vup, vdn = np.array(
+        [decode(c) for c in range(rmv.N_VALUES.size * rmv.V_VALUES.size**2)]).T
+    return (n >= n_min) & (vup >= v_lo) & (vup <= v_hi) & (vdn >= v_lo) & (vdn <= v_hi)
+
+
+def region_weeks(oos: np.ndarray, wins: list[dict], mask: np.ndarray) -> list[dict]:
+    """Equal-weight the masked combos: one record per OOS window, shaped for `aggregate`.
+
+    Holding 1/M of every combo in the region makes each of the six OOS columns the mean
+    over the region: net, trade count, winners, largest loser and drawdown are all
+    extensive in position size, so the portfolio's column *is* the average column.
+
+    ⚑ `ollt` and `odd` therefore read as the portfolio-weighted largest losing trade and
+    drawdown, not the worst any single leg had, and `aggregate`'s `LLTr` inherits that.
+    ⚑ `selected` is true on every window by construction -- there are no screens, so SPEC
+    §6.4's case 1 cannot arise here and `n_sel == n`. Case 2, a selected week that fired no
+    signals, still can and still contributes its 0.
+    """
+    if not mask.any():
+        raise ValueError("the region selects no combos")
+    if oos.shape[1] != mask.size:
+        raise ValueError(f"mask is {mask.size} combos, the table holds {oos.shape[1]}")
+    names = rmv.METRIC_COLS[rmv.OOS_COLS]
+    avg = oos[:, mask].mean(axis=1, dtype=np.float64)
+    return [{"friday": w["friday"], "oos_start": w["oos_start"], "oos_end": w["oos_end"],
+             "xmult": w["xmult"], "cost": w["cost"], "selected": True,
+             **{nm: float(v) for nm, v in zip(names, row)}}
+            for w, row in zip(wins, avg)]
+
+
+def run_region(out_dir: Path | str = OUT_DIR, region: tuple = REGION,
+               tail: bool = False) -> dict:
+    """The region portfolio off one symbol's stored tables. `tail=True` ⚑ **opens the tail**.
+
+    ⚑ Hoists **zero** IS columns. `load_tables([])` still runs every shape and column-name
+    check at the file boundary, but the returned `cols` is empty -- there is no IS metric
+    in this path at all, which is the difference between Unit 8's filter and this unit and
+    is worth being structural rather than merely stated (PLAN §3 Unit 10).
+
+    `bps` is the weekly net on notional, the units the SPY+QQQ portfolio is combined in:
+    per-share dollars do not add across two symbols at different price levels.
+    """
+    if tail:
+        oos, wins = load_tail_oos(out_dir)
+    else:
+        _, oos, wins = load_tables([], out_dir)
+    mask = region_mask(*region)
+    weeks = region_weeks(oos, wins, mask)
+    return {"combos": int(mask.sum()), "region": tuple(region), "weeks": weeks,
+            "agg": aggregate(weeks),
+            "bps": np.array([1e4 * w["osnp"] / window_notional(w["cost"]) for w in weeks])}
+
+
+def _align(legs: dict[str, dict]) -> int:
+    """Common week count across legs, refusing legs that do not cover the same weeks.
+
+    ⚑ Truncating to the shortest leg is not alignment: week `k` of one leg has to *be* week
+    `k` of the other or the blend mixes two different weeks into one return, and a shuffled
+    portfolio has a perfectly plausible Sharpe. Shared by `region_report` and
+    `region_verdict` because Unit 10's review found the guard on the printed table and not
+    on the number the pre-registration is judged by — which is the wrong way round.
+
+    A common **prefix** is all this accepts; two caches that start on different Fridays are
+    a legitimate pair it will refuse. Recorded rather than solved (PLAN §3 Unit 10).
+    """
+    m = min(legs[nm]["bps"].size for nm in legs)
+    fridays = [[wk["friday"] for wk in legs[nm]["weeks"][:m]] for nm in legs]
+    if any(f != fridays[0] for f in fridays[1:]):
+        raise ValueError("legs do not cover the same weeks; the blend would mix them")
+    return m
+
+
+def _bps_row(label: str, r: np.ndarray) -> str:
+    """One weekly-bps series as a line: cumulative, per week, dispersion, both halves."""
+    sd = float(r.std(ddof=1)) if r.size > 1 else 0.0
+    sh = float(r.mean()) / sd if sd > 0.0 else 0.0
+    h = r.size // 2
+    return (f"  {label:<22}{r.sum() / 100:>9.1f}%{r.mean():>9.2f}{sd:>9.2f}"
+            f"{sh * math.sqrt(52):>9.2f}{sh * math.sqrt(r.size):>8.2f}"
+            f"{r[:h].sum() / 100:>9.1f}%{r[h:].sum() / 100:>9.1f}%")
+
+
+def region_report(legs: dict[str, dict], weights: dict[str, float] | None = None) -> str:
+    """PLAN §3 Unit 10's deliverable: SPEC §6.3 per leg, then the blended bps series.
+
+    `Prob` is absent, and that is the unit's point rather than an omission: SPEC §6.5's
+    multiplier corrects for the number of hypotheses examined, and the pre-registered claim
+    is one hypothesis with no selection inside it. Success is `toNP > 0` and `t > 0`.
+
+    The blend is equal-weight in *notional*, which is why the legs are combined in bps and
+    not in the per-share dollars each leg's own §6.3 table reports. Legs are truncated to
+    the shortest common history -- the symbols' caches do not end on the same Friday.
+    """
+    names = list(legs)
+    w = {n: 1.0 / len(names) for n in names} if weights is None else weights
+    if abs(sum(w[n] for n in names) - 1.0) > 1e-9:
+        raise ValueError(f"weights sum to {sum(w[n] for n in names)}, not 1")
+    # Before a line is formatted: a misaligned blend is not a table worth printing.
+    m = _align(legs)
+
+    # ⚑ Per leg, off the leg's own `region`. Printing the frozen `REGION` regardless of what
+    # was actually run made the report misdescribe itself under any other mask (Unit 10 review).
+    L = ["Region portfolio (PLAN §3 Unit 10) -- equal weight, no IS filter",
+         "  " + "; ".join(
+             f"{n} n >= {legs[n]['region'][0]}, v in [{legs[n]['region'][1]}, "
+             f"{legs[n]['region'][2]}], {legs[n]['combos']}/"
+             f"{rmv.N_VALUES.size * rmv.V_VALUES.size ** 2} combos, "
+             f"{len(legs[n]['weeks'])} weeks "
+             f"{legs[n]['weeks'][0]['oos_start']}..{legs[n]['weeks'][-1]['oos_end']}"
+             for n in names),
+         "",
+         "SPEC §6.3, per share, per leg",
+         " " * 12 + "".join(f"{n:>13}" for n in names)]
+    cell = lambda v: ("inf" if v == math.inf else  # noqa: E731
+                      f"{v + 0.0:.4f}" if abs(v) < 1000 else f"{v + 0.0:.1f}")
+    for col, key in R63:
+        if key == "Prob":
+            continue
+        L.append(f"{col} {key}".ljust(12)
+                 + "".join(f"{cell(legs[n]['agg'][key]):>13}" for n in names))
+
+    blend = sum(w[n] * legs[n]["bps"][:m] for n in names)
+    L += ["", f"net on notional, {m} common weeks",
+          f"  {'':<22}{'sum bps':>10}{'bps/wk':>9}{'sd':>9}{'Sharpe':>9}{'t':>8}"
+          f"{'h1':>10}{'h2':>10}"]
+    L += [_bps_row(n, legs[n]["bps"][:m]) for n in names]
+    if len(names) > 1:
+        L.append(_bps_row("/".join(f"{w[n]:.0%}" for n in names), blend))
+        c = np.corrcoef(np.array([legs[n]["bps"][:m] for n in names]))
+        L.append("  leg correlation " + ", ".join(
+            f"{names[i]}-{names[j]} {c[i, j]:+.3f}"
+            for i in range(len(names)) for j in range(i + 1, len(names))))
+    eq = np.cumsum(blend)
+    dd = eq - np.maximum.accumulate(eq)
+    L.append(f"  max drawdown {dd.min() / 100:.1f}% of notional; worst week "
+             f"{blend.min() / 100:.2f}%; weeks > 0 {(blend > 0).mean():.1%}")
+    yr = np.array([int(wk["oos_start"][:4]) for wk in legs[names[0]]["weeks"][:m]])
+    L += ["", "  net on notional by year",
+          "   " + "  ".join(f"{y}:{blend[yr == y].sum() / 100:+6.1f}%"
+                            for y in np.unique(yr))]
+    return "\n".join(L)
+
+
+def load_tail_oos(out_dir: Path | str = OUT_DIR):
+    """⚑ **Opens `pwfo_tail.npy`.** The withheld set's six OOS columns and its own windows.
+
+    A separate door from `load_tables` on purpose. `load_tables`' contract is that it
+    *cannot* reach the tail -- three units rest on that and it stays true -- so the one
+    read the project is allowed gets its own function, whose name says what it does and
+    which nothing else in this file calls. Every caller is a deliberate act.
+
+    The tail table carries all 24 metric columns where `pwfo_oos.npy` carries 6, so the six
+    are taken **by name** out of `tail_cols`. A positional slice would silently score `tnp`
+    and its IS siblings as OOS metrics -- the same defect `run`'s canary exists to catch,
+    at the only other boundary where it could happen.
+    """
+    out_dir = Path(out_dir)
+    index = json.loads((out_dir / "pwfo_index.json").read_text(encoding="utf-8"))
+    wins = [w for w in index["windows"] if w["file"] == "tail"]
+    if not wins:
+        raise ValueError(f"{out_dir} holds no withheld windows; the tail would be empty")
+    if [w["row"] for w in wins] != list(range(len(wins))):
+        raise ValueError("pwfo_index.json's tail rows are not 0..n-1 in order")
+    names = index["tail_cols"]
+    mm = np.load(out_dir / "pwfo_tail.npy", mmap_mode="r")
+    try:
+        want = (len(wins), index["n_combos"], len(names))
+        if mm.shape != want:
+            raise ValueError(f"pwfo_tail.npy is {mm.shape}, index says {want}")
+        oos = np.asarray(mm[:, :, [names.index(n) for n in index["oos_cols"]]])
+    finally:
+        mm._mmap.close()  # Unit 7's Windows handle leak, same cause and same fix
+    if np.isnan(oos).any():
+        raise ValueError("pwfo_tail.npy holds nan in an OOS column")
+    return oos, wins
+
+
+def tail_windows(dirs: dict[str, Path]) -> list[str]:
+    """The withheld Fridays every leg agrees on, read from `pwfo_index.json` **only**.
+
+    ⚑ Metadata, not data. This opens no `.npy` and is the pre-flight the tail arm runs
+    *before* it records the look and *before* it reads anything: Unit 10's review found the
+    arm loading both holdout tables and only then discovering a leg had none, which spends
+    the withheld set and records nothing. Every reason to abort has to be findable here.
+    """
+    seen = {}
+    for sym, d in dirs.items():
+        f = Path(d) / "pwfo_index.json"
+        if not f.exists():
+            raise ValueError(f"{sym}: no PWFO tables at {d}")
+        index = json.loads(f.read_text(encoding="utf-8"))
+        wins = [w for w in index["windows"] if w["file"] == "tail"]
+        if not wins:
+            raise ValueError(f"{sym}: {d} withheld nothing; there is no tail to open")
+        if not (Path(d) / "pwfo_tail.npy").exists():
+            raise ValueError(f"{sym}: index claims {len(wins)} withheld windows, no table")
+        seen[sym] = [w["friday"] for w in wins]
+    first = next(iter(seen.values()))
+    off = {sym: f for sym, f in seen.items() if f != first}
+    if len(off) and len(seen) > 1:
+        raise ValueError(f"legs withhold different weeks: { {k: len(v) for k, v in seen.items()} }")
+    return first
+
+
+def region_verdict(legs: dict[str, dict], weights: dict[str, float] | None = None) -> dict:
+    """PLAN §3 Unit 10's pre-registered success test, on the blended weekly series.
+
+    Two conditions, both stated before the tail was opened: `toNP > 0` after costs, and a
+    positive `t`. No `K` correction and no benchmark -- one hypothesis with no selection
+    inside it, and Unit 10 already recorded why "beat long-only SPY" is unreachable under
+    SPEC §2's flatten. In bps of notional, because that is the unit two legs blend in.
+    """
+    names = list(legs)
+    w = {n: 1.0 / len(names) for n in names} if weights is None else weights
+    m = _align(legs)
+    blend = sum(w[n] * legs[n]["bps"][:m] for n in names)
+    sd = float(blend.std(ddof=1)) if m > 1 else 0.0
+    t = float(blend.mean()) / sd * math.sqrt(m) if sd > 0.0 else 0.0
+    return {"weeks": m, "toNP": float(blend.sum()), "t": t,
+            "passed": bool(blend.sum() > 0.0 and t > 0.0)}
+
+
+# ⚑ Exact match on `argv[1]`, not membership in `argv`. `"tail" in sys.argv` fired on
+# `python pwfo.py SPY tail`, and arm precedence meant `python pwfo.py tail report` silently
+# ran the *report* and never opened the tail (Unit 10 review). A symbol named TAIL is also a
+# real ETF, so the subcommands are lowercase and symbols are not.
+_ARG = sys.argv[1] if len(sys.argv) > 1 else "SPY"
+_REST = [a for a in sys.argv[2:] if a not in ("--full", "--force")]
+if __name__ == "__main__" and _ARG in ("report", "region", "tail") and _REST:
+    raise SystemExit(f"`{_ARG}` takes no further arguments, got {_REST}")
+
+
+if __name__ == "__main__" and _ARG == "report":
     # PLAN §3 Unit 9's deliverable, off the stored tables. Does not touch `pwfo/`.
     _res = run_filters()
     _cols, _oos, _wins = load_tables(["nT"])
@@ -1010,19 +1294,75 @@ if __name__ == "__main__" and "report" in sys.argv:
     raise SystemExit(0)
 
 
+if __name__ == "__main__" and _ARG == "region":
+    # PLAN §3 Unit 10's deliverable, off the stored pre-tail tables. Touches no bars, no
+    # tail file and nothing under `pwfo*/`. Every symbol with a table on disk is a leg.
+    _legs = {s: run_region(sym_dir(s)) for s in ("SPY", "QQQ")
+             if (sym_dir(s) / "pwfo_index.json").exists()}
+    if not _legs:
+        raise SystemExit("no PWFO tables on disk; run `python pwfo.py SPY` first")
+    print(region_report(_legs))
+    raise SystemExit(0)
+
+
+if __name__ == "__main__" and _ARG == "tail":
+    # ⚑ PLAN §3 Unit 10's pre-registration, and the project's one clean measurement. This
+    # arm is the **only** caller of `load_tail_oos` and the only door to `pwfo_tail.npy`
+    # anywhere in the codebase. Running it spends the withheld set.
+    #
+    # The order below is the whole of Unit 10's review, and none of it is cosmetic:
+    #   1. `tail_windows` validates both legs off the index. Every abortable reason to stop
+    #      is found here, before a byte of holdout is read.
+    #   2. `count_look(unique=True)` records the look *before* the read, and appends rather
+    #      than dedupes -- a corrective re-run is a second look and the ledger must show it.
+    #   3. The pre-registered number prints **first**. A raise inside the §6.3 formatter
+    #      after step 2 would otherwise leave the holdout spent and nothing on stdout.
+    _dirs = {s: sym_dir(s) for s in ("SPY", "QQQ")}
+    _fr = tail_windows(_dirs)
+    _k = count_look("unit10_region_tail", kind="region", unique=True)
+    print(f"\u2691 WITHHELD TAIL OPENED -- {len(_fr)} weeks, {_fr[0]}..{_fr[-1]}, "
+          f"K = {_k} after this look\n")
+    _legs = {s: run_region(d, tail=True) for s, d in _dirs.items()}
+    _v = region_verdict(_legs)
+    print(f"pre-registered test (PLAN \u00a73 Unit 10): equal-weight n >= {REGION[0]}, "
+          f"vup, vdn in [{REGION[1]}, {REGION[2]}], no IS filter, SPY+QQQ 50/50")
+    print(f"  toNP {_v['toNP']:+.1f} bps over {_v['weeks']} withheld weeks, t {_v['t']:+.3f}"
+          f"  ->  {'PASS' if _v['passed'] else 'FAIL'}\n")
+    # ⚑ The full §6.3 block is 70-odd numbers off the holdout where one was pre-registered,
+    # and it is exactly the seed for hypothesis #2 (the deferred vol-state filter). Behind a
+    # flag, so seeing it is a decision someone made (Unit 10 review).
+    if "--full" in sys.argv:
+        print(region_report(_legs))
+    else:
+        print("(`python pwfo.py tail --full` prints the full \u00a76.3 block; "
+              "anything derived from it is contaminated for a second hypothesis)")
+    raise SystemExit(0)
+
+
 if __name__ == "__main__":
     t0 = time.perf_counter()
+    symbol = _ARG
+    out = sym_dir(symbol)
+    # ⚑ A bare `python pwfo.py` rewrites `pwfo/` -- including the withheld table whose
+    # sha256 is the project's evidence that it was never opened. The hazard was a comment in
+    # a handoff note; Unit 10's review pointed out that a comment is not a guard.
+    if (out / "pwfo_tail.npy").exists() and "--force" not in sys.argv:
+        raise SystemExit(
+            f"{out / 'pwfo_tail.npy'} exists -- regenerating it destroys the sealed "
+            f"withheld set. Pass --force if that is really what you mean."
+        )
     bars = data.load_bars(
-        "SPY",
+        symbol,
         datetime(2016, 1, 1, tzinfo=timezone.utc),
         datetime(2030, 1, 1, tzinfo=timezone.utc),
         refresh=False,
     )
     matrix = rmv.rmv_all_n(bars.close)
     wins = windows(bars)
-    print(f"{len(bars)} bars, {len(wins)} windows, RMV in {time.perf_counter() - t0:.1f} s")
+    print(f"{symbol}: {len(bars)} bars, {len(wins)} windows, RMV in "
+          f"{time.perf_counter() - t0:.1f} s -> {out.name}/")
     t1 = time.perf_counter()
-    idx = run(bars, matrix, wins, progress=100)
+    idx = run(bars, matrix, wins, out_dir=out, progress=100)
     # Nothing about the tail beyond its count: the file is written and not opened again
     # until Unit 9's final step (PLAN §3 Unit 9).
     pre = [w for w in idx if w["file"] == "is"]
