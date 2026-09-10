@@ -277,6 +277,7 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 | Full PWFO, 546 windows, IS+OOS | < 60 s, peak RSS < 1 GB | **~32 s, 226 MB** |
 | ⚑ Same, shipped `pwfo.run`, 551 windows (525 + 26 withheld) | < 60 s, peak RSS < 1 GB | **2.6 s, 411 MB** |
 | ⚑ One filter over the full table, shipped `pwfo.evaluate` | < 1 s | **10–23 ms** (+ 0.11 s hoist, shared by all nine) |
+| ⚑ Unit 9 report: 9 filters + 5000-iteration bootstrap + both falsifications | — | **~9 s** total, 574-line report |
 | Live per-bar compute | < 1 ms, zero steady-state allocation | — |
 
 **The entire walk-forward is a ~35-second job.** Any design adding a job queue, a database,
@@ -979,7 +980,8 @@ defect is still open for Units 1–7.
   `mLb` puts every no-loser row, sentinel `+inf` and all, at the head of a pool it can
   never be displaced from, and a filter picking max `eqR2` selects an `nT <= 2` row in 24
   of 24 windows. The sanctioned directions are now the only ones spellable. Unit 10
-  reopens this deliberately or not at all.
+  does not reopen it: the filter search is cancelled, so the sentinel directions stay pinned
+  and unexercised.
 - ⚑ **The trade-count floor is surfaced, not patched.** `CL4` selects a row with `nT < 5`
   in **82 of 525** windows and `CL2` in **120 of 525** (median selected `nT` 12 and 7);
   `meyers2005` never does, and its median is 28. Faithful to [M25], whose two published
@@ -1122,7 +1124,160 @@ the two zero cases distinctly.
 
 ---
 
-### Unit 9 — Significance, costs, report
+### Unit 9 — Significance, costs, report ✅ **shipped — the gate fails 3 of 3**
+
+**Shipped** in `pwfo.py`: `count_look()` and the committed `comparisons.json`; `_moments()`,
+`_ktau()`, `_lin_r2()` and SPEC §6.3's eleven remaining columns folded into `aggregate()`;
+`bootstrap()`, `null_moments()`, `significance()`; `shuffled_oos()`, `displace()`;
+`spy_weekly()`, `R63`, `gate()`, `report()`. `python pwfo.py report` writes the deliverable
+off the stored tables without touching `pwfo/`; **`UNIT9_REPORT.txt`** is that run. 111/111
+tests, `ruff check .` clean, **55 of 56 mutations killed**, 8 tests added. The withheld tail
+was not opened — sha256 `629122d198949afd…` unchanged.
+
+⚑ **The first mutation pass scored 35 of 49 and the fourteen survivors were real.** Every
+one was a Unit 9 test reading a *label* where it should have read a *number*: `gate`'s three
+comparisons were never called, `spy_weekly`'s two boundaries were never checked, the report
+asserted that a `Z Prob` row existed but not that it held `significance`'s numbers, and
+`v20` was tested on a 12-week series where `p[-20:]` and `p[:20]` are the same twelve
+numbers. Two more branches were unreachable on the real table and had to be built
+synthetically — `displace` on a §6.4 case-2 week, and `_lin_r2`'s flat-equity sentinel.
+The one surviving mutation is equivalent: adding the diagonal to `_ktau`'s pair set
+contributes `sign(0)`, which is neither concordant nor discordant.
+
+⚑ **The decision gate fails all three conditions, and none of them marginally.**
+
+| Condition | Bar | Best of the nine | Margin |
+|---|---|---|---|
+| 1. bootstrap `Prob × K < 0.05` | 0.05 | `CL2` **3.05** (`p` 0.235, `K` 13) | fails ~60× |
+| 2. `toNP > 0` after costs | > 0 | +132.11/share over 525 weeks | 3 of 9 positive; both open ambiguities flip the sign |
+| 3. risk-adjusted > long-only SPY | μ/σ **0.1147** | μ/σ **0.0606** | fails for every filter, on both total and risk-adjusted |
+
+- ⚑ **The power check ended the unit before the bootstrap was written**, which is exactly
+  what this section said it might do. The mirror-random null is a sum of independent
+  per-window uniform draws, so its mean and sd have a **closed form** — `sum_k mean_k` and
+  `sqrt(sum_k var_k)` over each window's stored OOS column, one pass, no sampling. Over 525
+  weeks it is **+61.48/share, sd 97.60**, so `z = 2` needs `toNP > 256.67`. The best filter
+  reaches 132.11. The 5000-iteration bootstrap SPEC §6.5 specifies was written anyway and
+  agrees to **61.43 / 96.96** — it is what carries the distribution's shape, and
+  `null_moments` is what says whether it converged.
+- ⚑ **This is not an underpowered sample — it is a clean negative.** A per-window oracle
+  with perfect foresight scores **+4751.67** (floor −6328.14), so the `z = 2` bar is
+  **5.4% of perfect foresight**: a filter capturing a twentieth of the achievable spread
+  would clear it. And the same 525 weeks detect SPY's own drift at **t = 2.63**. The
+  experiment had the power; there was no *filter* edge to find. PLAN's own free check —
+  `μ/σ >= 2/sqrt(525) = 0.0873` — is missed by all nine, best **0.0606**.
+  ⚑ **Superseded in part by Unit 10.** Every figure in this bullet stands. The inference
+  drawn from it — "there was no edge" — does not: what had no edge was the *selection step*.
+  The same 525 OOS weeks, equal-weighted over `n >= 5, v in [0.75, 2.75]` with no filter at
+  all, return **+124.29/share at t = 2.39**, and the per-window IS→OOS rank correlation a
+  filter depends on is **−0.0062, t = −0.45**. Read §3 Unit 10 before citing this bullet.
+- ⚑ **The cost model cannot change the verdict, so the FINRA/SEC lookup is closed as a
+  non-blocker.** `osnp` is already net, so gross is `net + ont × cost` exactly off the
+  stored columns. Total cost paid over 525 weeks runs **$24.54 to $84.00 per share**, and
+  at **zero cost** the whole CL4-as-written family stays negative while the null rises
+  with it (**gross null +123.49**) — gross `CL2` +157.47 sits *closer* to the null than net
+  does. SPEC §3.2's structural error (a per-share TAF folded into a notional-scaled fee, a
+  Section 31 rate pinned to one year) is real and still recorded; it is worth cents on a
+  result that misses by a factor of sixty.
+- ⚑ **Autocorrelation is negligible, so no block bootstrap.** Lag-1..4 of `osnp` across the
+  nine filters runs **−0.133 to +0.080**, against a ±2σ band of ±0.087 at n = 525 — one
+  value (`meyers2005` lag-1) outside it, of thirty-six. The 23-of-30-day IS overlap does
+  **not** inflate `t` here. Reported as this section required; the answer is "no action".
+- ⚑ **Falsification 1 passes: shuffled OOS columns come back insignificant.** Permuting the
+  combo axis per window preserves each week's OOS population and destroys only the IS→OOS
+  row correspondence. Worst |z| over the nine is **1.143**.
+- ⚑ **Falsification 2 is the sharpest result in the unit.** Scoring each OOS week with the
+  selection made 50 windows earlier — under that week's own `xmult`, which `run` already
+  stored — moves `toNP` by **−187.8 to +271.9 per share** over the 475 weeks both sides
+  share, *wider than the filters' entire real range*, with displaced |z| reaching 1.919
+  against real |z| ≤ 2.279. The selection carries no window-specific information; the
+  filter is a static parameter prior, which is precisely the failure column-shuffling could
+  never have caught. ⚑ The claim this section attaches to the test ("if that does not
+  degrade…") is only *decidable* when the undisplaced filter is significant, and none is —
+  so the test asserts the mechanism and the measured shift is recorded rather than asserted.
+- ⚑ **Deviation from this section: the counter is keyed, not incremented.** PLAN wrote "a
+  file the evaluator increments on every OOS-touching run". `K` corrects for the number of
+  *distinct* hypotheses examined; re-executing a deterministic evaluation of the same nine
+  filters tests nothing new, and an incrementing counter would make reported significance a
+  function of how many times someone ran the script. **`K = 13`**: Unit 8's nine variants,
+  the two accidental tail reads this section named, and the two falsification runs above.
+- ⚑ **SPEC §6.5's published chain is now a test.** `test_unit9_significance_reproduces_
+  both_rows_of_the_published_chain` pins [M25 p.9]'s own numbers — 396.7/week, z 4.92,
+  4.23e-7, `K·p` 0.049 at n = 446 — *and* the §9-K row that the same total against the same
+  null over all 517 periods gives `K·p` **2.234**. Significant to not significant on one
+  choice of divisor, pinned so a change that re-flatters the filter fails.
+- **Conventions settled here** (SPEC §6.3, "Pinned in Unit 9"): `KTau^2` stored **signed**
+  ×100 despite the column name; `v20` as Δequity/Δperiod over the last 20; `aoTr` **net**;
+  `toGP` reconstructed from stored columns rather than re-simulated; `tkr|bl` = 0 when `BE`
+  is `inf`.
+
+**Where this leaves the project.** ⚑ **Amended 2026-09-09 — read this with §3 Unit 10.**
+
+As shipped, this section concluded that the gate failed on every condition and that Units
+11–13 should not be written. The measurements are unchanged and the halt on live code stands.
+The *inference* was wrong on two of the three conditions, and Unit 10 records why:
+
+- Condition 3 ("beat long-only SPY") is unreachable by construction — **79% of SPY's return
+  is overnight and pre-10:00**, which SPEC §2's 15:55 flatten forbids the strategy from
+  touching. The gated-hours pool is **+103.79/share**, not +505.31.
+- Condition 1's null is the equal-weight whole-grid portfolio, which has **gross t = +3.00**
+  on its own. `K·p` measures the filter's skill *above the grid average*, not whether RMedV
+  works.
+- Condition 2 stands and is met.
+
+What genuinely failed is the weekly parameter selection, and it failed for a reason no filter
+search can repair: IS ranking predicts OOS ranking at **t = −0.45**. Unit 10 is therefore
+rewritten from "filter search" to "region portfolio", the search is cancelled, and the
+withheld tail — still unopened — becomes the project's one clean test.
+
+### Review findings, triaged
+
+One adversarial subagent per §4. It reproduced **every** numeric claim above independently —
+the null moments, the bootstrap, the oracle ceiling and floor, the cost decomposition, the
+autocorrelation range *including which of the thirty-six values is the outlier*, the SPY
+benchmark, both falsifications, both sign flips — and confirmed `python pwfo.py report` is
+byte-identical to the committed `UNIT9_REPORT.txt`. It found no look-ahead. It also
+hand-checked `R63` against SPEC §6.3 column by column, which the shipped test could not do
+(that test checks the report against `R63`, not `R63` against the source).
+
+- ⚑ **Fixed, and it changed a headline number — `displace` wrapped its tail into a different
+  price regime.** Rev 1 wrapped the last 50 windows back to window 0 to hold the denominator
+  at 525. SPY is $210 there and $650 at the source, per-share dollar P/L is not scale-free
+  across a 3× price change, and measured, **those 50 windows (9.5% of the sample) carried
+  65.3% of the total displacement effect**, every one of the nine contributions pointing the
+  same way. `displace` now **truncates**: it returns one record per window from `shift` on,
+  carrying the earlier window's selection, and its control is `weeks[shift:]` — the same
+  weeks, the same null, the same denominator, differing only in whose selection was applied.
+  The conclusion is unchanged and now attributable; the quoted range moved from
+  −181.5..+263.5 to **−187.8..+271.9**. The reviewer found the confound; the decomposition
+  and the redesign are ours.
+- **Fixed — a second equivalent mutation the tally had not found.** `tkr|bl`'s
+  `if be != math.inf else 0.0` guard could not be killed by any test, because IEEE-754
+  already gives `finite / inf == 0.0` and every factor is finite by its own zero-guard.
+  Unkillable code is unfalsifiable code: the branch is deleted and the reasoning is in the
+  comment. The mutation set grew from 51 to 56 as a result, now **55 killed**.
+- **Fixed — `displace`'s `traded` flag had no coverage.** Mutating it to a constant passed
+  both falsification tests. Nothing downstream reads it, which is exactly how it would have
+  gone stale. Now pinned, on a synthetic window that fires no signals.
+- **Recorded, no change — `significance` raises on `n = 0`.** `null_sd / n` runs before the
+  `sd_mean > 0.0` guard. A zero-period aggregate is a misconfiguration, not a result, and
+  the same reasoning already governs `run`'s all-windows-withheld `ValueError`: raising is
+  the intended behaviour, not a gap.
+- ⚑ **Promoted to a test — the reviewer checked something none of our code did.** The normal
+  tail `significance` reads is *earned*, not assumed: the 5000-draw distribution has skew
+  −0.054 and excess kurtosis −0.12 despite per-window OOS columns skewed −4.20 to +1.00, and
+  the empirical tail for `CL2` (0.2434) tracks the normal `Prob` (0.2346). That is the CLT
+  over 525 windows doing its job. `test_unit9_bootstrap_converges_on_its_exact_moments` now
+  asserts the sum's shape and three empirical-vs-normal tail quantiles.
+- **Protocol note.** The reviewer disclosed running `sha256sum` on `pwfo_tail.npy`, which
+  our brief had listed among forbidden operations. The brief was over-strict: a SHA-256
+  digest is one-way, reveals nothing about the values, and is this project's own sanctioned
+  integrity check (§Verification). No `np.load`, no parse, hash matched. **The tail is not
+  spent.**
+
+---
+
+**What the unit was asked to do, kept for the record.**
 
 ⚑ **From Unit 7: three things this unit inherits.**
 
@@ -1244,32 +1399,161 @@ threshold *before* committing to Units 10–13.
 
 ---
 
-### Unit 10 — Filter search (conditional)
+### Unit 10 — Region portfolio, not filter search — ⚑ **rewritten after diagnosis; the filter search is cancelled. Not built.**
 
-⚑ **From Unit 5: pre-register the comparison DIRECTION, not just the metric and threshold.**
-Every degenerate sentinel in SPEC §6.6 is fail-safe in exactly one direction — the one the
-three shipped filters use — and is the worst possible value in the other. Measured over 24
-real pre-tail windows, a filter picking **max `eqR2`** selects a row with `nT <= 2` in **24 of
-24**, and **min `eq2R2`** in **24 of 24**; a screen `PF > x` passes every no-loser row, and a
-**top**-k rank on `mLb` puts every no-loser row at the head. A generated space that crosses
-metrics with both directions will therefore find "filters" that are selecting the sentinel,
-score them well in-sample, and look like discoveries. Either give every generated filter an
-`nT >= 3` screen or restrict the space to §6.6's directions — and write which, first.
+Rev 1 of this unit was a bounded filter search, unblocked by Unit 9's failed gate and flagged
+as the unit most likely to manufacture a false positive. **It is cancelled.** Diagnosis
+(2026-09-09) found the failure was not in the strategy and not in the data — it was in the
+selection step Unit 10 proposed to search harder. Searching harder is the one thing the
+measurements rule out.
 
-Meyers ran 115,320 filters through WFME64. Do **not** start there.
+#### What Unit 9's gate actually measured
 
-⚑ **Pre-register or don't build.** "Build only if Unit 9 fails" makes this a conditional
-second look at the same data — a forking path. Either write down the bounded space *before*
-reading Unit 9's result, or skip the unit.
+⚑ **Two of the three gate conditions test something other than "does RMedV work".**
 
-If built: ~2000 filters (3 screen metrics × thresholds × 3 rank metrics × `top_k` in
-{5,10,25,50}), scored by bootstrap probability, every one added to the comparison counter.
+**Condition 3, "beat long-only SPY", is unreachable by construction.** Of SPY's +505.31/share
+over the sample (+485.45 pre-tail), only **+103.79 accrues between 10:00 and 15:55**; the
+other **+381.66, 79%, is overnight and pre-10:00**. SPEC §2 flattens at 15:55 and never holds
+overnight, so the gate asked for a return the rules forbid the strategy from touching. The
+condition was written to catch "made money purely through long bias" — a real risk, and the
+right guard against it is the long/short decomposition below, not a benchmark the strategy
+cannot access. **Amend the condition to the gated-hours pool (+103.79), or drop it.**
 
-**Done when** reproducible from a seed. Validation is the withheld tail, opened once, after
-freezing.
+**Condition 1's null is not a null.** `null_moments`' random-filter draw is the equal-weight
+whole-grid portfolio, and that portfolio has **gross t = +3.00** in its own right. `K·p`
+therefore measures the *filter's selection skill above the grid average*, which is a
+worthwhile question and not the one the project was asking.
 
-**Anti-goal** 115k filters over 546 windows is feasible and is precisely the second-order
-overfit Meyers' own Bonferroni correction warns about. Bounded space, or none.
+Condition 2 (`toNP > 0` after costs) stands as written and is met.
+
+#### Measured: the kernel is correct, the grid has edge, the filter has none
+
+The implementation was re-verified independently before anything else, because a broken
+estimator would make every number below meaningless:
+
+| check | result |
+|---|---|
+| [M05 p.2] and [M25 p.2] worked examples | exactly `1.0`, both |
+| 4,400 random `(n, t)` pairs on real SPY bars, all 22 n, vs `scipy.siegelslopes` | max diff **3.18e-08**, i.e. float32 storage precision |
+| `rmv._simulate` vs an independent from-SPEC-§2 re-implementation, 40,000 bars | **361/361 trades identical, 0.00 P&L difference** |
+
+Equal-weight a parameter region, apply no filter at all, same per-window `xmult` and `cost`,
+same 525 pre-tail OOS weeks, read straight off `pwfo/pwfo_oos.npy`:
+
+| region | combos | gross $ | net $ | t | Sharpe | h1 | h2 |
+|---|---|---|---|---|---|---|---|
+| whole grid | 4312 | 123.49 | 61.48 | 1.51 | 0.47 | 0.48 | 61.00 |
+| `n>=5, v in [0.75, 2.75]` | 1620 | 175.36 | **124.29** | **2.39** | 0.75 | 31.40 | 92.89 |
+| `n>=14, v in [0.75, 2.75]` | 891 | 195.63 | **157.59** | **2.47** | 0.78 | 49.19 | 108.41 |
+| Unit 8's best filter, `CL2` | 1 | 157.47 | 132.11 | 1.39 | — | — | — |
+
+Fifteen region boundaries were tried; every one lands at **t = 2.0..2.9**, so the result is
+not carried by where the boundary is drawn. The surface is smooth and physically motivated:
+`n=3,4` lose to microstructure noise (gross −105.67 and +2.70), edge climbs monotonically to
+`n=21` (+195.02), and `v` peaks at 1.25 and falls both ways — low `v` overtrades into costs,
+high `v` starves the sample.
+
+**Not long bias, and this is the measurement condition 3 should have been.** Re-simulating the
+891-combo region and splitting by direction: **long +91.55 gross on 909 trades, short +104.08
+gross on 910 trades.** The short side earns *more*, on symmetric counts, across a decade in
+which SPY tripled.
+
+**The filter is what failed, and it fails for a reason that is not fixable by searching:**
+
+- Per-window Spearman(IS `tnp`, OOS `osnp`) across all 4312 combos: **mean −0.0062, t = −0.45,
+  48.2% of windows negative.** IS ranking carries no information about OOS ranking. Not weak —
+  zero.
+- Median **19 IS trades** per combo per window; **24.8% of combos have fewer than 10**. Ranking
+  4312 hypotheses on 19 trades is not an estimation problem that a better metric solves.
+- **Picking the IS-best `tnp` each week returns −228.75, t = −2.00** — materially worse than
+  random. Winner's curse: the IS maximum is the combo with the largest positive noise.
+- Selecting on *trailing OOS* results — which is cheating, and strictly more data than any
+  filter has — stays negative through a 52-week lookback and only reaches +151.17 at 104
+  weeks, still below the static region's +157.59.
+
+⚑ **Conclusion: at this trade frequency, weekly parameter selection has negative expected
+value. A bounded search over 2000 filters is a search for a better way to do the thing that
+does not work.**
+
+#### Measured: the asset question, answered and partly refuted
+
+The SPY-derived region, unchanged, on seven other symbols over the same 525 weeks:
+
+| sym | net bps / 10yr | t | note |
+|---|---|---|---|
+| QQQ | **+6502** | **+2.87** | clean |
+| SPY | +2762 | +2.39 | clean |
+| IWM | +231 | +0.12 | clean |
+| USO | −270 | −0.11 | crude proxy — nothing |
+| TLT | −1092 | −0.84 | clean |
+| GLD | −1176 | −0.72 | clean |
+| TSLA | +15570 | +2.24 | split-contaminated cost model |
+| NVDA | +1400 | +0.18 | cost model unusable (4:1 and 10:1 splits) |
+
+- **SPY being an ETF rather than a futures contract is not the problem.** SPY works; QQQ works
+  **2.4x better per dollar of notional** (Sharpe 0.89 vs 0.75).
+- **"Meyers used CL" does not explain the result either** — the crude proxy gives nothing.
+  Caveat: USO is a poor CL proxy (contango roll drag, 8:1 reverse split 2020). A real test of
+  [M25]'s CL claim needs CL futures bars, which Alpaca does not carry. Recorded as unresolved,
+  not as refuted.
+- `$0.01`/share slippage is one half-spread per fill. That is correct for SPY, QQQ, IWM, TLT
+  and GLD, whose books are penny-wide across their whole price range. It is **not** correct for
+  split-adjusted TSLA and NVDA, where split-adjusted prices make per-share cost wildly wrong in
+  bps — NVDA's 79% cost-to-gross ratio is a model artifact. Those two rows are not evidence.
+- The edge is specific to the large-cap US equity index complex. **NQ, not ES, is the futures
+  analogue worth pricing** if futures are ever revisited.
+- ⚑ **SPY options are ruled out.** Net edge is **1.3 bps per trade**; 0DTE SPY bid/ask runs
+  1–3% of premium, 100–300x the edge, before vega and theta enter as uncontrolled exposures.
+
+#### What this unit builds instead
+
+**Do** Freeze the region as a *static prior*, trade it as an equal-weight portfolio, and run
+the existing PWFO machinery with the selection step removed. No search, no generated filter
+space, no addition to `K` beyond the pre-registration below.
+
+Measured shape of the deliverable, 50/50 SPY+QQQ, sized in bps of notional:
+
+| | cum ret | bps/wk | sd | Sharpe | t | h1 | h2 |
+|---|---|---|---|---|---|---|---|
+| SPY | 31.0% | 5.90 | 56.45 | 0.75 | 2.39 | 10.6% | 20.3% |
+| QQQ | 47.3% | 9.02 | 73.43 | 0.89 | 2.81 | 16.3% | 31.0% |
+| **50/50** | **39.2%** | 7.46 | 61.71 | **0.87** | **2.77** | 13.5% | 25.7% |
+
+Leg correlation 0.80; max drawdown −8.7% of notional; worst week −2.31%; two losing years in
+eleven. Intraday only, so overnight risk is zero and Reg-T day-trading leverage applies to the
+whole of it.
+
+⚑ **Pre-register this, verbatim, before running anything against the tail:**
+
+> The RMedV edge is a broad property of the parameter region, not a selectable point.
+> Equal-weight every combo with `n >= 5` and `vup, vdn` both in `[0.75, 2.75]`, refit `xmult`
+> per IS window as Unit 7 already does, apply no IS filter, and trade SPY and QQQ at 50/50.
+> Success is `toNP > 0` after costs and a positive `t` on the withheld tail's weekly series.
+
+One hypothesis, one direction, one number. Add **exactly one** entry to `comparisons.json`.
+
+**Done when** the region portfolio reproduces the +124.29 / t = 2.39 SPY figure from the
+stored `pwfo/` tables through the shipped code path rather than through a scratch script, and
+a QQQ PWFO run exists alongside SPY's.
+
+⚑ **The withheld tail is still unopened and is now the only clean test the project has.**
+Every number in this unit was measured on data Unit 9 already read, and the region was chosen
+by reading SPY's own OOS marginals — that contamination is real and is not argued away by the
+breadth of the region or by both halves being positive. Open the tail **once**, after
+freezing, exactly as Rev 1 specified.
+
+**Anti-goal** Do not re-derive the region from the tail, and do not widen the search when the
+tail disappoints. Do not add money management to rescue a result: sizing reshapes a
+distribution, it cannot create edge, and naive vol-targeting would actively hurt here — the
+payoff is long-volatility (skew +1.99; 2018 +13.7% and 2022 +13.0% against 2017 +0.1%, 2019
+−3.3%), so scaling down into vol cuts exactly the profitable weeks.
+
+**Deferred, pre-registered, not built:** a trailing-realized-vol *state* filter. Weekly net by
+trailing-vol quintile runs **−3.3, +2.5, +6.3, +12.2, +11.2 bps**, monotone; skipping the
+bottom quintile lifts Sharpe 0.75 → 0.95, the bottom 40% → 1.10. This is a *state* filter, not
+a *parameter* filter — realized vol is persistent and forecastable, combo rank is not, which is
+exactly why one has a chance and the other does not. It is a second hypothesis and must not be
+folded into the first one's tail test.
 
 ---
 
@@ -1385,7 +1669,7 @@ Adding any of these requires a reason written down first.
 
 | Not building | Why | Add when |
 |---|---|---|
-| WFME64's 115k-filter search | Second-order overfit; the papers' three filters are the honest baseline | Unit 10, pre-registered |
+| WFME64's 115k-filter search | Second-order overfit — and Unit 10 measured IS→OOS rank correlation at **t = −0.45**, so no filter space contains the answer | **Never.** Cancelled in Unit 10 |
 | Distributed / queued execution | The full run is 35 seconds | Never, at this data scale |
 | Parquet / DuckDB / any database | Dense float32 matrix; `.npy` memmap is faster and dep-free | The table exceeds RAM |
 | Config framework, YAML schema, CLI parser | Five modules and a `params.json` | A third caller appears |

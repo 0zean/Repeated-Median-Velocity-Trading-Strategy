@@ -5,6 +5,7 @@ One test function per unit of work (see PLAN.md §3).
 
 from __future__ import annotations
 
+import collections
 import functools
 import hashlib
 import json
@@ -4015,9 +4016,11 @@ def test_unit8_aggregates_match_a_hand_computation() -> None:
     first equity value, dispersion is `ddof=1`, and `%P` counts a non-trading period in
     the denominator.
     """
+    # `cost` and `ollt` ride on every record from Unit 9 on (`toGP`, `LLTr`). Zero cost
+    # keeps every figure below unchanged: with nothing paid, gross equals net.
     p = [10.0, -4.0, 0.0, -3.0, -1.0]
     ont, ownt, ownp = [4.0, 2.0, 0.0, 3.0, 1.0], [3.0, 0.0, 0.0, 1.0, 0.0], [14.0, 0.0, 0.0, 2.0, 0.0]
-    weeks = [{"osnp": a, "ont": b, "ownt": c, "ownp": d, "selected": True}
+    weeks = [{"osnp": a, "ont": b, "ownt": c, "ownp": d, "cost": 0.0, "ollt": 0.0, "selected": True}
              for a, b, c, d in zip(p, ont, ownt, ownp)]
     a = pwfo.aggregate(weeks)
     assert (a["n"], a["n_sel"], a["n_trd"]) == (5, 5, 4)
@@ -4042,27 +4045,28 @@ def test_unit8_aggregates_match_a_hand_computation() -> None:
     # at a loss. [M25 Table 1] settles it rather than leaving it to taste: on its all-loser
     # weeks `odd` equals the full cumulative loss, where a peak seeded from the first equity
     # value would report the smaller drop that follows it.
-    down = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "selected": True}
+    down = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "cost": 0.0, "ollt": 0.0, "selected": True}
                            for v in (-5.0, 3.0, -2.0)])
     assert down["eqDD"] == -5.0, down  # equity -5, -2, -4 against a peak of 0, not of -5
     assert down["LLp"] == -5.0 and down["Blw"] == 3
     # And an all-winner filter has no largest losing period at all: [M25 Table 1]'s 12/15/14
     # publishes `ollt` and `odd` at 0, not at the smallest win of the week.
-    up = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 1.0, "ownp": v, "selected": True}
+    up = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 1.0, "ownp": v, "cost": 0.0, "ollt": 0.0, "selected": True}
                          for v in (2.0, 5.0, 1.0)])
     assert (up["LLp"], up["eqDD"], up["Blw"]) == (0.0, 0.0, 0)
 
     # ⚑ A zero period breaks the *winning* streak too, and only a series with a zero between
     # two winners can show it -- the series above has one isolated positive and would read
     # the same either way. §6.6's partition is symmetric and so is this.
-    flat = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "selected": True}
+    flat = pwfo.aggregate([{"osnp": v, "ont": 1.0, "ownt": 0.0, "ownp": 0.0, "cost": 0.0, "ollt": 0.0, "selected": True}
                            for v in (3.0, 0.0, 2.0, -1.0)])
     assert (flat["wpr"], flat["lpr"]) == (1, 1), flat
     # A single profitable period has no dispersion at all, so §6.3 col X's formula collapses
     # to zero -- which is not an answer to "how many periods would you have to trade". One.
     lone = pwfo.aggregate([{"osnp": 5.0, "ont": 1.0, "ownt": 1.0, "ownp": 5.0,
-                            "selected": True}])
+                            "cost": 0.0, "ollt": 0.0, "selected": True}])
     assert lone["std"] == 0.0 and lone["BE"] == 1, lone
+
 
 
 def test_unit8_decodes_every_combo_to_its_parameters() -> None:
@@ -4131,7 +4135,11 @@ def test_unit8_reads_only_the_two_tables_it_is_handed() -> None:
             for m in ("mLTr", "nT"):
                 assert np.array_equal(cols[m], stored[:, :, is_names.index(m)]), m
 
-            res = pwfo.run_filters(out_dir=tmp)
+            # `counter` into the temp dir: the production `comparisons.json` is a
+            # committed record of what has actually been examined (PLAN §3 Unit 9), and a
+            # test run is not a look at the OOS table -- these are synthetic 2016 bars.
+            res = pwfo.run_filters(out_dir=tmp, counter=Path(tmp) / "comparisons.json")
+            assert res.pop("K") == 9, res["K"]
             assert len(res) == 9
             oos = np.load(Path(tmp) / "pwfo_oos.npy")
             names = rmv.METRIC_COLS[rmv.OOS_COLS]
@@ -4198,6 +4206,435 @@ def test_unit8_budget() -> None:
           f"{len(wins)}; %P moves +{min(deltas):.1f}..+{max(deltas):.1f} pts if the silent "
           "weeks are dropped)", end="")
 
+
+
+def test_unit9_comparison_counter_is_keyed_not_incremented() -> None:
+    """PLAN §3 Unit 9's multiplier: `K` counts distinct looks, and the record survives.
+
+    The deviation this pins is deliberate (`pwfo.count_look`): PLAN wrote "increments on
+    every OOS-touching run", and an incrementing counter would make the reported
+    significance a function of how many times the script was run. So re-recording a key
+    must not move `K` and must not rewrite its first-seen date, while a genuinely new
+    filter must. Both directions are checked -- a counter that only ever grew would pass
+    the second alone, and one that never grew would pass the first.
+
+    The committed file is checked too. It is data, not a derivation, so nothing else in
+    the suite would notice if Unit 8's nine variants or PLAN's two accidental tail reads
+    fell out of it -- and `K` is the one input to SPEC §6.5 step 4 that no artifact on
+    disk could reconstruct.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "comparisons.json"
+        assert pwfo.count_look(["a", "b"], path=path) == 2
+        first = json.loads(path.read_text(encoding="utf-8"))["looks"]["a"]["first"]
+        assert pwfo.count_look(["a"], path=path) == 2, "a repeat run is not a new look"
+        assert pwfo.count_look(["b", "a"], path=path) == 2
+        assert pwfo.count_look("c", kind="tail", path=path) == 3, "a new look must count"
+        # ⚑ Re-recording under a *different* kind must not move the entry. The date
+        # alone cannot show this -- `first` is a day stamp, so two calls in one run write
+        # the same string whether or not the second overwrote the first.
+        assert pwfo.count_look(["a"], kind="tail", path=path) == 3
+        book = json.loads(path.read_text(encoding="utf-8"))["looks"]
+        assert book["a"]["first"] == first, "re-recording rewrote the first-seen date"
+        assert book["a"]["kind"] == "filter", "re-recording overwrote the kind"
+        assert book["c"]["kind"] == "tail"
+
+    looks = json.loads((Path(pwfo.__file__).parent / "comparisons.json")
+                       .read_text(encoding="utf-8"))["looks"]
+    missing = [n for n in pwfo.variants() if n not in looks]
+    assert not missing, f"Unit 8's variants are not in the committed record: {missing}"
+    tails = sorted(n for n, v in looks.items() if v["kind"] == "tail")
+    assert tails == ["unit3-tail-second-moment", "unit5-review-tail-probe"], tails
+    kinds = collections.Counter(v["kind"] for v in looks.values())
+    print(f"    (K = {len(looks)}: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+          + ")", end="")
+
+
+def test_unit9_significance_reproduces_both_rows_of_the_published_chain() -> None:
+    """SPEC §6.5's worked example, both denominators. The arithmetic has a published answer.
+
+    [M25 p.9] states every intermediate: `toNP` 176932 over 446 traded weeks is 396.7/week,
+    a random-filter null of 65.3 +/- 67.3, z = 4.92, one-sided tail 4.23e-7, and 115320
+    filters giving 0.049. Reproducing that chain is what makes `significance` trustworthy
+    on *our* numbers, where no published answer exists to check against.
+
+    ⚑ And the second row is the reason SPEC §9-K exists: the same total against the same
+    null over all 517 periods -- the denominator the null itself is built on -- gives
+    `K*p` 2.234 instead of 0.049. Significant to not significant on one choice of divisor.
+    Both rows are pinned here, so a change that quietly re-flatters the filter fails.
+    """
+    for n, mean_wk, z_want, kp_want in ((446, 396.7, 4.92, 0.049), (517, 342.2, 4.11, 2.234)):
+        agg = {"n": n, "avg": 176932.0 / n, "std": 0.0}
+        assert abs(agg["avg"] - mean_wk) < 0.1, (n, agg["avg"])
+        # The null is quoted per week; `significance` takes moments of `toNP`, so both
+        # scale by this filter's own denominator -- which is exactly the mismatch above.
+        sig = pwfo.significance(agg, 65.3 * n, 67.3 * n, 115320)
+        assert abs(sig["z"] - z_want) < 0.01, (n, sig["z"])
+        assert abs(sig["K"] * sig["p"] - kp_want) < 0.002, (n, sig["K"] * sig["p"])
+        # `Kp` is the exact `1-(1-p)^K`. It tracks the linear form while `K*p << 1` and
+        # saturates past it, which is the whole reason the report prints both.
+        assert abs(sig["Kp"] - (1.0 - (1.0 - sig["p"]) ** 115320)) < 1e-12
+        assert (abs(sig["Kp"] - kp_want) < 0.002) if kp_want < 0.1 else sig["Kp"] > 0.89
+    print("    (446 -> K*p 0.049 significant; 517 -> 2.234 not, on one divisor)", end="")
+
+
+def test_unit9_aggregate_extras_match_a_hand_computation() -> None:
+    """SPEC §6.3's Unit 9 columns against scipy and closed forms on a built series.
+
+    Twelve weekly P/Ls chosen so nothing is degenerate: both signs, a zero week, an
+    unequal winner/loser split and a non-monotone equity curve, so `skew`, `kur`, `ktau`
+    and `eqR2` all have something to be wrong about. `toGP` is checked against the cost
+    the weeks actually paid rather than a re-derived constant, which is the one way the
+    reconstruction could be wrong without any single column being wrong.
+    """
+    from scipy.stats import kendalltau, kurtosis, linregress, skew
+
+    p = [3.0, -1.0, 2.0, 0.0, -4.0, 5.0, 1.0, -2.0, 6.0, -3.0, 2.0, -1.0]
+    weeks = [{"osnp": v, "ont": 2.0, "ownp": max(v, 0.0), "ownt": 1.0 if v > 0 else 0.0,
+              "ollt": min(v, 0.0), "odd": min(v, 0.0), "cost": 0.02, "selected": True,
+              "traded": True} for v in p]
+    a = pwfo.aggregate(weeks)
+    arr = np.array(p)
+    eq = np.cumsum(arr)
+
+    assert abs(a["toGP"] - (arr.sum() + 12 * 2.0 * 0.02)) < 1e-9, a["toGP"]
+    assert abs(a["aoGP"] - a["toGP"] / 12) < 1e-9
+    assert abs(a["ao#T"] - 2.0) < 1e-12
+    assert abs(a["aoTr"] - arr.sum() / 24.0) < 1e-12, a["aoTr"]
+    assert abs(a["skew"] - float(skew(arr))) < 1e-9, (a["skew"], float(skew(arr)))
+    assert abs(a["kur"] - float(kurtosis(arr))) < 1e-9, (a["kur"], float(kurtosis(arr)))
+    assert abs(a["KTau^2"] - 100.0 * kendalltau(np.arange(12), eq).statistic) < 1e-9
+    assert abs(a["eqR2"] - 100.0 * linregress(np.arange(12), eq).rvalue ** 2) < 1e-9
+    assert abs(a["LLTr"] - min(min(v, 0.0) for v in p)) < 1e-12
+    # v20 with fewer than 20 periods is the mean of what exists, and the identity that
+    # defines it -- (eq[-1] - eq[-k-1]) / k -- degenerates to eq[-1]/n here.
+    assert abs(a["v20"] - float(arr.mean())) < 1e-12, a["v20"]
+    assert abs(a["tkr|bl"] - a["t"] * a["KTau^2"] * a["eqR2"] / a["BE"]) < 1e-9
+
+    # ⚑ v20 needs more than 20 periods to be a *window* rather than the whole series --
+    # at n=12 above, `p[-20:]` and `p[:20]` are the same twelve numbers.
+    long = [{"osnp": float(v), "ont": 1.0, "ownp": max(float(v), 0.0),
+             "ownt": 1.0 if v > 0 else 0.0, "ollt": 0.0, "odd": 0.0, "cost": 0.0,
+             "selected": True, "traded": True} for v in range(-4, 21)]
+    lv = pwfo.aggregate(long)
+    assert len(long) == 25
+    tail20 = np.array([w["osnp"] for w in long[-20:]])
+    assert abs(lv["v20"] - float(tail20.mean())) < 1e-12, lv["v20"]
+    assert abs(lv["v20"] - float(np.mean([w["osnp"] for w in long]))) > 1.0, "v20 is the whole series"
+    eq_l = np.cumsum([w["osnp"] for w in long])
+    assert abs(lv["v20"] - (eq_l[-1] - eq_l[-21]) / 20.0) < 1e-12, "v20 is not d(equity)/d(period)"
+
+    # ⚑ Degenerate branches. A constant series has zero central moments, so `skew`/`kur`
+    # are 0/0 rather than nan; a flat equity curve has no line to fit, so `eqR2` takes
+    # §6.6's `eqR2` sentinel of 100 -- the value that fails `< 80` and `<= 50`.
+    const = pwfo.aggregate([dict(w, osnp=2.0, ownp=2.0, ownt=1.0) for w in weeks])
+    assert const["skew"] == 0.0 and const["kur"] == 0.0, const
+    # Both `const` and `flat` read 100, for opposite reasons: a constant weekly P/L is a
+    # genuinely perfect straight line, and a flat equity curve has no line to fit at all.
+    # Only the second exercises the sentinel branch, which is why both are here.
+    assert const["eqR2"] == 100.0, "constant P/L is a perfectly straight equity line"
+    flat = pwfo.aggregate([dict(w, osnp=0.0, ownp=0.0, ownt=0.0) for w in weeks])
+    assert flat["eqR2"] == 100.0, ("flat equity must take the sentinel", flat["eqR2"])
+    assert flat["KTau^2"] == 0.0 and flat["skew"] == 0.0, flat
+
+    # A losing series never breaks even, so `BE` is inf and `tkr|bl` must not be nan.
+    down = pwfo.aggregate([dict(w, osnp=-abs(w["osnp"]) - 1.0) for w in weeks])
+    assert down["BE"] == math.inf and down["tkr|bl"] == 0.0, down["BE"]
+    print(f"    (skew {a['skew']:.4f}, kur {a['kur']:.4f}, ktau {a['KTau^2']:.2f}, "
+          f"eqR2 {a['eqR2']:.2f} all match scipy)", end="")
+
+
+def test_unit9_bootstrap_converges_on_its_exact_moments() -> None:
+    """SPEC §6.5's 5000 draws against the closed form they are sampling.
+
+    The mirror-random null is a sum of independent per-window uniform draws, so its mean
+    and variance are `sum_k mean_k` and `sum_k var_k` exactly. A bootstrap that disagrees
+    with that is sampling the wrong thing -- drawing one row for all windows, drawing with
+    the window axis transposed, or reusing a draw -- and every one of those bugs produces
+    a plausible-looking distribution. The mean's tolerance is its own standard error.
+
+    ⚑ Run on a synthetic table, not `pwfo/`. This checks the estimator, and an estimator
+    checked against real data can only be checked to the precision of the real data.
+    """
+    rng = np.random.default_rng(7)
+    oos = np.zeros((40, 300, 6), dtype=np.float32)
+    oos[:, :, 0] = rng.normal(0.5, 3.0, (40, 300)) + np.arange(40)[:, None] * 0.1
+    mean, sd = pwfo.null_moments(oos)
+    boot = pwfo.bootstrap(oos, n_iter=5000, seed=3)
+
+    assert boot.shape == (5000,)
+    se = sd / math.sqrt(5000)
+    assert abs(float(boot.mean()) - mean) < 4.0 * se, (float(boot.mean()), mean, se)
+    assert abs(float(boot.std(ddof=1)) / sd - 1.0) < 0.05, (float(boot.std(ddof=1)), sd)
+    # Independent draws per window: identical rows across windows would collapse the sd.
+    assert len(set(boot.tolist())) > 4900, "draws are repeating"
+    assert not np.array_equal(boot, pwfo.bootstrap(oos, 5000, seed=4)), "seed is ignored"
+    # ⚑ `significance` reads a **normal** tail off this distribution, and nothing else
+    # checks that it may. The per-window OOS columns are strongly skewed, so the licence
+    # is the CLT over 40+ windows, not the shape of the inputs -- assert the sum, not the
+    # summands, and compare the empirical tail against the normal one it stands in for.
+    d = boot - boot.mean()
+    m2 = float((d * d).mean())
+    skew = float((d**3).mean()) / m2**1.5
+    exkur = float((d**4).mean()) / (m2 * m2) - 3.0
+    assert abs(skew) < 0.15 and abs(exkur) < 0.25, (skew, exkur)
+    for q in (1.0, 1.5, 2.0):
+        emp = float(np.count_nonzero(boot > mean + q * sd)) / boot.size
+        nrm = 0.5 * math.erfc(q / math.sqrt(2.0))
+        assert abs(emp - nrm) < 0.02, (q, emp, nrm)
+    print(f"    (5000 draws: mean {boot.mean():.3f} vs exact {mean:.3f}, "
+          f"sd {boot.std(ddof=1):.3f} vs exact {sd:.3f}; skew {skew:+.3f}, "
+          f"excess kurtosis {exkur:+.3f} -- the normal tail is earned)", end="")
+
+
+def test_unit9_shuffled_oos_comes_back_insignificant() -> None:
+    """PLAN §3 Unit 9's first done-when, on the real 525-window table.
+
+    Permuting the combo axis per window keeps each week's OOS population and destroys only
+    the IS->OOS row correspondence, so a filter that scored through selection rather than
+    through the marginals must lose its score. `|z| < 2` against the same null is the
+    statement; it is checked for all nine, because one surviving filter would mean the
+    evaluator is reading something other than the row it selected.
+    """
+    if not (pwfo.OUT_DIR / "pwfo_oos.npy").exists():
+        print("    (skipped: no pwfo tables)", end="")
+        return
+    names = sorted({"nT", *(pwfo._base(m) for f in pwfo.variants().values()
+                            for m in pwfo._metrics(f))})
+    cols, oos, wins = pwfo.load_tables(names)
+    shuf = pwfo.shuffled_oos(oos, seed=11)
+    assert not np.array_equal(shuf[:, :, 0], oos[:, :, 0]), "the shuffle did nothing"
+    for k in range(0, len(wins), 97):  # the population is preserved window by window
+        assert np.array_equal(np.sort(shuf[k, :, 0]), np.sort(oos[k, :, 0])), k
+
+    mean, sd = pwfo.null_moments(shuf)
+    worst = 0.0
+    for name, f in pwfo.variants().items():
+        agg = pwfo.aggregate(pwfo.evaluate(f, cols, oos, wins))
+        s_agg = pwfo.aggregate(pwfo.evaluate(f, cols, shuf, wins))
+        assert s_agg["toNP"] != agg["toNP"], f"{name}: shuffling changed nothing"
+        z = pwfo.significance(s_agg, mean, sd, 1)["z"]
+        assert abs(z) < 2.0, f"{name}: shuffled z {z:.3f} -- selection is not the cause"
+        worst = max(worst, abs(z))
+    print(f"    (nine filters on shuffled columns, worst |z| {worst:.3f} < 2)", end="")
+
+
+def test_unit9_displaced_selection_carries_no_window_information() -> None:
+    """PLAN §3 Unit 9's second done-when: each OOS week scored with the pick from 50 earlier.
+
+    ⚑ The control is `weeks[50:]` — **the same 475 weeks, the same null, the same
+    denominator** — so the only thing that differs is whose IS window the parameters came
+    from. Rev 1 wrapped the tail instead, and the review measured that the 50 wrapped
+    windows carried 65.3% of the effect purely because SPY was $210 there and $650 at the
+    source. Same weeks on both sides is what makes the shift attributable at all.
+
+    The mechanism is what is asserted: every selected week re-scored off its *own* window's
+    row under that window's own `xmult`, every case-2 week left at zero, and the shift
+    reported rather than turned into a conclusion the data does not support (nothing is
+    significant undisplaced, so there is no degradation to detect — see the docstring).
+    """
+    if not (pwfo.OUT_DIR / "pwfo_oos.npy").exists():
+        print("    (skipped: no pwfo tables)", end="")
+        return
+    names = sorted({"nT", *(pwfo._base(m) for f in pwfo.variants().values()
+                            for m in pwfo._metrics(f))})
+    cols, oos, wins = pwfo.load_tables(names)
+    shift = 50
+    mean, sd = pwfo.null_moments(oos[shift:])
+    shifts, zs = [], []
+    for name, f in pwfo.variants().items():
+        weeks = pwfo.evaluate(f, cols, oos, wins)
+        moved = pwfo.displace(weeks, oos, shift=shift)
+        control = weeks[shift:]
+        assert len(moved) == len(control) == len(wins) - shift, (name, len(moved))
+        for i, (ctl, mv) in enumerate(zip(control, moved)):
+            j = i + shift
+            # The week is window j's; the selection is window i's.
+            assert mv["friday"] == ctl["friday"] and mv["cost"] == ctl["cost"], (name, i)
+            assert mv["row"] == weeks[i]["row"] and mv["selected"] == weeks[i]["selected"]
+            if mv["selected"]:
+                assert mv["osnp"] == float(oos[j, weeks[i]["row"], 0]), (name, i)
+                assert mv["traded"] == (mv["ont"] > 0), (name, i)
+            else:
+                assert mv["osnp"] == 0.0 and mv["traded"] is False, (name, i)
+        c_agg, m_agg = pwfo.aggregate(control), pwfo.aggregate(moved)
+        z = pwfo.significance(m_agg, mean, sd, 1)["z"]
+        assert abs(z) < 3.0, f"{name}: displaced z {z:.3f}"
+        shifts.append(m_agg["toNP"] - c_agg["toNP"])
+        zs.append(z)
+    assert max(abs(v) for v in shifts) > 10.0, "displacement changed almost nothing at all"
+    print(f"    (k -> k+{shift} over {len(wins) - shift} shared weeks: toNP moves "
+          f"{min(shifts):+.1f}..{max(shifts):+.1f}/share, |z| <= {max(abs(z) for z in zs):.3f}; "
+          "neither side is significant, so this is the mechanism, not a degradation)", end="")
+
+
+def test_unit9_gate_and_benchmark_read_their_boundaries() -> None:
+    """PLAN §3 Unit 9's three conditions, and the SPY series condition 3 is measured against.
+
+    Rev 1's single significance test would have passed a strategy that beat a random filter
+    while losing money after costs, or that made money purely through long bias in a market
+    that quadrupled -- so each condition is checked in both directions, including the one
+    that decides which way `beats_spy` points. A gate whose comparison is backwards passes
+    every check that only ever feeds it a failing filter.
+
+    `spy_weekly`'s two boundaries are here too: the OOS week's **first** stored close is the
+    entry, and its `oos_end` day is **inside** the span. Both are off-by-ones that shift the
+    benchmark by a day's move -- around a fifth of a weekly move on SPY -- without ever
+    raising, and condition 3 is the only thing that reads them.
+    """
+    spy_flat = np.array([1.0, -1.0, 1.0, -1.0, 2.0])
+    agg = {"n": 5, "avg": 1.0, "std": 2.0, "toNP": 5.0}
+    g = pwfo.gate(agg, {"Kp": 0.01}, spy_flat)
+    assert (g["significant"], g["profitable"]) == (True, True), g
+    assert g["beats_spy"] is (agg["avg"] / agg["std"] > g["spy_mu_sigma"]), g
+    assert abs(g["spy_total"] - 2.0) < 1e-12
+    assert not pwfo.gate(agg, {"Kp": 0.05}, spy_flat)["significant"], "0.05 is not < 0.05"
+    assert not pwfo.gate({**agg, "toNP": 0.0}, {"Kp": 0.01}, spy_flat)["profitable"]
+    # A filter with the same mu/sigma as the benchmark does not beat it.
+    same = {"n": 5, "avg": float(spy_flat.mean()), "std": float(spy_flat.std(ddof=1)),
+            "toNP": 1.0}
+    assert not pwfo.gate(same, {"Kp": 0.01}, spy_flat)["beats_spy"], "ties must not pass"
+    assert pwfo.gate({**same, "avg": same["avg"] * 2}, {"Kp": 0.01}, spy_flat)["beats_spy"]
+
+    bars = _synth_bars("2020-01-06", "2020-01-24")
+    days = _et_days(bars)
+    wins = [{"oos_start": "2020-01-13", "oos_end": "2020-01-17"}]
+    got = pwfo.spy_weekly(bars, wins)
+    inside = np.flatnonzero((days >= np.datetime64("2020-01-13"))
+                            & (days <= np.datetime64("2020-01-17")))
+    want = float(bars.close[inside[-1]] - bars.close[inside[0]])
+    assert abs(float(got[0]) - want) < 1e-6, (float(got[0]), want)
+    # The entry is the first bar *in* the week, not the last bar of the week before, and
+    # the exit is on `oos_end` itself, not the day before it.
+    before = float(bars.close[inside[0] - 1])
+    assert abs(float(got[0]) - float(bars.close[inside[-1]] - before)) > 1e-9, "entry is early"
+    friday_open = np.flatnonzero(days == np.datetime64("2020-01-17"))[0]
+    assert abs(float(got[0]) - float(bars.close[friday_open - 1] - bars.close[inside[0]])) > 1e-9, \
+        "the last day of the OOS week is outside the span"
+    try:
+        pwfo.spy_weekly(bars, [{"oos_start": "2021-01-04", "oos_end": "2021-01-08"}])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a week with no bars returned a price change")
+    print(f"    (gate 3/3 both ways; SPY week {float(got[0]):+.3f}/share off "
+          f"{inside.size} bars)", end="")
+
+
+def test_unit9_displace_leaves_an_unselected_week_at_zero() -> None:
+    """`pwfo.displace` on SPEC §6.4 case 2, which the real 525 windows never produce.
+
+    No row fails the screens in any of 4725 real filter-windows (Unit 8), so the branch
+    that must *not* re-score a week is unreachable on the stored table and the falsification
+    test over it cannot exercise it. Built here instead. `traded` is checked as well: it is
+    recomputed from the displaced `ont` and nothing downstream reads it, so a stale value
+    would survive every aggregate — which is exactly how it stays stale.
+    """
+    rng = np.random.default_rng(2)
+    oos = np.zeros((6, 4, 6), dtype=np.float32)
+    oos[:, :, 0] = rng.normal(5.0, 1.0, (6, 4))    # every stored row is far from zero
+    oos[:, :, 1] = 3.0
+    oos[3, :, 1] = 0.0                              # ...and one window fires no signals
+    names = rmv.METRIC_COLS[rmv.OOS_COLS]
+    weeks = []
+    for k in range(6):
+        sel = k != 0
+        rec = {"row": k % 4 if sel else None, "selected": sel, "cost": 0.02,
+               "friday": f"2020-01-{k + 1:02d}", "nT": 9.0 if sel else 0.0,
+               "rank_tie": k, "pick_tie": 1, "n": 6, "vup": 0.5, "vdn": 0.5}
+        rec.update({nm: (float(oos[k, k % 4, j]) if sel else 0.0)
+                    for j, nm in enumerate(names)})
+        rec["traded"] = rec["ont"] > 0
+        weeks.append(rec)
+
+    moved = pwfo.displace(weeks, oos, shift=2)
+    assert len(moved) == 4, len(moved)
+    # Output i is window i+2's week carrying window i's selection.
+    assert moved[0]["selected"] is False, "window 0 passed no screens; its carry must be too"
+    assert moved[0]["osnp"] == 0.0 and moved[0]["ont"] == 0.0 and moved[0]["row"] is None
+    assert moved[0]["traded"] is False and moved[0]["nT"] == 0.0
+    for i in (1, 2, 3):
+        j = i + 2
+        assert moved[i]["friday"] == weeks[j]["friday"], "the week is the later one"
+        assert moved[i]["row"] == weeks[i]["row"], "the selection is the earlier one"
+        assert moved[i]["osnp"] == float(oos[j, weeks[i]["row"], 0]), i
+        assert moved[i]["rank_tie"] == weeks[i]["rank_tie"], "tie widths ride with the pick"
+    # Window 3 fires no signals, so the record that lands on it must report not-traded.
+    assert moved[1]["ont"] == 0.0 and moved[1]["traded"] is False, moved[1]
+    assert moved[2]["traded"] is True and moved[3]["traded"] is True
+    assert weeks[2]["osnp"] != moved[0]["osnp"], "displace mutated its input"
+    for bad in (0, 6, 7):
+        try:
+            pwfo.displace(weeks, oos, shift=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"shift={bad} was accepted on 6 windows")
+    print("    (case 2 carries nothing; a no-signal target week reports not-traded)", end="")
+
+
+def test_unit9_report_carries_every_spec_63_column() -> None:
+    """The report is the unit's deliverable, so its shape is a test, not a look.
+
+    Every §6.3 row label, the row-1 scalars §6.5 needs (`K`, bootstrap mean and sd, the
+    cost per trade), and one §6.4 Table 1 with all fourteen published headers plus the two
+    tie widths Unit 8 measured. A report missing a column reads as a filter that does not
+    have that property rather than as a bug.
+    """
+    rng = np.random.default_rng(5)
+    n_win, n_combo = 12, 40
+    oos = np.zeros((n_win, n_combo, 6), dtype=np.float32)
+    oos[:, :, 0] = rng.normal(0.0, 2.0, (n_win, n_combo))
+    oos[:, :, 1] = rng.integers(0, 5, (n_win, n_combo))
+    wins = [{"friday": f"2020-01-{d:02d}", "oos_start": f"2020-02-{d:02d}",
+             "oos_end": f"2020-02-{d:02d}", "is_start": f"2020-01-{d:02d}",
+             "is_end": f"2020-01-{d:02d}", "xmult": 1.0, "cost": 0.02}
+            for d in range(1, n_win + 1)]
+    cols = {"nT": np.abs(rng.normal(20, 5, (n_win, n_combo))),
+            "mLb": rng.normal(5, 1, (n_win, n_combo)),
+            "mLTr": -np.abs(rng.normal(2, 1, (n_win, n_combo))),
+            "PF": np.abs(rng.normal(2, 0.5, (n_win, n_combo))),
+            "lr": np.abs(rng.normal(2, 0.5, (n_win, n_combo))),
+            "eqR2": rng.uniform(0, 100, (n_win, n_combo)),
+            "eq2R2": rng.uniform(0, 100, (n_win, n_combo))}
+    with tempfile.TemporaryDirectory() as tmp:
+        res = {"K": 11}
+        for name, f in pwfo.variants().items():
+            weeks = pwfo.evaluate(f, cols, oos, wins)
+            res[name] = {"filt": f, "weeks": weeks, "agg": pwfo.aggregate(weeks)}
+        assert Path(tmp).exists()
+        text = pwfo.report(res, oos, wins, rng.normal(1.0, 4.0, n_win), n_iter=200,
+                           table1="CL2")
+
+    for col, key in pwfo.R63:
+        assert f"{col} {key}" in text, f"§6.3 col {col} ({key}) missing from the report"
+    for token in ("K = 11", "bootstrap avg", "cost/trade", "exact null moments",
+                  "K*p", "1-(1-p)^K", "decision gate"):
+        assert token in text, f"row-1/gate token missing: {token}"
+    header = [ln for ln in text.splitlines() if "osnp" in ln and "NetEq" in ln]
+    assert len(header) == 1, "no §6.4 Table 1 header"
+    for h in ("osnp", "ont", "ownp", "ownt", "ollt", "odd", "EQ", "NetEq", "N", "vup",
+              "vdn", "rk_tie", "pk_tie"):
+        assert h in header[0], f"§6.4 header {h} missing"
+    body = text.split(header[0])[1].strip().splitlines()
+    assert len(body) == n_win, f"{len(body)} Table 1 rows for {n_win} windows"
+
+    # ⚑ The numbers, not just the labels. `Prob` comes from `significance` and is the only
+    # row in the table that is not a property of the filter's own weeks, so a report that
+    # silently read it off the aggregate would print a column of zeros under the right
+    # heading -- and `Z Prob` would still be "present".
+    mean, sd = pwfo.null_moments(oos)
+    probs = [float(v) for v in
+             next(ln for ln in text.splitlines() if ln.startswith("Z Prob")).split()[2:]]
+    want = [pwfo.significance(res[nm]["agg"], mean, sd, 11)["p"]
+            for nm in res if nm != "K"]
+    assert len(probs) == len(want) and all(abs(a - b) < 5e-5 for a, b in zip(probs, want)), \
+        (probs, want)
+    assert any(v > 1e-4 for v in probs), "every Prob is zero"
+    # EQ and NetEq are running sums: the last row's NetEq is the filter's `toNP`.
+    # Fields from the right: pk_tie, rk_tie, vdn, vup, N, NetEq -- N/vup/vdn are three
+    # tokens whether they hold parameters or the "--" of an unselected week.
+    assert abs(float(body[-1].split()[-6]) - res["CL2"]["agg"]["toNP"]) < 5e-3, body[-1]
+    print(f"    ({len(pwfo.R63)} §6.3 columns, {n_win} Table 1 rows)", end="")
 
 
 def main() -> int:

@@ -461,6 +461,8 @@ a test asserts they continue to agree.
 
 ### 3.2 Other transfers
 
+⚑ **Measured in Unit 9: the fee model is still structurally wrong and it cannot change the Unit 9 gate.** Total cost paid over 525 pre-tail windows runs **$24.54 to $84.00 per share** across the nine filters. At **zero cost** the CL4-as-written family stays negative, and the random-filter null rises with the filters (gross null **+123.49** against net +61.48), so gross `CL2` at +157.47 sits *closer* to the null than net `CL2` at +132.11 does. The FINRA TAF per-share schedule and the SEC Section 31 rate history are therefore **not blockers** for the gate — they are worth cents on a result that misses by a factor of sixty. They remain required before any live order is sent.
+
 | Item | Decision | Reason |
 |---|---|---|
 | **Bar timestamp** | a bar is labelled by its **open** (Alpaca convention). All gate comparisons use the open timestamp. | Undefined, this is worth one bar. Under open-labelling the last gated bar opens 15:50 and closes 15:55; 10:00 is the 7th RTH bar. |
@@ -891,6 +893,56 @@ significant. The linear approximation holds while `K*p << 1`.
 > **Our convention: the same denominator on both sides — all OOS periods, zero-trade weeks
 > counted as zero.** It is the conservative reading and the only internally consistent one.
 > See §9-K.
+
+
+### Pinned in Unit 9 ⚑
+
+Five more things the source leaves open, all of them in §6.3's columns, and one measured
+fact about the null that no reading changes.
+
+**`KTau^2` is stored signed and unsquared**, despite the column name. [M25 Figure 2] prints
+`KTau = 93` beside `eqR2 = 82` in the same row, so the printed column is on the same 0–100
+scale as the other two correlation columns (§6.6). A square is derivable from the signed
+value and the sign is not, so the recoverable form is the one stored — and `tkr|bl` reads it
+as-is. Two of the nine filters return a **negative** `KTau^2` (−72.56, −54.55), which a
+squared column could not express and which is the honest description of their equity curves.
+
+**`v20` is Δequity/Δperiod over the last 20 periods**, i.e. the mean weekly net of those 20,
+which is exactly `(eq[-1] - eq[-21]) / 20`. §6.3 col T says "equity velocity" and an OLS
+slope through the same 20 points is the other reading; velocity is what the word names.
+
+**`aoTr` is net per trade, not gross.** §6.3 col E says only "profit" where col B of the
+same table is gross and col C net, so the column is ambiguous. Net is the reading §9-K
+already took for every other denominator in this table.
+
+**`toGP` is reconstructed, not re-simulated.** Cost lives inside `_simulate` per trade
+(§6.6), so gross is `osnp + ont × cost` on the stored columns — exact arithmetic rather than
+a second simulation that could disagree with the first.
+
+**`tkr|bl` is 0 when `BE` is `inf`.** §6.3 col Y is `t · ktau · eqR2 / BE`, and a filter that
+never breaks even would otherwise propagate `inf` through a product whose other factors are
+already signed. It scores zero, which is where a filter that does not make money belongs.
+
+⚑ **The null's moments are exact, not estimated.** The mirror random filter is a sum of
+independent per-window uniform draws, so `E = sum_k mean_k` and `Var = sum_k var_k` over
+each window's stored OOS column. Measured over 525 pre-tail SPY windows: **+61.48/share,
+sd 97.60** — against [M25]'s +$65.3/week with sd $67.3 on CL, and confirming this section's
+central point that **the null is positive**. The 5000-iteration bootstrap gives 61.43 /
+96.96; `pwfo.null_moments` is what says whether it converged, and `pwfo.bootstrap` is what
+carries the distribution's shape.
+
+⚑ **The normal tail this section reads off that distribution is earned, not assumed.**
+Step 3 takes a one-sided Gaussian tail, and the per-window OOS columns are badly non-normal
+— skew from **−4.20 to +1.00** across the 525 windows. The sum is not: the 5000-draw
+distribution has skew **−0.054** and excess kurtosis **−0.12**, and its empirical tail for
+`CL2` (**0.2434**) tracks the normal `Prob` (**0.2346**). That is the central limit theorem
+over 525 independent draws, and it is what licenses steps 2–3. Assert the shape of the
+*sum*, never of the summands.
+
+⚑ **Measured: no baseline filter is significant against it.** `Prob` runs 0.235 to 0.989
+across the nine, so `K·p` at `K = 13` runs **3.05 to 12.85** against a 0.05 bar. `z = 2`
+would need `toNP > 256.67`; the best filter reaches 132.11, and a per-window oracle with
+perfect foresight reaches 4751.67. See PLAN §3 Unit 9.
 
 ---
 

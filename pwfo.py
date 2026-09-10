@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import operator
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -536,9 +537,10 @@ def _longest(mask) -> int:
 def aggregate(weeks: list[dict]) -> dict:
     """SPEC §6.3's aggregates over one filter's OOS periods. PLAN Unit 8's thirteen.
 
-    ⚠ Four of these names collide with §6.1's per-combination metrics (SPEC §6.6): `%P`,
-    `std` and `t` here are **per OOS period**, where the same names in a `weeks` record are
-    per trade within one window. Unit 9 prints both blocks and has to disambiguate.
+    ⚠ Six of these names collide with §6.1's per-combination metrics (SPEC §6.6): `%P`,
+    `std`, `t`, `eqR2` and `ktau` here are **per OOS period**, where the same names in a
+    `weeks` record are per trade within one window. Unit 9 prints both blocks and has to
+    disambiguate. `LLTr` and `llt` collide the same way (SPEC §6.6, naming collision).
 
     Conventions, all pinned upstream rather than chosen here:
 
@@ -571,6 +573,24 @@ def aggregate(weeks: list[dict]) -> dict:
     nt, nw = float(ont.sum()), float(ownt.sum())
     nl, wsum = nt - nw, float(ownp.sum())
     lsum = float(p.sum()) - wsum
+    t = avg / (std / math.sqrt(n)) if std > 0.0 and n > 1 else 0.0
+    # §6.3 col X: periods needed for a 98% chance equity is above zero, assuming normality.
+    # n*avg / (std*sqrt(n)) = Z98 solves to (Z98*std/avg)^2. A filter that does not make
+    # money never breaks even, hence inf rather than a large number.
+    be = max(1, math.ceil((Z98 * std / avg) ** 2)) if avg > 0.0 else math.inf
+
+    # ---- Unit 9 (PLAN §3): SPEC §6.3's remaining columns.
+    # `toGP` is reconstructed, not stored. Cost lives inside `_simulate` per trade (§6.6),
+    # so gross is net plus what this window's trades actually paid -- exact arithmetic on
+    # the stored columns rather than a second simulation that could disagree.
+    gp = float((p + ont * g("cost")).sum())
+    skew, kur = _moments(p) if n > 1 else (0.0, 0.0)
+    ktau, eq_r2 = (_ktau(eq), _lin_r2(eq)) if n else (0.0, 100.0)
+    # §6.3 col T, "equity velocity for the latest 20 periods": d(equity)/d(period) over the
+    # last 20, which is their mean weekly net. An OLS slope through the same 20 points is
+    # the other reading of "velocity" and is a different number; this one is what the word
+    # says and what `(eq[-1] - eq[-21]) / 20` reproduces.
+    v20 = float(p[-20:].mean()) if n else 0.0
     return {
         "n": n,
         # ⚑ These are not complements. `n_trd` is §6.3 col G, the periods that traded.
@@ -582,7 +602,20 @@ def aggregate(weeks: list[dict]) -> dict:
         "toNP": float(p.sum()),
         "avg": avg,
         "std": std,
-        "t": avg / (std / math.sqrt(n)) if std > 0.0 and n > 1 else 0.0,
+        "t": t,
+        "toGP": gp,
+        "aoGP": gp / n if n else 0.0,
+        # ⚑ Net per trade, not gross. §6.3 col E says only "profit" where col B is gross
+        # and col C net, so the column is ambiguous; net is the reading §9-K already took
+        # for every other denominator in this table.
+        "aoTr": float(p.sum()) / nt if nt else 0.0,
+        "ao#T": nt / n if n else 0.0,
+        "skew": skew,
+        "kur": kur,
+        "LLTr": min(0.0, float(g("ollt").min())) if n else 0.0,
+        "v20": v20,
+        "KTau^2": ktau,
+        "eqR2": eq_r2,
         "%P": 100.0 * float(np.count_nonzero(p > 0)) / n if n else 0.0,
         "%Wtr": 100.0 * nw / nt if nt else 0.0,
         "oW|oL": (wsum / nw) / abs(lsum / nl) if nw and nl and lsum else math.inf,
@@ -591,29 +624,390 @@ def aggregate(weeks: list[dict]) -> dict:
         "Blw": _longest(eq < peak),
         "eqDD": float((eq - peak).min()) if n else 0.0,
         "LLp": min(0.0, float(p.min())) if n else 0.0,
-        # §6.3 col X: periods needed for a 98% chance equity is above zero, assuming
-        # normality. n*avg / (std*sqrt(n)) = Z98 solves to (Z98*std/avg)^2. A filter that
-        # does not make money never breaks even, hence inf rather than a large number.
-        "BE": max(1, math.ceil((Z98 * std / avg) ** 2)) if avg > 0.0 else math.inf,
+        "BE": be,
+        # §6.3 col Y, "a measure of how good the filter fits". On the stored x100 scale for
+        # both correlation columns, so it is x10000 against a reading that used fractions --
+        # neither source states one, and only the ordering across filters is used.
+        #
+        # ⚑ No `be == inf` branch: `t`, `ktau` and `eq_r2` are each finite by their own zero
+        # guards, so IEEE-754 already gives `finite / inf == 0.0` -- which is where a filter
+        # that never breaks even belongs. Unit 9's review found the explicit guard was
+        # unkillable by any test, because it could not change an answer.
+        "tkr|bl": t * ktau * eq_r2 / be,
     }
 
 
-def run_filters(filters: dict | None = None, out_dir: Path | str = OUT_DIR) -> dict:
+# ------------------------------------------------- Comparisons (PLAN §3 Unit 9)
+
+COUNTER = Path(__file__).parent / "comparisons.json"
+
+
+def count_look(keys, kind: str = "filter", path: Path | str = COUNTER) -> int:
+    """Record OOS-touching looks; return `K`, SPEC §6.5 step 4's multiplier.
+
+    The file is the record, not this function: `comparisons.json` is committed and already
+    holds Unit 8's nine filter variants and the two accidental reads of the withheld tail
+    that PLAN §3 Unit 9 names. Nothing on disk could have reconstructed those -- `K` is a
+    fact about what was *examined*, and no artifact carries it -- so they are data, seeded
+    once, rather than a constant here that could drift from what was actually run.
+
+    ⚑ Deviation from PLAN §3 Unit 9, which wrote "a file the evaluator increments on every
+    OOS-touching run". Keyed, not incremented. `K` corrects for the number of *distinct*
+    hypotheses examined; re-executing a deterministic evaluation of the same nine filters
+    tests nothing new, and an incrementing counter would make the reported significance a
+    function of how many times someone ran the script. Re-running is idempotent here; a
+    new filter, a new ambiguity reading or a new A/B is not, which is the property PLAN
+    actually wants and the one "it's a 35-second run" threatens.
+    """
+    path = Path(path)
+    book = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"looks": {}}
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for k in ([keys] if isinstance(keys, str) else keys):
+        book["looks"].setdefault(k, {"kind": kind, "first": now})
+    path.write_text(json.dumps(book, indent=1, sort_keys=True), encoding="utf-8")
+    return len(book["looks"])
+
+
+def run_filters(filters: dict | None = None, out_dir: Path | str = OUT_DIR,
+                counter: Path | str = COUNTER) -> dict:
     """Every filter against the stored pre-tail tables. `{name: {weeks, agg, filt}}`.
 
     One hoist shared by all of them -- the columns are the union of what they read, plus
-    `nT`, which every record surfaces. ⚑ Each entry is one OOS-touching comparison and
-    belongs in PLAN §Unit 9's multiplier.
+    `nT`, which every record surfaces. ⚑ Each entry is one OOS-touching comparison and is
+    recorded in `counter` on the way through: this is the only door to the OOS table that
+    ranks anything, so counting here is what makes PLAN §Unit 9's multiplier hard to lose.
+    `K`, the count after this run, comes back alongside the filters under the key `"K"`.
     """
     filters = variants() if filters is None else filters
     names = sorted({"nT", *(_base(m) for f in filters.values() for m in _metrics(f))})
     cols, oos, wins = load_tables(names, out_dir)
-    out = {}
+    out = {"K": count_look(list(filters), path=counter)}
     for name, f in filters.items():
         weeks = evaluate(f, cols, oos, wins)
         out[name] = {"filt": f, "weeks": weeks, "agg": aggregate(weeks)}
     return out
 
+
+# --------------------------------------- Significance and report (PLAN §3 Unit 9)
+
+
+def _moments(p: np.ndarray) -> tuple[float, float]:
+    """SPEC §6.3 cols I and J: skew and **excess** kurtosis, both biased (`scipy` defaults).
+
+    `scipy.stats.skew`/`kurtosis` with their default `bias=True, fisher=True` are the
+    oracle, pinned in `test_unit9_aggregate_extras_match_a_hand_computation`. Neither
+    source states a convention, so the one that a reader can reproduce from a named
+    function wins over the one that needs a footnote.
+    """
+    d = p - p.mean()
+    m2 = float((d * d).mean())
+    if m2 <= 0.0:
+        return 0.0, 0.0
+    return float((d**3).mean()) / m2**1.5, float((d**4).mean()) / (m2 * m2) - 3.0
+
+
+def _ktau(y: np.ndarray) -> float:
+    """SPEC §6.3 col U: Kendall tau of the equity curve against period order, x100.
+
+    Same estimator and scale as `rmv`'s per-combination `ktau` (SPEC §6.6): x is the
+    period index and strictly increasing, so it carries no ties and tau-b collapses to
+    `(C - D) / sqrt((C + D) * nPairs)`, which is what `scipy.stats.kendalltau` computes.
+
+    ⚑ Signed, not squared, despite §6.3 naming the column `KTau^2`. [M25 Figure 2] prints
+    `KTau = 93` beside `eqR2 = 82` in the same row, so the printed column is on the same
+    0-100 scale as the other two correlation columns; a square is derivable from this and
+    the sign is not, so the recoverable form is the one stored. `tkr|bl` reads it as-is.
+
+    ponytail: O(n^2) as a dense sign matrix -- 2.2 MB at n=525. `_longest`'s reasoning,
+    one dimension up: the merge-sort inversion count is the upgrade path above ~5000.
+    """
+    n = y.size
+    if n < 2:
+        return 0.0
+    s = np.sign(y[None, :] - y[:, None])[np.triu_indices(n, 1)]
+    conc, disc = int(np.count_nonzero(s > 0)), int(np.count_nonzero(s < 0))
+    if conc + disc == 0:
+        return 0.0
+    return 100.0 * (conc - disc) / math.sqrt(float(conc + disc) * (n * (n - 1) // 2))
+
+
+def _lin_r2(y: np.ndarray) -> float:
+    """SPEC §6.3 col V: R^2 of a **straight-line** fit to the equity curve, x100.
+
+    Not `eq2R2`. §6.6's `eq2R2` is the 2nd-order fit and this is the linear one; [M25 p.15
+    col V] says "a straight-line fit" in as many words. Clamped at 100 like `rmv`'s per-
+    combination `eqR2`, and flat or single-point equity returns that same degenerate 100.
+    """
+    n = y.size
+    if n < 2:
+        return 100.0
+    x = np.arange(n, dtype=np.float64) - (n - 1) / 2.0
+    dy = y - y.mean()
+    syy = float((dy * dy).sum())
+    if syy <= 0.0:
+        return 100.0
+    res = dy - x * (float((x * dy).sum()) / float((x * x).sum()))
+    return min(100.0, 100.0 * (1.0 - float((res * res).sum()) / syy))
+
+
+def bootstrap(oos: np.ndarray, n_iter: int = 5000, seed: int = 0) -> np.ndarray:
+    """SPEC §6.5's mirror random filter: `n_iter` chance `toNP` totals.
+
+    Per window pick a *uniformly random* row's OOS net profit instead of the filter's, and
+    sum across windows. The null this builds is **not zero** -- [M25 p.9] measures the
+    random filter at +$65.3/week on CL, and a filter can beat zero and still be worthless.
+
+    ⚑ Every window contributes, zero-trade rows included (SPEC §9-K). [M25] divides its
+    filter's total by the 446 weeks it traded while defining the null over all 517; one
+    denominator on both sides moves that paper's own `K*p` from 0.049 to 2.234, and it is
+    the choice this project's gate turns on.
+
+    ⚑ The sampled row is a row of the **stored** grid, so duplicate parameter rows that
+    produce identical trade sets are drawn with their multiplicity. That is correct rather
+    than a bias to remove: the filter chooses from the same 4312 rows with the same
+    duplication (PLAN Unit 6 measures 2640-3652 distinct trade sets per window), so both
+    sides of the comparison see one population.
+    """
+    col = oos[:, :, 0].astype(np.float64)
+    n_win, n_combos = col.shape
+    idx = np.random.default_rng(seed).integers(0, n_combos, size=(n_iter, n_win))
+    return col[np.arange(n_win)[None, :], idx].sum(axis=1)
+
+
+def null_moments(oos: np.ndarray) -> tuple[float, float]:
+    """The mirror-random null's exact `(mean, sd)` of `toNP`. No sampling.
+
+    A sum of independent uniform draws, one per window, so `E = sum_k mean_k` and
+    `Var = sum_k var_k` over each window's stored OOS column. `bootstrap` is what SPEC
+    §6.5 specifies and what carries the distribution's *shape*; this is what says whether
+    5000 iterations converged, and it costs one pass.
+    """
+    col = oos[:, :, 0].astype(np.float64)
+    return float(col.mean(axis=1).sum()), math.sqrt(float(col.var(axis=1).sum()))
+
+
+def significance(agg: dict, null_mean: float, null_sd: float, k: int) -> dict:
+    """SPEC §6.5 steps 1-4, on §9-K's denominator. `null_*` are moments of `toNP`.
+
+    Step 4's `1 - (1 - p)^K ~= K*p` is only a good approximation while `K*p << 1`, so the
+    exact form is what is returned and `K*p` is what §6.5 walks through. They agree to
+    four digits at the paper's own numbers and diverge exactly where the result stops
+    being significant anyway.
+    """
+    n = agg["n"]
+    sd_mean = null_sd / n
+    z = (agg["avg"] - null_mean / n) / sd_mean if sd_mean > 0.0 else 0.0
+    p = 0.5 * math.erfc(z / math.sqrt(2.0))          # one-sided normal tail, P(Z > z)
+    return {"z": z, "p": p, "K": k, "Kp": min(1.0, 1.0 - (1.0 - p) ** k)}
+
+
+def shuffled_oos(oos: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Permute the combo axis independently per window. PLAN §3 Unit 9's first done-when.
+
+    Every window keeps its own OOS *population* -- same rows, same weeks, same marginal
+    distribution -- and loses only the correspondence between an IS row and its own OOS
+    row. So a filter run against this can still pick a row and still be scored; what it
+    can no longer do is carry information from the IS half to the OOS half. Anything that
+    survives is a property of the marginals, not of the selection.
+    """
+    rng = np.random.default_rng(seed)
+    out = np.empty_like(oos)
+    for k in range(oos.shape[0]):
+        out[k] = oos[k, rng.permutation(oos.shape[1])]
+    return out
+
+
+def displace(weeks: list[dict], oos: np.ndarray, shift: int = 50) -> list[dict]:
+    """Score each OOS week with the selection made `shift` windows *earlier*. 2nd done-when.
+
+    Returns `len(weeks) - shift` records, one per window from `shift` on: window `j`'s own
+    dates, cost and OOS bars, carrying window `j - shift`'s chosen row. Its control is
+    `weeks[shift:]` -- **the same weeks, the same null, the same denominator**, differing
+    only in whose selection was applied. That is the whole question: does the IS window the
+    parameters came from matter?
+
+    ⚑ **Under window `j`'s own `xmult`**, which is automatic rather than arranged: `run`
+    computes each window's whole OOS grid with the multiplier fitted on *that* window's IS
+    bars, so `oos[j]` already carries them. Carrying the earlier window's multiplier across
+    would mis-scale the thresholds by up to 20x (SPEC §1.2.1) and the test would "degrade"
+    for a reason that has nothing to do with the filter.
+
+    ⚑ **It truncates; it does not wrap.** Rev 1 wrapped the tail back to window 0 to keep
+    the denominator at 525 -- and that was wrong. SPY runs $210 to $650 across the sample,
+    per-share dollar P/L is not scale-free across a 3x price change, and measured, the 50
+    wrapped windows (9.5% of the sample) carried **65.3% of the total displacement effect**
+    with every one of the nine contributions pointing the same way. That is a regime
+    artifact wearing the result's clothes. Holding the weeks fixed and varying only the
+    selection removes it, and costs nothing but `shift` windows of sample.
+
+    ⚑ What this can and cannot show. If displacement leaves the result unchanged, the
+    selection is a static parameter prior rather than a response to the IS window -- and
+    column-shuffling would never have caught that, because shuffled columns break a link a
+    static prior was not using. The converse needs the undisplaced filter to be significant
+    first; on this sample nothing is, so the run measures the mechanism and the *size* of
+    the shift, not a degradation from a signal that was never there.
+    """
+    if not 0 < shift < len(weeks):
+        raise ValueError(f"shift {shift} outside 1..{len(weeks) - 1}")
+    names = rmv.METRIC_COLS[rmv.OOS_COLS]
+    out = []
+    for j in range(shift, len(weeks)):
+        src = weeks[j - shift]
+        rec = dict(weeks[j])
+        rec.update(row=src["row"], n=src["n"], vup=src["vup"], vdn=src["vdn"],
+                   rank_tie=src["rank_tie"], pick_tie=src["pick_tie"],
+                   selected=src["selected"])
+        if src["selected"]:
+            rec.update({nm: float(v) for nm, v in zip(names, oos[j, src["row"]])})
+            rec["nT"] = src["nT"]
+        else:
+            rec.update(nT=0.0, **dict.fromkeys(names, 0.0))
+        rec["traded"] = rec["ont"] > 0
+        out.append(rec)
+    return out
+
+
+def spy_weekly(bars: data.Bars, wins: list[dict]) -> np.ndarray:
+    """Long-only SPY over each window's OOS week, per share. PLAN §3 Unit 9 gate cond. 3.
+
+    First to last stored close inside the OOS span, so it is the same bars, the same weeks
+    and the same units as `toNP` -- a benchmark measured anywhere else would not be a
+    comparison. No cost is charged: buy-and-hold pays it twice in ten years against the
+    filters' thousands of trades, and leaving it out is the conservative direction for the
+    condition the strategy has to *beat*.
+    """
+    out = []
+    for w in wins:
+        lo = np.datetime64(w["oos_start"]).astype("datetime64[ns]").astype(np.int64)
+        hi = (np.datetime64(w["oos_end"]) + np.timedelta64(1, "D")
+              ).astype("datetime64[ns]").astype(np.int64)
+        i, j = np.searchsorted(bars.ts, lo), np.searchsorted(bars.ts, hi)
+        if j <= i:
+            raise ValueError(f"no bars in the OOS week starting {w['oos_start']}")
+        out.append(float(bars.close[j - 1] - bars.close[i]))
+    return np.array(out, dtype=np.float64)
+
+
+# SPEC §6.3's aggregate table, in the source's column order. `Prob` is the only one that
+# is not a property of the filter's own weeks, so it arrives from `significance`.
+R63 = [("B", "toGP"), ("C", "toNP"), ("D", "aoGP"), ("E", "aoTr"), ("F", "ao#T"),
+       ("G", "n_trd"), ("H", "std"), ("I", "skew"), ("J", "kur"), ("K", "t"),
+       ("L", "oW|oL"), ("M", "%Wtr"), ("N", "%P"), ("O", "LLTr"), ("P", "LLp"),
+       ("Q", "eqDD"), ("R", "wpr"), ("S", "lpr"), ("T", "v20"), ("U", "KTau^2"),
+       ("V", "eqR2"), ("W", "Blw"), ("X", "BE"), ("Y", "tkr|bl"), ("Z", "Prob")]
+
+
+def gate(agg: dict, sig: dict, spy: np.ndarray) -> dict:
+    """PLAN §3 Unit 9's decision gate. Three conditions, and all three must hold.
+
+    Rev 1's single significance test would have passed a strategy that beat a random
+    filter while losing money after costs, or that made money purely through long bias in
+    a market that quadrupled -- so `toNP > 0` and the benchmark are conditions, not
+    commentary. Risk-adjusted is `mu/sigma` per OOS week on both sides, which is a Sharpe
+    without the annualization or the risk-free rate: both cancel between two series
+    measured on the same 525 weeks in the same units.
+    """
+    mu_s, sd_s = float(spy.mean()), float(spy.std(ddof=1))
+    ours = agg["avg"] / agg["std"] if agg["std"] > 0.0 else 0.0
+    return {
+        "significant": sig["Kp"] < 0.05,
+        "profitable": agg["toNP"] > 0.0,
+        "beats_spy": ours > (mu_s / sd_s if sd_s > 0.0 else 0.0),
+        "mu_sigma": ours, "spy_mu_sigma": mu_s / sd_s if sd_s > 0.0 else 0.0,
+        "spy_total": float(spy.sum()),
+    }
+
+
+def report(res: dict, oos: np.ndarray, wins: list[dict], spy: np.ndarray,
+           n_iter: int = 5000, seed: int = 0, table1: str | None = None) -> str:
+    """SPEC §6.3's aggregate table, its row-1 scalars, and one §6.4 per-week Table 1.
+
+    `res` is `run_filters`' output, `K` included -- the comparison count multiplies every
+    `Prob` in the table, which is the whole reason `comparisons.json` exists.
+
+    Transposed against the source: [M25 Figure 2] runs one filter per row across 25
+    columns, and nine filters of 25 columns do not fit anything a person reads. Metrics
+    run down and filters across, which is the same table.
+    """
+    k = res["K"]
+    filters = {n: r for n, r in res.items() if n != "K"}
+    boot = bootstrap(oos, n_iter, seed)
+    exact_mean, exact_sd = null_moments(oos)
+    b_mean, b_sd = float(boot.mean()), float(boot.std(ddof=1))
+    n = len(wins)
+    cost = [w["cost"] for w in wins]
+
+    L = [f"PWFO {OUT_DIR.name}  |  {wins[0]['oos_start']} .. {wins[-1]['oos_end']}  |  "
+         f"{n} OOS periods  |  {len(filters)} filters in this table",
+         f"row 1 (SPEC §6.3): bootstrap avg {b_mean:.2f}, sd {b_sd:.2f} over {n_iter} "
+         f"iterations; cost/trade {min(cost):.4f}..{max(cost):.4f}; K = {k}",
+         f"  exact null moments (no sampling): mean {exact_mean:.2f}, sd {exact_sd:.2f}",
+         ""]
+
+    sig = {nm: significance(r["agg"], exact_mean, exact_sd, k) for nm, r in filters.items()}
+    names = list(filters)
+    # `v + 0.0` normalises IEEE-754 negative zero to positive: `tkr|bl` divides a signed
+    # product by `inf` for a filter that never breaks even, which is arithmetically 0 but
+    # prints as "-0.0000". A sign on a zero is noise in a table people read across.
+    cell = lambda v: ("inf" if v == math.inf else  # noqa: E731
+                      f"{v + 0.0:.4f}" if abs(v) < 1000 else f"{v + 0.0:.1f}")
+    L.append(" " * 12 + "".join(f"{nm:>13}" for nm in names))
+    for col, key in R63:
+        vals = [sig[nm]["p"] if key == "Prob" else filters[nm]["agg"][key] for nm in names]
+        L.append(f"{col} {key}".ljust(12) + "".join(f"{cell(v):>13}" for v in vals))
+
+    # Both forms of §6.5 step 4. `K*p` is what the source walks through and what stays
+    # readable once it exceeds 1; `1-(1-p)^K` is the exact statement and saturates at 1,
+    # so quoting only the exact one would hide *how far* past the bar a result sits.
+    L += ["",
+          "z".ljust(12) + "".join(f"{sig[nm]['z']:>13.3f}" for nm in names),
+          "K*p".ljust(12) + "".join(f"{k * sig[nm]['p']:>13.4f}" for nm in names),
+          "1-(1-p)^K".ljust(12) + "".join(f"{sig[nm]['Kp']:>13.4f}" for nm in names), ""]
+
+    gates = {nm: gate(filters[nm]["agg"], sig[nm], spy) for nm in names}
+    L.append(f"decision gate (PLAN §3 Unit 9) -- SPY {float(spy.sum()):.2f}/share, "
+             f"mu/sigma {gates[names[0]]['spy_mu_sigma']:.4f}")
+    for nm in names:
+        g = gates[nm]
+        flags = "".join("Y" if g[c] else "n" for c in
+                        ("significant", "profitable", "beats_spy"))
+        L.append(f"  {nm:<14} sig/profit/beat-SPY {flags}   K*p {sig[nm]['Kp']:.4f}   "
+                 f"toNP {filters[nm]['agg']['toNP']:+.2f}   mu/sigma {g['mu_sigma']:+.4f}")
+
+    if table1 is not None:
+        L += ["", f"SPEC §6.4 Table 1 -- {table1}", "",
+              f"{'is_start':<12}{'is_end':<12}{'oos_start':<12}{'oos_end':<12}"
+              f"{'osnp':>10}{'net$':>10}{'ont':>6}{'ownp':>10}{'ownt':>6}"
+              f"{'ollt':>10}{'odd':>10}{'EQ':>10}{'NetEq':>10}{'N':>4}"
+              f"{'vup':>7}{'vdn':>7}{'rk_tie':>8}{'pk_tie':>8}"]
+        eq = neq = 0.0
+        for wk, w in zip(filters[table1]["weeks"], wins):
+            gross = wk["osnp"] + wk["ont"] * wk["cost"]
+            eq += gross
+            neq += wk["osnp"]
+            # [M25 p.17]: "Blank rows indicate that no out-of-sample trades were made".
+            # Kept as a row with its parameters, because SPEC §6.4's two zero cases are
+            # only distinguishable when the selected N/vup/vdn are still printed.
+            L.append(
+                f"{w['is_start']:<12}{w['is_end']:<12}{w['oos_start']:<12}{w['oos_end']:<12}"
+                f"{gross:>10.2f}{wk['osnp']:>10.2f}{wk['ont']:>6.0f}{wk['ownp']:>10.2f}"
+                f"{wk['ownt']:>6.0f}{wk['ollt']:>10.2f}{wk['odd']:>10.2f}{eq:>10.2f}"
+                f"{neq:>10.2f}"
+                + (f"{wk['n']:>4}{wk['vup']:>7.2f}{wk['vdn']:>7.2f}"
+                   if wk["selected"] else f"{'--':>4}{'--':>7}{'--':>7}")
+                + f"{wk['rank_tie']:>8}{wk['pick_tie']:>8}")
+    return "\n".join(L)
+
+
+if __name__ == "__main__" and "report" in sys.argv:
+    # PLAN §3 Unit 9's deliverable, off the stored tables. Does not touch `pwfo/`.
+    _res = run_filters()
+    _cols, _oos, _wins = load_tables(["nT"])
+    _bars = data.load_bars("SPY", datetime(2016, 1, 1, tzinfo=timezone.utc),
+                           datetime(2030, 1, 1, tzinfo=timezone.utc), refresh=False)
+    _best = max((n for n in _res if n != "K"), key=lambda n: _res[n]["agg"]["toNP"])
+    print(report(_res, _oos, _wins, spy_weekly(_bars, _wins), table1=_best))
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
