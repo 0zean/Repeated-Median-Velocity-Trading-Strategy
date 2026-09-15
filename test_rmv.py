@@ -6,8 +6,10 @@ One test function per unit of work (see PLAN.md §3).
 from __future__ import annotations
 
 import collections
+import contextlib
 import functools
 import hashlib
+import io
 import json
 import math
 import re
@@ -23,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 import data
+import live
 import pwfo
 import rmv
 
@@ -5110,6 +5113,308 @@ def test_unit10_the_tail_preflight_refuses_before_it_reads() -> None:
         assert all(book[k]["kind"] == "region" for k in book if k != "f")
     print(f"    ({len(fr)} withheld Fridays agreed; 6 preflight refusals, 3 load guards, "
           f"region looks append)", end="")
+
+
+# ======================================================= Unit 11: weekly refit (live.py)
+
+# IS 2024-02-14..2024-03-15 straddles the 2024-03-10 DST switch, so an hour-offset span
+# bound shows up as a moved bar count rather than as nothing.
+U11_FRIDAY = np.datetime64("2024-03-15")
+
+
+def _u11_series(friday: np.datetime64 = U11_FRIDAY):
+    """Extended-hours bars on every real NYSE session from 40 days before `friday` to 10
+    after -- a day before the span to not read and a Monday after it to not see. Real
+    sessions, so `load_calendar` answers from the cache and nothing touches the network."""
+    lo, hi = friday - np.timedelta64(40, "D"), friday + np.timedelta64(10, "D")
+    cal = data.load_calendar(lo.item(), hi.item(), refresh=False)
+    days = [d for d in sorted(cal) if str(lo) <= d <= str(hi)]
+    ts = np.concatenate([_session_ts(d) for d in days])
+    rng = np.random.default_rng(11)
+    return ts, (500.0 + np.cumsum(rng.normal(0.0, 0.05, ts.size))).astype(np.float32)
+
+
+def test_unit11_refit_reproduces_unit7_windows() -> None:
+    """PLAN Unit 11's done-when, off the cache: a standalone 31-day refit gives the **exact**
+    `xmult`, `cost` and bar count Unit 7 stored, on both legs.
+
+    Not closeness. `pwfo.run` computes RMedV and the gate on the full sample and slices;
+    `refit` computes both on the span alone. They agree only because no gated bar's `t` or
+    `t-1` window reaches across a session gap (SPEC §3.1's zero-margin blackout), and the
+    first thing to break that -- a later session start, a wider `MAX_N` -- moves `xmult`
+    by a few ulp, which only equality sees.
+
+    Every 4th pre-tail window. A 31-day span puts any one event day -- an early close, a
+    DST switch, a circuit breaker, Good Friday -- inside 4 or 5 consecutive windows, so
+    stride 4 cannot step over one. All 1050 windows were swept once (PLAN §3 Unit 11): 0
+    mismatches, ~75 s, which is why this samples.
+    """
+    checked = 0
+    for sym in live.LEGS:
+        f = pwfo.sym_dir(sym) / "pwfo_index.json"
+        if not (f.exists() and data._cache_paths(sym, "sip")[0].exists()):
+            print(f"    (skipped: no {sym} cache or index)", end="")
+            return
+        wins = [w for w in json.loads(f.read_text(encoding="utf-8"))["windows"]
+                if w["file"] == "is"]
+        for w in wins[::4]:
+            got = live.refit(sym, np.datetime64(w["friday"]), cache=True)
+            want = {k: w[k] for k in ("xmult", "cost", "is_bars")}
+            assert got == want, f"{sym} {w['friday']}: refit {got} != Unit 7's {want}"
+            checked += 1
+    print(f"    ({checked} windows over {'+'.join(live.LEGS)}, all bit-identical)", end="")
+
+
+def test_unit11_refit_reads_exactly_its_own_span() -> None:
+    """PLAN Unit 11's review focus: the timezone of "the last 30 days", and whether the
+    refit sees the coming week. Off a fake client, so every bar it could read is planted.
+    """
+    f = U11_FRIDAY
+    ts, close = _u11_series()
+    fake = _FakeClient(ts, close)
+    # `cache=False` is a second read or the offline/online check compares nothing.
+    orig = data._read_cache, data._write_cache
+
+    def touched(*a, **k):
+        raise AssertionError("cache=False touched the bar cache")
+    data._read_cache = data._write_cache = touched
+    try:
+        base = live.refit("SPY", f, client=fake)
+    finally:
+        data._read_cache, data._write_cache = orig
+
+    # One request, bounded by **ET** midnights: Wednesday 02-14 00:00 EST to Saturday 03-16
+    # 00:00 EDT. A UTC midnight is 19:00/20:00 ET the evening before, which cuts Friday.
+    assert len(fake.calls) == 1, fake.calls
+    lo, hi = (data._to_ns(x) for x in fake.calls[0])
+    assert lo == pd.Timestamp("2024-02-14", tz=data.ET).value, data._as_utc(lo)
+    assert hi == pd.Timestamp("2024-03-16", tz=data.ET).value, data._as_utc(hi)
+    et = data.to_et(ts)
+    day = et.normalize().tz_localize(None).values.astype("datetime64[D]")
+    in_span = (day >= f - pwfo.IS_DAYS) & (day <= f) & data.session_mask(ts)
+    assert base["is_bars"] == int(in_span.sum()), (base["is_bars"], int(in_span.sum()))
+
+    def with_spike(at: str) -> dict:
+        c = close.copy()
+        i = np.flatnonzero(et == pd.Timestamp(at, tz=data.ET))
+        assert i.size == 1, f"no bar at {at} ET to plant on -- the check would be vacuous"
+        c[i] += np.float32(1.0)
+        return live.refit("SPY", f, client=_FakeClient(ts, c))
+
+    # Friday's last gated bar is inside the span: both constants move.
+    last = with_spike("2024-03-15 15:50")
+    assert last["xmult"] != base["xmult"] and last["cost"] != base["cost"], "Friday is cut"
+    # The first IS day's 08:00 bar is in `cost` (unmasked) and not in `xmult` (ungated,
+    # and no gated window reaches back to 08:00 -- SPEC §3.1's one bar of margin).
+    first = with_spike("2024-02-14 08:00")
+    assert first["cost"] != base["cost"], "the first IS day is not in the span"
+    assert first["xmult"] == base["xmult"], "an ungated 08:00 bar moved xmult"
+    # The day before the span and the coming week: nothing moves.
+    for at in ("2024-02-13 15:50", "2024-03-18 10:30", "2024-03-15 19:55"):
+        assert with_spike(at) == base, f"a bar at {at} ET moved the refit"
+
+    # The returned-bars guard, independent of the request bounds: widen the span by a day
+    # at either end and the refit must refuse rather than fit on what came back.
+    real = live.is_span
+    for lo_d, hi_d in ((-31, 1), (-30, 4)):
+        live.is_span = lambda fr, a=lo_d, b=hi_d: (
+            pd.Timestamp(str(fr + np.timedelta64(a, "D")), tz=data.ET).to_pydatetime(),
+            pd.Timestamp(str(fr + np.timedelta64(b, "D")), tz=data.ET).to_pydatetime())
+        try:
+            live.refit("SPY", f, client=fake)
+        except ValueError as e:
+            assert "outside the IS span" in str(e), e
+        else:
+            raise AssertionError(f"refit fitted on bars from a span widened by {lo_d, hi_d}")
+        finally:
+            live.is_span = real
+
+    # A whole missing session is refused; the cache path cannot have one silently (Unit 1's
+    # overlap check), a one-shot fetch can.
+    gone = day != np.datetime64("2024-02-21")
+    try:
+        live.refit("SPY", f, client=_FakeClient(ts[gone], close[gone]))
+    except ValueError as e:
+        assert "2024-02-21" in str(e), e
+    else:
+        raise AssertionError("refit accepted an IS span with a session missing")
+    # ⚑ The same, on a *live* date: the cached calendar ends Thursday and the fetch is missing
+    # Friday. `load_bars` refreshes the calendar only to its last bar, so Friday is missing
+    # from both -- and only `refit`'s own span-wide read catches it. The review proposed
+    # dropping that read as redundant (#4); this is why it stays.
+    cal = json.loads((data.CACHE_DIR / "nyse_calendar.json").read_text(encoding="utf-8"))
+    keep_dir, keep_fetch = data.CACHE_DIR, data.fetch_calendar
+    no_fri = day != f
+    with tempfile.TemporaryDirectory() as tmp:
+        data.CACHE_DIR = Path(tmp)
+        (Path(tmp) / "nyse_calendar.json").write_text(
+            json.dumps({d: m for d, m in cal.items() if d < str(f)}), encoding="utf-8")
+        data.fetch_calendar = lambda a, b: {d: m for d, m in cal.items() if str(a) <= d <= str(b)}
+        try:
+            live.refit("SPY", f, client=_FakeClient(ts[no_fri], close[no_fri]))
+        except ValueError as e:
+            assert str(f) in str(e), e
+        else:
+            raise AssertionError("a fetch missing Friday passed on a calendar ending Thursday")
+        finally:
+            data.CACHE_DIR, data.fetch_calendar = keep_dir, keep_fetch
+    try:
+        data.load_bars("SPY", data._as_utc(ts[0]), None, cache=False, client=fake)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cache=False without an end bound was accepted")
+    # `refresh` governs the calendar only once the cache is out of the loop: an empty
+    # series here would be a silent flat week, not an error.
+    got = data.load_bars("SPY", *live.is_span(f), cache=False, refresh=False, client=fake)
+    assert len(got) == base["is_bars"], "cache=False, refresh=False fetched nothing"
+    print(f"    ({base['is_bars']} IS bars across the DST switch; 6 planted bars, 2 widened "
+          "spans, 2 missing sessions)", end="")
+
+
+def test_unit11_params_refuse_anything_but_their_own_week() -> None:
+    """`params.json`: exact round trip, and a refusal -- a flat week -- on any doubt.
+
+    ⚑ Valid for `as_of + 3 .. as_of + 7` only, not PLAN Rev 2's "older than 10 days": that
+    rule trades the Monday after a failed weekend refit on last week's `xmult`, which moves
+    up to 20x week to week (SPEC §1.2.1). And the CLI's one safety property: a dated run is
+    a dry run and never writes the file live trades off.
+    """
+    f = U11_FRIDAY
+    legs = {"SPY": {"xmult": 0.1 + 0.2, "cost": 0.027, "is_bars": 2111},
+            "QQQ": {"xmult": 2.0518093224269993, "cost": 0.024, "is_bars": 2111}}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "params.json"
+        live.write_params(f, legs, path)
+        for d in range(3, 8):
+            got = live.load_params(path, f + np.timedelta64(d, "D"))
+            assert got["legs"] == legs, "float round trip through params.json is not exact"
+        for d in (-1, 0, 2, 8, 10):  # 10 is PLAN Rev 2's boundary, and it is refused
+            _refused(lambda: live.load_params(path, f + np.timedelta64(d, "D")), f"day {d}")
+
+        good = json.loads(path.read_text(encoding="utf-8"))
+        bad = [("a Thursday as_of", {"as_of": "2024-03-14"}),
+               ("another region", {"region": [5, 0.75, 3.0]}),
+               ("a missing leg", {"legs": {"SPY": legs["SPY"]}}),
+               ("an extra leg", {"legs": {**legs, "IWM": legs["SPY"]}})]
+        # ⚑ `is_bars` was not validated at all -- the review's finding #1 -- so "refuses any
+        # doubtful file" was false for a third of every leg.
+        for k, v in (("xmult", float("nan")), ("xmult", -1.0), ("xmult", 0.0),
+                     ("xmult", "2.5"), ("xmult", 3), ("xmult", None), ("cost", float("inf")),
+                     ("is_bars", -999), ("is_bars", 0), ("is_bars", "2111"),
+                     ("is_bars", 2111.0), ("is_bars", None), ("is_bars", True)):
+            bad.append((f"{k} = {v!r}", {"legs": {**legs, "QQQ": {**legs["QQQ"], k: v}}}))
+        bad.append(("no cost", {"legs": {**legs, "QQQ": {"xmult": 1.0, "is_bars": 9}}}))
+        bad.append(("no is_bars", {"legs": {**legs, "QQQ": {"xmult": 1.0, "cost": 0.02}}}))
+        for why, patch in bad:
+            _refused(lambda: live.load_params({**good, **patch}, f + np.timedelta64(3, "D")), why)
+        path.write_text("{", encoding="utf-8")
+        _refused(lambda: live.load_params(path, f + np.timedelta64(3, "D")), "invalid JSON")
+        _refused(lambda: live.load_params(Path(tmp) / "nope.json"), "a missing file")
+        # The writer validates through the reader, so it cannot persist a file live refuses.
+        _refused(lambda: live.write_params(f, {**legs, "QQQ": {**legs["QQQ"], "xmult": -2.0}},
+                                           Path(tmp) / "never.json"), "writing a bad file")
+        assert not (Path(tmp) / "never.json").exists(), "a refused file was written anyway"
+
+        # The CLI, offline: the same synthetic series serves both legs. Its own printing is
+        # swallowed -- the suite's output is one line per test.
+        ts, close = _u11_series()
+        fake = _FakeClient(ts, close)
+        sat = f + np.timedelta64(1, "D")
+        out = Path(tmp) / "live.json"
+        quiet = io.StringIO()
+
+        def cli(argv, **kw):
+            with contextlib.redirect_stdout(quiet), contextlib.redirect_stderr(quiet):
+                return live.main(argv, **kw)
+        assert cli(["refit"], today=sat, client=fake, path=out) == 0
+        wrote = live.load_params(out, f + np.timedelta64(3, "D"))
+        assert wrote["as_of"] == str(f) and wrote["legs"]["SPY"] == live.refit("SPY", f, client=fake)
+        keep = out.read_text(encoding="utf-8")
+        # A dated run never writes, whatever it finds. Unit 7's real window for this Friday
+        # disagrees with a synthetic series, so this exits on MISMATCH; without the pwfo
+        # tables it refuses before fetching. Either way the file is untouched.
+        dry = Path(tmp) / "dry.json"
+        assert cli(["refit", str(f)], today=sat, client=fake, path=dry) != 0
+        assert not dry.exists(), "a dry run wrote params.json"
+        # A failed refit writes nothing and leaves last week's file for the reader to refuse.
+        empty = _FakeClient(ts[:0], close[:0])
+        assert cli(["refit"], today=sat, client=empty, path=out) == 1
+        assert out.read_text(encoding="utf-8") == keep, "a failed refit touched params.json"
+        # "Logged loudly" is the product here: which week goes flat, and why.
+        assert "FLAT" in quiet.getvalue() and "no bars in the IS span" in quiet.getvalue(), (
+            quiet.getvalue())
+        _refused(lambda: live.refit("SPY", f - np.timedelta64(1, "D"), client=fake),
+                 "a refit whose span ends on a Thursday")
+        # ⚑ A dry run on a withheld Friday refuses before it fetches a single bar: the tail
+        # windows' `xmult` is a vol-state reading of the spent holdout, kept unprinted for
+        # the deferred vol filter (PLAN §3 Unit 10). Dates only are read off the index.
+        spy_idx = pwfo.sym_dir("SPY") / "pwfo_index.json"
+        if spy_idx.exists():
+            held = next(w["friday"] for w in json.loads(
+                spy_idx.read_text(encoding="utf-8"))["windows"] if w["file"] == "tail")
+            assert live.stored("SPY", np.datetime64(held)) is None, "stored() hands out the tail"
+            probe = _FakeClient(ts, close)
+            assert cli(["refit", held], today=np.datetime64(held) + np.timedelta64(1, "D"),
+                       client=probe, path=dry) == 2
+            assert probe.calls == [], f"a dry run fetched the withheld Friday {held}"
+        # The last row is a live refit *on* a Friday: it would write the week that ends that
+        # night, and a Friday-evening schedule would then go flat every Monday.
+        for argv, today in ((["refit", "2024-03-14"], sat), (["refit", str(f)], f),
+                            (["refit", str(f + np.timedelta64(7, "D"))], sat),
+                            ([], sat), (["tail"], sat), (["refit", str(f), "x"], sat),
+                            (["refit"], f)):
+            assert cli(argv, today=today, client=fake, path=dry) == 2, argv
+        assert not dry.exists()
+        assert "Saturday or later" in quiet.getvalue(), "a Friday refit did not say when to run"
+
+    # Strictly before today: a Friday's own span is still open on that Friday.
+    for d in range(-6, 8):
+        today = f + np.timedelta64(d, "D")
+        want = f if 1 <= d <= 7 else f - np.timedelta64(7, "D")
+        assert live.last_friday(today) == want, (today, live.last_friday(today))
+    # "Params fall inside the grid": the frozen region's bounds are grid values.
+    assert pwfo.REGION[0] in rmv.N_VALUES and {*pwfo.REGION[1:]} <= {*rmv.V_VALUES}
+    print(f"    (5 valid days, {len(bad) + 8} refusals, dry run never writes)", end="")
+
+
+def _refused(fn, why: str) -> None:
+    try:
+        fn()
+    except ValueError:
+        return
+    raise AssertionError(f"accepted {why}")
+
+
+def test_unit11_online_refit_matches_the_offline_table() -> None:
+    """PLAN Unit 11's done-when proper: a refit **off the network** reproduces Unit 7.
+
+    ⚑ Hits Alpaca. Five Fridays picked for what they could break: 2020-03-20, whose span
+    holds all four March 2020 circuit-breaker halts (intraday gaps, gate blackouts);
+    2024-11-08 and 2025-03-14, a span across each DST switch, so its request bounds carry
+    two UTC offsets; 2024-11-29, a 13:00 early-close Friday; 2025-04-18, Good Friday --
+    `as_of` on a closed market. All five, because PLAN quotes all five (review #3). Like
+    `test_unit1_cache_is_never_narrowed_or_left_invalid`, a timeout here is not a failure
+    of the code; re-run it alone before believing one.
+    """
+    try:
+        data._credentials()
+    except RuntimeError:
+        print("    (skipped: no Alpaca credentials)", end="")
+        return
+    for sym in live.LEGS:
+        if not (pwfo.sym_dir(sym) / "pwfo_index.json").exists():
+            print(f"    (skipped: no {sym} PWFO tables)", end="")
+            return
+    fridays = ("2020-03-20", "2024-11-08", "2024-11-29", "2025-03-14", "2025-04-18")
+    for fr in fridays:
+        for sym in live.LEGS:
+            got = live.refit(sym, np.datetime64(fr))
+            w = live.stored(sym, np.datetime64(fr))
+            want = {k: w[k] for k in ("xmult", "cost", "is_bars")}
+            assert got == want, f"{sym} {fr}: online {got} != Unit 7's {want}"
+    print(f"    ({len(fridays)} Fridays x {len(live.LEGS)} legs off the network, bit-identical "
+          "to pwfo_index.json)", end="")
 
 
 def main() -> int:

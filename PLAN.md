@@ -1752,7 +1752,147 @@ folded into the first one's tail test.
 
 ---
 
-### Unit 11 — Live: weekly refit (`live.py`)
+### Unit 11 — Live: weekly refit (`live.py`) ✅ **shipped — re-scoped to the region portfolio**
+
+**Shipped** in a new `live.py`: `LEGS`, `today_et()`, `last_friday()`, `is_span()`, `refit()`,
+`write_params()`, `load_params()`, `stored()`, `main()`. In `data.py`, `load_bars(cache=False)`
+fetches exactly `[start, end]` off the network and neither reads nor writes the bar cache —
+the online half of the offline/online check has to be a second read or it compares the cache
+with itself. ⚠ A second read of the **bars** only: the exchange calendar, which sets early-close
+gating and so moves `xmult`, is the one input both halves share — `cache/nyse_calendar.json`,
+refetched only when it does not cover the span. `params.json` is gitignored.
+**120/120 tests** (4 added), `ruff check .` clean, **39 of 39 mutations killed**; the withheld
+tail's sha256 is unchanged and `K` is still 14.
+
+    python live.py refit              refit for the last closed Friday, write params.json
+    python live.py refit 2025-06-13   dry run: refit off the network, compare to Unit 7, never write
+
+⚑ **Re-scoped, not built as written.** Rev 2 (kept below) refits the grid on one IS window,
+applies the frozen filter and writes the chosen `N/vup/vdn`. Unit 10 cancelled selection — IS→OOS
+rank correlation t = −0.45, the IS-best pick t = −2.00 — and what passed the tail is the 1620-combo
+region, equal weight, SPY+QQQ 50/50, **no IS filter**. There is no row to choose. What that
+strategy still refits every week is the *scale*: each leg's `xmult` (SPEC §1.2.1, a 20× range
+across windows) and `cost` (SPEC §3.2), each off that leg's own 31-day IS span. The grid run is
+dropped because nothing reads its 4312 rows.
+
+| | Rev 2 | shipped |
+|---|---|---|
+| refit | RMV → grid → frozen filter → one row | RMV → `xmult`, `cost`, per leg |
+| file | `{N, vup, vdn, filter, as_of, is_metrics, xmult, git_sha}` + `cost` | `{as_of, region, legs: {SPY, QQQ: {xmult, cost, is_bars}}, git, written}` |
+| legs | one symbol | both, each off its own bars; a one-leg file is refused, not traded at 100% |
+| staleness | refuse when older than 10 days | valid **only** `as_of+3 .. as_of+7`, its own OOS week |
+| failure | no row passes → flat week | refit raises → no file written → flat week |
+
+`region` replaces `N/vup/vdn/filter`; `is_metrics` described a selected row that no longer
+exists. `cost` no longer selects anything, which was Unit 4's reason to carry it — it stays in
+the file and in the check because Unit 12a's replay charges it per trade and Unit 13 compares
+realised fills against it.
+
+**Done when** ✅ **met, bit-for-bit, both ways.**
+
+- **Offline, every window.** `refit(sym, friday, cache=True)` loads the IS span standalone out of
+  the cache and builds RMedV and the gate on those 31 days alone. Against `pwfo_index.json`, all
+  525 pre-tail windows of both legs: **1050 of 1050 identical** in `xmult`, `cost` and `is_bars`
+  — `==`, not `isclose` — and none trips the missing-session guard. ~75 s, so the test samples
+  every 4th window (264, ~14 s): a 31-day span puts any single event day inside 4–5 consecutive
+  windows, so stride 4 cannot step over one.
+- **Online.** `python live.py refit <Friday>` fetches the span off Alpaca: **MATCH on both legs** at
+  2020-03-20 (all four circuit-breaker halts inside the span), 2024-11-08 (DST end), 2024-11-29
+  (a 13:00 early-close Friday), 2025-03-14 (DST start) and 2025-04-18 (Good Friday — `as_of` on a
+  closed market). All five are a network test (two, until the review's #3).
+- **The live arm, end to end,** for the current week: `as_of` 2026-09-04, fetched past the end of
+  the cache with the calendar refreshed, written, read back — accepted 09-07 through 09-11,
+  refused 09-06 and 09-12.
+
+⚑ **Why equality holds, and why it is a test rather than a comment.** `pwfo.run` computes RMedV
+and the gate on the full 10-year series and slices each window out; `refit` computes both on 31
+days. They agree only because no gated bar's `t` or `t−1` window reaches back across a session
+gap — SPEC §3.1's blackout, whose margin is exactly zero. A later session start, a larger
+`MAX_N` or an `RMedV[t−2]` term would move `xmult` by a few ulp in some windows and nowhere else,
+which only `==` over many windows can see. That invariant is now pinned from the live side too.
+
+- ⚑ **Valid for its own week only.** Rev 2's "older than 10 days refuses" trades the Monday after a
+  failed weekend refit — day 10 — on last week's `xmult`, which moves up to 20× week to week while
+  `pwfo.run` scores every OOS week on its own. That is a parity break, not staleness. Refused is
+  flat, and flat is the backtest's own zero.
+- **Review focus, answered.** *Timezone:* `is_span` runs ET midnight to ET midnight,
+  `[F−30 00:00, F+1 00:00]`. A UTC midnight is 19:00/20:00 ET the evening before, which cuts
+  Friday's whole session — pinned across the 2024-03-10 DST switch by the request bounds and by
+  bars planted on each edge. *Sees the coming week:* no, and checked twice — the request stops at
+  Saturday 00:00 ET, and `refit` then re-checks the dates of what actually came back and refuses
+  a span widened by a day at either end. The default Friday is strictly before today, so a run on
+  Friday afternoon refits the *previous* week rather than a half-finished session. *No row
+  passes:* cannot happen with no filter. The failure that replaces it is a refit that raises —
+  no bars, a missing session, an undefined `xmult` — after which nothing is written, `main` exits
+  1 with `REFIT FAILED … FLAT` naming the week, and last week's file is refused on Monday.
+- ⚑ **One guard the cache path never needed.** A calendar session in the span with no bars at all
+  is refused. The cache re-reads its last 200 bars on every refresh and compares; a one-shot fetch
+  is compared against nothing. Intraday holes stay the gate's job, identically on both paths.
+- **A dry run refuses a withheld Friday before it fetches a bar.** It exists to compare against
+  Unit 7, and the tail windows' `xmult` is a vol-state reading of the spent holdout that Unit 10
+  keeps unprinted for the deferred vol filter. The live arm's own IS spans overlap August 2026 for
+  the next few weeks; that is trading, not a look at a tail window, and cannot be avoided.
+- The live arm appended 2026-09-01..04 to `cache/nyse_calendar.json` (2680 → 2684 sessions) —
+  gitignored, append-only, and nothing counts it.
+- ⚠ **`pwfo.py report` no longer reproduces `UNIT9_REPORT.txt` byte-for-byte, and should not.**
+  The tail look took `K` from 13 to 14, and the report prints `K`: 12 lines differ — the header,
+  `K*p`, `1-(1-p)^K` and three gate rows — while every `K`-free number (bootstrap, `toNP`, `z`,
+  mu/sigma) is identical. The regression check is now "differs only in `K`-dependent lines".
+
+**Carried to Unit 12, which needs the same re-scope before it starts** — Rev 2's 12a/12b text
+below still assumes one row:
+
+- Parity is per combo: 1620 combos × 2 legs, not one `N/vup/vdn`. The position live holds is the
+  mean of 1620 signals in {−1, 0, +1}, i.e. fractional. Rounding it to shares is both a sizing
+  decision and a parity gap, and Unit 10 already recorded that modelled cost is an upper bound
+  because 1620 fractional legs net into one order.
+- Sizing: the backtest's bps are on the IS-mean close (`window_notional`); a leg sized on Friday's
+  close differs from it by −10%..+26% in a given week (Unit 10).
+- SPEC §3.2's fee model is still "required before any live order is sent". This unit sends none.
+
+#### Adversarial review (PLAN §4) — 5 findings + 1 of mine: 3 fixed, 2 rejected, 1 recorded
+
+The reviewer re-ran everything that carries a number rather than trusting it: the full
+unsampled sweep (**1050/1050**, 0 exceptions, 56 s), all five online Fridays (3 by hand, since
+only 2 were in the suite), the suite, ruff, and the tail's sha256. It confirmed that
+`params.json`'s three-number `region` plus per-leg `xmult`/`cost` rebuilds all 1620
+`(n, vup, vdn)` thresholds through `decode` and `rmv.threshold`, so Unit 12 is missing nothing,
+and that `load_bars(cache=False)` reduces exactly to the old logic for every existing caller. It
+touched no repository file.
+
+1. **Fixed — `load_params` never looked at `is_bars`** (filed BREAKING). "Refuses on any doubt"
+   was false for a third of every leg: `-999`, `"banana"`, `None`, `nan`, or the key deleted, all
+   accepted. `is_bars` trades nothing — so this was a false claim, not a wrong trade — but it is
+   the file's record of what the fit saw. Now a positive `int`, and `bool` is refused explicitly
+   because `True` is an `int`. 8 refusal cases added.
+2. **Rejected — a mistyped dry-run date raises instead of exiting 2** (filed SEVERE). Only the
+   manual dry run can reach it; the scheduled arm computes its Friday. The traceback names the
+   unparseable string and exits non-zero, and nothing is fetched or written. A handler would
+   change the message, not the outcome.
+3. **Fixed — three of the five online Fridays were prose, not tests** (filed SEVERE). All five
+   are in `test_unit11_online_refit_matches_the_offline_table` now, +2 s. DST end and the early
+   close had no online coverage at all.
+4. **Rejected, and pinned — "the second `load_calendar` is redundant"** (MINOR). It is the only
+   read that covers a missing *last* session on a live date. `load_bars` refreshes the calendar
+   just to the last bar that came back, so a fetch missing Friday is also missing Friday from
+   that refresh, and the missing-session guard passes silently. The reviewer's fix would have
+   removed the guard's one live-only case. A test now builds exactly that — a calendar cache
+   ending Thursday and a fetch missing Friday — and the "read over the bars" mutant dies on it.
+5. **Recorded — bar amendments are spot-checked online at 5 Fridays, not swept** (MINOR). An online
+   sweep is 1050 fetches; the cache's 200-bar overlap re-read already catches a retroactive change
+   on every refresh. No change.
+6. **Fixed, mine — a Friday-evening schedule goes flat every week.** On a Friday the last *closed*
+   Friday is a week old, so the file written is for the week ending that night and Monday refuses
+   it. Every week, with no failing job anywhere. The no-date arm now exits 2 on a Friday and
+   says to run on Saturday, so a bad schedule fails on its first run instead of on the Monday
+   after.
+
+**39 of 39 mutations killed** — my 35, which first came back 31/35 and cost four test gaps
+(the no-bars message, a non-Friday refit, `stored()` handing out tail windows, a dry run fetching
+before its pre-check), plus 4 on the fixes above. The reviewer found its two real gaps by
+reading, not mutating.
+
+#### Rev 2's Unit 11, superseded — kept for the record
 
 **Do** Fetch the last 30 calendar days → RMV → grid on that one IS window → apply the frozen
 filter → write `params.json`: `{N, vup, vdn, filter, as_of, is_metrics, xmult, git_sha}`.

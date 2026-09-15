@@ -6,3 +6,4 @@ cache/
 *.npy
 pwfo/
 pwfo_*/
+params.json

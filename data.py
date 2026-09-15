@@ -382,6 +382,7 @@ def load_bars(
     session: bool = True,
     calendar: bool = True,
     client: StockHistoricalDataClient | None = None,
+    cache: bool = True,
 ) -> Bars:
     """Cached 5-minute bars, sliced to [start, end] and to the session window.
 
@@ -393,8 +394,13 @@ def load_bars(
     session=False returns everything the API gave (04:00-20:00), for measurement only --
     that range is not contiguous and is not a valid RMedV input (SPEC §3.1).
     calendar=False assumes every session closes at 16:00, which is wrong on early closes.
+    cache=False fetches exactly [start, end] off the network and neither reads nor writes
+    the bar cache -- PLAN Unit 11's online path, which has to be a second read for its
+    offline/online check to compare anything. `refresh` then governs the calendar only.
     """
-    cached = _read_cache(symbol, feed)
+    if not cache and (start is None or end is None):
+        raise ValueError("cache=False fetches exactly [start, end]; both are required")
+    cached = _read_cache(symbol, feed) if cache else None
     ts, close = cached if cached is not None else (np.empty(0, np.int64), np.empty(0, np.float32))
 
     # refresh=True with no end silently fetched nothing. "Refresh" means "bring me current".
@@ -404,7 +410,7 @@ def load_bars(
     # Only reach for the network when the request actually extends past the cache.
     # Without this, any historical slice asks Alpaca for end < start and gets an HTTP 400.
     wants_new = end is not None and (ts.size == 0 or _to_ns(end) > int(ts[-1]))
-    if refresh and wants_new:
+    if (refresh or not cache) and wants_new:
         if ts.size:
             overlap_from = ts[max(0, ts.size - OVERLAP_BARS)]
             new_ts, new_close = fetch(symbol, _as_utc(overlap_from), end, feed=feed, client=client)
@@ -413,7 +419,8 @@ def load_bars(
             if start is None:
                 raise ValueError("no cache for this symbol/feed, so start is required")
             ts, close = fetch(symbol, start, end, feed=feed, client=client)
-        _write_cache(symbol, feed, ts, close)
+        if cache:
+            _write_cache(symbol, feed, ts, close)
 
     if start is not None:
         ts, close = _slice_from(ts, close, start)
