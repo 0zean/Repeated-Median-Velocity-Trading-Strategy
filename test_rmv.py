@@ -5417,6 +5417,89 @@ def test_unit11_online_refit_matches_the_offline_table() -> None:
           "to pwfo_index.json)", end="")
 
 
+# ================================================= Unit 12a: offline parity (live.py)
+
+# One OOS week per event class, by Friday. OOS weeks tile, so a stride steps clean over any
+# single event day; `python live.py parity` sweeps all 525 per leg (PLAN §3 Unit 12a).
+U12A_WEEKS = {
+    "2016-02-19": "QQQ 2016-02-22: a gated bar's successor arrives late",
+    "2019-08-09": "SPY 2019-08-12: the feed stops at 15:30",
+    "2020-03-06": "circuit breakers 03-09 and 03-12: gaps, blackouts, reopens",
+    "2020-03-13": "circuit breakers 03-16 and 03-18; 03-18 shuts the gate mid-session",
+    "2024-11-22": "a 13:00 early close on 11-29",
+    "2025-04-11": "Good Friday 04-18 closed: a four-session week",
+    "2025-07-11": "an ordinary EDT week",
+    "2026-01-09": "an ordinary EST week",
+}
+
+
+def test_unit12a_replay_matches_unit7_trade_for_trade() -> None:
+    """PLAN §3 Unit 12a's done-when on the named weeks, both legs: live's gate is `bars.gate`,
+    the reference scores to Unit 7's stored rows, every combo's trades are identical on every
+    session live could know, and a `FakeBroker` reconciled bar by bar holds exactly the book.
+
+    ⚑ The unknowable sessions are pinned by name. They are derived from the bars, so a harness
+    exempting more would pass every trade comparison and fail here -- and each is required
+    to actually differ, so none is exempted for nothing.
+    """
+    checked = 0
+    for sym, unknowable in (("SPY", ["2019-08-12", "2020-03-18"]),
+                            ("QQQ", ["2016-02-22", "2020-03-18"])):
+        if not ((pwfo.sym_dir(sym) / "pwfo_oos.npy").exists()
+                and data._cache_paths(sym, "sip")[0].exists()):
+            print(f"    (skipped: no {sym} cache or tables)", end="")
+            return
+        r = live.parity(sym, fridays=list(U12A_WEEKS))
+        assert r["weeks"] == len(U12A_WEEKS), (sym, r["weeks"])
+        assert r["sessions"] == unknowable == r["differ"], (sym, r["sessions"], r["differ"])
+        assert r["trades"] > 0 and r["excluded"] > 0, (sym, r)
+        # Netting is real, and in the direction Unit 10 recorded: the backtest over-charges.
+        assert 0 < r["turnover"] < r["charged"], (sym, r["turnover"], r["charged"])
+        checked += r["trades"]
+    print(f"    ({checked} trades over {len(U12A_WEEKS)} weeks x 2 legs, all identical)", end="")
+
+
+def test_unit12a_book_crosses_on_equality_like_the_kernel() -> None:
+    """SPEC §2's inclusive bounds, where real bars never go. A float32 RMedV landing exactly on
+    a float64 threshold does not happen in 1050 real weeks, so the parity sweep passes with
+    `>` for `>=` (Unit 12a's mutation pass). This day is built to land on it: a $0.25-a-bar
+    ramp is an exact line, so RMedV at n = 16 is exactly +-0.25 -- which is exactly
+    `threshold(1.0, 1.0, 16)` -- and the book has to trade it as `_simulate` does.
+    """
+    day = "2024-06-14"
+    ts = _session_ts(day, "08:00", "15:55")
+    i = np.arange(ts.size)
+    close = np.select([i < 36, i < 66, i < 76], [500.0, 500 + 0.25 * (i - 35), 507.5],
+                      507.5 - 0.25 * (i - 75)).astype(np.float32)
+    d = np.datetime64(day).item()
+    cal = data.load_calendar(d, d, refresh=False)
+    gate = data.build_gate(ts, close_min=np.full(ts.size, cal[day]))
+    matrix = rmv.rmv_all_n(close)
+    r16 = matrix[np.searchsorted(rmv.N_VALUES, 16)].astype(np.float64)
+    thr = rmv.threshold(1.0, 1.0, 16)
+    # The precondition, or this proves nothing: RMedV reaches the threshold and never passes it,
+    # once up and once down, each on a gated bar that is not the last of its run.
+    assert thr == 0.25 == np.abs(r16).max(), (thr, np.abs(r16).max())
+    hits = [t for t in range(1, ts.size - 1)
+            if gate[t] and gate[t + 1] and abs(r16[t]) == thr != abs(r16[t - 1])]
+    assert hits == [43, 83], hits
+
+    book = live.Book({"xmult": 1.0}, cal)
+    states, gated, _ = live.replay(book, ts, close)
+    assert np.array_equal(gated, gate)
+    combo, got = live.trades(states, close, 0.03)
+    want = [rmv.simulate(matrix[book.row[k]], close, gate, book.up[k], book.dn[k], 0.03)
+            for k in range(book.pos.size)]
+    assert np.array_equal(combo, np.repeat(np.arange(book.pos.size), [len(w) for w in want]))
+    assert np.array_equal(got, np.concatenate(want))
+    k = [pwfo.decode(c) for c in np.flatnonzero(pwfo.region_mask())].index((16, 1.0, 1.0))
+    assert got[combo == k][:, :3].tolist() == [[43, 83, 1], [83, 94, -1]], got[combo == k]
+    # Cut at bar 60, combo k is still long: no exit bar exists to book, so it is refused rather
+    # than read one past `close` (Unit 12a review, #1).
+    assert states[59, k] == 1
+    _refused(lambda: live.trades(states[:60], close[:60], 0.03), "a combo open on the last bar")
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

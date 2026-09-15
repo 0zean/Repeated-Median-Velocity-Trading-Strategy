@@ -283,7 +283,7 @@ it hits its budget. ⚑ Figures below are for 546 windows (10 yr); §8-A recomme
 | ⚑ Same, shipped `pwfo.run`, 551 windows (525 + 26 withheld) | < 60 s, peak RSS < 1 GB | **2.6 s, 411 MB** |
 | ⚑ One filter over the full table, shipped `pwfo.evaluate` | < 1 s | **10–23 ms** (+ 0.11 s hoist, shared by all nine) |
 | ⚑ Unit 9 report: 9 filters + 5000-iteration bootstrap + both falsifications | — | **~9 s** total, 574-line report |
-| Live per-bar compute | < 1 ms, zero steady-state allocation | — |
+| Live per-bar compute | < 1 ms, zero steady-state allocation | ⚑ `Book.on_bar`, 1620 combos: **121 µs** mean on a gated bar, p99 217 µs, max 449 µs; 9 µs ungated. **Not** allocation-free — see Unit 12a |
 
 **The entire walk-forward is a ~35-second job.** Any design adding a job queue, a database,
 a cache tier, or a distributed runner is solving a problem this project does not have.
@@ -1914,7 +1914,219 @@ happens when no row passes (answer: flat week, logged loudly).
 
 ---
 
-### Unit 12a — Offline parity harness ⚑
+### Unit 12a — Offline parity harness ✅ **shipped — re-scoped to the region portfolio; parity holds on every session live could know**
+
+**Shipped** in `live.py`: `ET`, `RING`, `Book`, `FakeBroker`, `replay()`, `trades()`, `parity()`,
+and a `parity` arm on `main`. No other module changed. **122/122 tests** (2 added), `ruff check .`
+clean, **29 of 29 mutations killed** (28, plus 1 on the review fix); the withheld tail's sha256
+is unchanged and `K` is still 14 — nothing here opens `pwfo_tail.npy`, and `load_tables` drops
+the index's tail rows before the harness sees them.
+
+    python live.py parity [SYM ...]   every pre-tail OOS week, bar by bar, against Unit 7; ~52 s a leg
+
+**Done when** ✅ **met, all four conditions, every pre-tail week, both legs:**
+
+| | weeks | trades identical | excluded, on the unknowable sessions | netted turnover ÷ charged |
+|---|---|---|---|---|
+| SPY | 525 | **3,958,490** | 5,065 on 2019-08-12, 2020-03-18 | **83.3%** |
+| QQQ | 525 | **3,937,717** | 3,262 on 2016-02-22, 2020-03-18 | **82.4%** |
+
+1. **Gate.** Live's per-bar gate equals `bars.gate` on every OOS bar of both legs — early closes,
+   Good Friday weeks, both DST regimes, and the 2020 circuit breakers with their blackout
+   reopens.
+2. **Reference.** All six OOS metrics of every region combo, off the reference trades, equal the
+   stored `pwfo_oos.npy` row float32 for float32 — **1,701,000 rows** (525 × 1620 × 2). "Identical
+   to `rmv.simulate`" therefore means identical to what Unit 7 *wrote*, not to a re-run that
+   could have drifted along with the replay.
+3. **Trades.** `(entry, exit, dir, net)` by `array_equal`, per combo, on every session but four;
+   **0.13%** of SPY's trades and **0.08%** of QQQ's excluded, all on sessions derived from the
+   bars before any trade is compared. ⚑ Each of the four actually differs — the test requires it
+   on the named weeks, and the review measured it over all 525 weeks of both legs — so none is
+   exempted for nothing. All four are one shape, the next bar did not come on time (table below):
+   - **SPY 2019-08-12** — the feed stops at 15:30 (91 bars). The clock says 15:35 is open, so live
+     may enter on 15:30; the backtest reads the next bar, Tuesday 08:00, as ungated and does not.
+   - **2020-03-18, both legs** — 13:00 and 13:05 never print (SPEC §2.1 B's halt). The backtest
+     exits at 12:55's close; live learns of the halt only when 13:10 arrives, and exits there.
+     Both reopen on the blackout at 15:10 and agree again from that bar.
+   - **QQQ 2016-02-22** — 10:30..11:05 never print (88 bars). Same shape: out at 10:25 against
+     11:10, and both reopen at 13:10.
+4. **Broker.** Gross off the `FakeBroker`'s fills equals the book's trade gross **exactly** in all
+   1050 weeks, and the position is 0 at every week's end. ⚑ Netted turnover is **83.3% / 82.4%**
+   of the per-combo turnover the backtest charges `cost` on: Unit 10's "modelled cost is an upper
+   bound" is measured, and by ~17%. That is fills at the close; 12b's real fills are what test it.
+
+⚑ **What the exclusion actually removes — measured, not asserted.** Each unknowable session's
+trades split at `t*`, the gated bar whose successor came late:
+
+| session | closed before `t*` | open across `t*`: exit differs | entered on `t*` | entered after the reopen |
+|---|---|---|---|---|
+| SPY 2019-08-12 (`t*` 15:30) | 716, identical | 1,006 of 1,015 | 9, live only | none |
+| SPY 2020-03-18 (`t*` 12:55) | 912, identical | 1,522 of 1,522 | 0 | 900, identical, from 15:10 |
+| QQQ 2020-03-18 (`t*` 12:55) | 877, identical | 1,503 of 1,550 | 47, live only | 709, identical, from 15:10 |
+| QQQ 2016-02-22 (`t*` 10:25) | 0 | 90 of 90 | 0 | 36, identical, from 13:40 |
+
+That is SPEC §2.1's two effects and nothing else: **B**, a position open across `t*` exits on the
+late bar instead of on `t*`; **C**, live enters on `t*` where the kernel skips — and the 9 and 47
+trades across `t*` that do *not* differ are exactly those reversals, whose closing leg fills on
+`t*` either way. Everything before `t*` and everything after the reopen is identical, so excluding
+the whole session is conservative rather than a hiding place. ⚑ Masked by **entry** date: SPY's
+2019-08-12 positions exit on Tuesday, and exit-date masking breaks (the review's probe).
+
+**Budget** (§2.4): `Book.on_bar` **121 µs** mean on a gated bar, p99 217 µs, max 449 µs, 9 µs
+ungated; `Book()` 6 ms once a week — ~5× inside 1 ms. ⚑ **Not** allocation-free: ~10 numpy
+temporaries a bar, marked `ponytail:` in the code. The zero-allocation line was written for one
+combo, at one bar per five minutes it buys nothing, and an njit step is the upgrade path.
+
+⚑ **Why this is not a function compared with itself.** The book and Unit 7 share `rmv.threshold`,
+`rmv.rmv_all_n` and `pwfo.decode`, which check 2 anchors to what Unit 7 wrote — and, ⚠ first
+written here as "nothing else", **`cache/nyse_calendar.json` and `data`'s gate constants**, which
+nothing anchors. Check 1 compares two gate computations off one calendar, so a wrong early close
+would pass it: Unit 11's disclosed caveat, again. Everything below is independent:
+
+| | Unit 7 (`pwfo.run` → `_simulate`) | `Book` |
+|---|---|---|
+| RMedV | one full-sample matrix, sliced per window | recomputed every bar on a 25-bar ring |
+| gate | `build_gate` over the whole series | rebuilt per bar: clock, calendar close, 120-minute span |
+| last gated bar | reads `gate[t + 1]` | the clock's `minute + 5` |
+| state | a scalar per combo inside a kernel loop | 1620 `int8` states, vectorised, one bar at a time |
+| exit on the gate | booked at `close[t − 1]` when the gate goes 1→0 | goes flat on the last gated bar |
+| trades | emitted by the kernel | reconstructed from state changes |
+
+The test, `test_unit12a_replay_matches_unit7_trade_for_trade`, runs eight named weeks — one per
+event class, because OOS weeks tile and a stride steps clean over any single day — on both legs:
+**134,784 trades**, ~10 s. It pins the unknowable sessions by name and requires each to differ.
+
+**Mutation pass: 28 of 28 killed, and every parity check kills something of its own** — which is
+the evidence that none of the four is decorative.
+
+- *Gate check:* the 10:00 or the 15:55 bound moved a bar (5 bars each), the blackout a bar short
+  (2 bars, 2020-03-06) or gone (43), early closes ignored (26 bars, 2024-11-22), the clock in UTC.
+- *Stored-table check:* thresholds at `n + 1`, `vup`/`vdn` swapped, the RMedV row off by one —
+  the three that share an input with the reference, and so exactly the three that trade parity
+  alone cannot see.
+- *Trade check:* a level rule on either side, `RMedV[t−1]` read as `RMedV[t]`, no hold, no
+  last-bar flatten and a bar-early one, entries a bar late, cost added instead of charged.
+- *Broker check:* position set instead of accumulated, the target submitted instead of the
+  difference, fills at the previous close.
+- *The test's own pins:* every 1→0 edge exempted, everything skipped (0 trades compared),
+  `differ` inverted, turnover counted from trades instead of fills.
+- Two die by crash rather than by a check: a ring of `max(n)`, and ungated bars not flattening.
+
+⚑ **Two survived the parity test**: `>` for `>=` and `<` for `<=`. A float32 RMedV landing
+exactly on a float64 threshold does not occur in 1050 real weeks, so 7.9 M identical trades are
+blind to SPEC §2's inclusive bounds. `test_unit12a_book_crosses_on_equality_like_the_kernel`
+closes it: a $0.25-a-bar ramp is an exact line, so RMedV at n = 16 is exactly
+±`threshold(1.0, 1.0, 16)` = ±0.25 on a gated bar, and the book has to trade it as `_simulate`
+does. Both mutants die on it.
+
+**Carried to Unit 12b** — the four the re-scope listed, plus two this unit found:
+
+- Rounding units to shares; sizing on Friday's close against the IS mean; SPEC §3.2's fee model;
+  a mid-session restart, which has to replay the session from 08:00.
+- ⚑ **The 15:55 flatten has to be driven by the clock, not by a bar.** `Book` can only act when a
+  bar arrives. On SPY 2019-08-12 the feed stopped at 15:30, no 15:35 bar ever came, and the
+  replay held to Tuesday 08:00 — overnight, which SPEC §2 forbids. Replay cannot express a timer;
+  live has one. 12b's session-cut flatten and its external 15:58 job are what close this, and
+  parity cannot test either.
+- ⚑ **The stale-bar guard flattens; it does not halt the session.** Every other gap in 1050 weeks
+  reopens on the blackout rule and matches the backtest trade for trade.
+
+#### Adversarial review (PLAN §4) — 6 findings: 2 fixed, 1 rejected, 3 recorded; plus 3 corrections of mine
+
+The reviewer re-ran everything that carries a number, at full scale rather than on the test's
+eight weeks: both legs' `parity` sweeps (every headline figure reproduced exactly), 122/122, ruff,
+`Book.on_bar` over 3,550 gated bars in ten other weeks (**106 µs** mean, p99 169, max 299), and
+all 28 mutants from its own harness against a scratch copy of `live.py`, plus 4 of its own (3
+killed). ⚑ It also measured `sessions == differ` over **all** 525 weeks of both legs, which the
+test asserts only on the named weeks. It touched no repository file and nothing under the tail.
+No BREAKING finding.
+
+1. **Fixed — `trades()` raised a bare `IndexError` on a combo still open on the last bar** (filed
+   SEVERE). Unreachable here — every week ends ungated and `Book` flattens on every ungated bar —
+   but a slice cut mid-session is exactly what 12b's restart replay would produce. Now a
+   `ValueError` naming the open count, pinned in the equality test; deleting the guard brings
+   the `IndexError` back and the test dies on it (mutant 29).
+2. **Rejected — the parity test returns early when a leg's cache or table is missing** (filed
+   SEVERE). The suite-wide convention Unit 5's review already deferred. The skip prints
+   `(skipped: …)`, which the handoff's verification step checks for; a partial pass prints it too.
+3. **Recorded — `math.fsum` is not shown to be load-bearing** (MINOR): a left-to-right sum ties it
+   in every named week. Equality for *any* summation order needs `fsum`; that one order also
+   happens to tie on this data is not a reason to drop it.
+4. **Fixed, in the docstring — two turnover bases conflated** (MINOR). The bound is against the
+   book's own per-combo turnover, `2 · len(live)` (the triangle inequality); the reported ratio is
+   against the backtest's, `2 · len(ref)`. They differ only on the unknowable sessions — the 9 and
+   47 trades in the table above — and `parity`'s docstring described the one as the other.
+5. **Recorded — `calendar.get(date, 0)` is untested** (MINOR; removing the default survived the
+   reviewer's mutant). A date missing from the calendar reads as a closed session, the default
+   `load_bars` gives `build_gate` too; without it the path raises rather than trades.
+6. **Recorded — the `parity` CLI arm has no test** (MINOR): a loop and a format string over the
+   function the suite exercises at every check.
+
+Mine, found proofreading while the review ran:
+
+- ⚑ **"Shares `rmv.threshold` and `rmv.rmv_all_n` and nothing else" was false.** Both sides also
+  read the calendar cache and `data`'s gate constants, so check 1 cannot see a wrong calendar.
+  Corrected above the comparison table.
+- **"Both reopen and agree again" was asserted, not measured.** Measured now — the table under the
+  done-when — and it holds, narrower than claimed: the divergence is B and C and nothing else.
+- The test runs in ~10 s, not ~14.
+
+#### The re-scope, as written before any code
+
+⚑ **Re-scoped before any code, as Unit 11 carried it.** Rev 2 (kept below) replays one
+`N/vup/vdn` row against one position. What passed the tail is 1620 combos × 2 legs at equal
+weight, so what live holds is the **sum of 1620 crossing-rule states** in {−1, 0, +1}, and
+parity is per combo. Checked before this was written, by a scratch probe over all 525 pre-tail
+weeks of both legs: a per-bar book reproduces `rmv.simulate` trade for trade on every session
+but four — each one live cannot see coming — at ~100 µs a bar.
+
+**Do** in `live.py`, offline — no network, no keys, freely re-runnable:
+
+- `Book` — one leg's live decision path, one closed bar at a time. A ring of `MAX_N + 1` bars
+  and `rmv.rmv_all_n` on it, reading `[:, -1]` and `[:, -2]` (the contract that function's
+  docstring already pins for live); thresholds by `rmv.threshold` off one `params.json` leg;
+  1620 `int8` states. ⚑ **The gate is rebuilt from what has arrived** — the clock, the
+  calendar's close, and "the last 25 bars are contiguous", which is `build_gate`'s blackout
+  read causally — and never read from `bars.gate`. The target is `sum(states)` in **combo
+  units**, 1 unit = 1/1620 share: the fractional book exactly, in integers.
+- The 15:55 flatten runs **before** signal evaluation (Unit 4's ordering, carried in 12b): a
+  gated bar whose successor the clock says is ungated goes flat and does not enter. That is
+  SPEC §2.1 A in the only form live can know it — the clock, not `gate[t+1]`.
+- `FakeBroker` fills any order in full at the bar's close. `replay` reconciles every bar: read
+  the position, submit the difference.
+- `parity(symbol)`, and `python live.py parity [SYM ...]` over every pre-tail week.
+
+**Done when**, every pre-tail OOS week of both legs:
+
+1. **Live's gate equals `bars.gate` on every bar.**
+2. **The reference is Unit 7's, not a re-run of it.** `rmv.simulate` on Unit 7's own inputs —
+   the full-sample matrix sliced, `bars.gate`, the index's `xmult` and `cost` — scores every
+   region combo to its stored `pwfo_oos.npy` row, float32 for float32, all six columns.
+3. **Trade for trade, per combo** — `(entry, exit, dir, net)` by `array_equal`, all 1620 — on
+   every session except those live cannot know: a gated bar whose successor is gated by the
+   clock and still not in `bars.gate`, i.e. the next bar did not arrive on time (SPEC §2.1 B
+   and C). ⚑ That set is computed **from the bars** — `build_gate` on timestamps shifted one
+   bar — not from where trades differ, and is reported by name.
+4. **The broker holds the book.** Gross off the fills equals the per-combo trades' gross
+   **exactly** (`math.fsum`, and every term is exact: integer units × a float32 price, and
+   Sterbenz on same-week price differences); the position is 0 at every week's end; netted
+   turnover never exceeds the per-combo turnover the backtest charges `cost` on — Unit 10's
+   "modelled cost is an upper bound", as a measurement.
+
+⚑ **Post-blackout reopens are not exempted** — Unit 4's either/or, answered on 12a's side.
+`Book`'s gate is `build_gate`'s own rule, so it reopens exactly where the backtest does and
+only the bar with a late successor diverges. If Unit 12b's stale-bar guard *halts* the session
+rather than flattening, it reintroduces Unit 4's measured gap and has to say so.
+
+**Not this unit** — carried to 12b unchanged: rounding units to shares (a sizing decision);
+sizing on Friday's close against the IS mean (−10%..+26%); SPEC §3.2's fee model; a mid-session
+restart, which has to replay the session from 08:00 because every state depends on each
+crossing since 10:00.
+
+**Why this unit matters most** Every backtest-to-live discrepancy this project could suffer
+shows up here or nowhere. If parity fails, nothing upstream is trustworthy.
+
+#### Rev 2's Unit 12a, superseded — kept for the record
 
 *Split from Rev 1's Unit 12, which bundled a polling loop, ring buffer, reconciliation engine,
 five guards, a fake broker and a replay harness into one "most important" unit.*
@@ -1925,12 +2137,13 @@ network, no API keys, freely re-runnable.
 **Done when** replaying every OOS session through the bar-by-bar path against `FakeBroker`
 produces trade-for-trade equality with the Unit 7 vectorized backtest.
 
-**Why this unit matters most** Every backtest-to-live discrepancy this project could suffer
-shows up here or nowhere. If parity fails, nothing upstream is trustworthy.
-
 ---
 
 ### Unit 12b — Live: Alpaca loop and guards
+
+⚑ **Needs the same re-scope as 12a before it starts.** The text below still assumes one row and
+one position; start from Unit 12a's "Carried to Unit 12b", which also answers the stale-bar
+guard's halt question and adds the clock-driven flatten.
 
 **Do**
 
