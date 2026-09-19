@@ -2139,11 +2139,323 @@ produces trade-for-trade equality with the Unit 7 vectorized backtest.
 
 ---
 
-### Unit 12b — Live: Alpaca loop and guards
+### Unit 12b — Live: Alpaca loop and guards ✅ **shipped offline — re-scoped to the region portfolio; a live session waits on real-time SIP**
 
-⚑ **Needs the same re-scope as 12a before it starts.** The text below still assumes one row and
-one position; start from Unit 12a's "Carried to Unit 12b", which also answers the stale-bar
-guard's halt question and adds the clock-driven flatten.
+**Shipped** in `live.py`:
+
+- constants: `NOTIONAL`, `MAX_DAY_LOSS`, `MAX_GROSS`, `POLL_OFFSET`, `RETRY`, `STALE`,
+  `ORDER_WAIT`, `WATCHDOG`, `HTTP_TIMEOUT`, `LOCK`;
+- functions and classes: `shares()`, `Alpaca`, `reconcile()`, `session()`, `_exclusive()`,
+  `dead_loop()`, `flatten()`, `run()`;
+- the `run` and `flatten [now]` arms on `main`, and a rounding line in `parity`;
+- one refusal added to `load_params` (a cost implying an IS mean ≤ 0).
+
+`heartbeat` and `live.lock` are gitignored, and no other module changed.
+**131/131 tests** (9 added), `ruff check .` clean, **64 of 65 mutations killed** (the one survivor is unobservable, below). The withheld
+tail's sha256 is unchanged and `K` is still 14.
+
+    python live.py run              today's session on the paper account. Exit 0 once flat
+                                    after the cut (or on a closed day); exit 1 when it refused
+                                    to trade (a flat day), or ended not flat, or never read a bar
+    python live.py flatten [now]    the out-of-process guard. Schedule it every 5 minutes through
+                                    each session day (not yet registered). It acts only when no
+                                    loop holds live.lock, or when the loop's heartbeat is stale;
+                                    `now` acts regardless
+
+**Done when** ✅ **met offline, all four**, with a simulated Alpaca on a simulated clock over
+real cached sessions. The simulated `bars` serves the previous session and the bar still
+forming, and ignores `lo`, so the loop has to drop all three itself.
+
+1. **A day holds the book in shares.** On 2025-07-15, a busy day, both legs' positions equal
+   the book's whole-share target after every one of 99 polls.
+   - The day has 84 orders, which is one per target change plus one per reversal, and three
+     QQQ reversals, each sent as two orders.
+   - Gross off the fills equals the whole-share book's gross **exactly** (`fsum`).
+   - The heartbeat holds the last poll's clock.
+2. **A restart converges on its first poll.** Killed at 11:02, with both legs flattened behind
+   its back, the restart replays the session from 08:00.
+   - At 11:02:00 it is back on the 11:00:15 position.
+   - Every later poll is identical to the uninterrupted run's.
+3. **Every guard fires in a test and leaves the position asserted:**
+
+| guard | case | afterwards |
+|---|---|---|
+| the clock's cut | 2025-07-14 with the 15:50 bar withheld; 2024-11-29 (13:00 close) | flat at **15:55:00** exactly, where stale alone would hold to 15:56; done at 12:55 |
+| stale | SPY 2019-08-12, feed stops at 15:30 | held at 15:40:55, flat at **15:41:00** and through the cut, while QQQ trades on. **12a's overnight hold is closed.** |
+| stale, then the book | 2020-03-18, 13:00 and 13:05 missing on both legs | held at 13:05:55, flat at 13:06:00; from 13:15:15, bar for bar with the book through the blackout and the 15:10 reopen |
+| daily loss | $7,000.00 before the open / $7,000.01 / $8,000 at 11:00 while holding | no fire and the day trades / flat all day, after the loss has gone / flat at 11:00:15 and never back in |
+| notional cap | QQQ sized on a $0.01 IS mean | halted on its first non-zero target, no QQQ order ever sent, SPY flattened |
+| params | last week's file; a cost implying an IS mean ≤ 0; a closed day | exit 1 with no order and no poll (twice); exit 0 |
+| a second loop | `live.lock` already held | exit 1, no order, no poll |
+| SIP | "subscription does not permit…" on the startup probe | exit 1, no order; a plain 503 there proceeds and trades |
+| rejects | SPY 11:05–11:20 | retried every 5 s, back on the book at 11:20:00 |
+| errors | QQQ bars, SPY position, account read, 11:00:15–:30; QQQ bars failing all day | the loop survives; QQQ holds its 10:50 target, then catches up at 11:00:30. A blind day ends flat with **exit 1**, not a quiet day's 0 |
+| a rejected cut | 20 s of rejects; rejects to the close | flat at 15:55:20; exit 1 at 16:00 for the external job |
+| reversal | 12 scripted `reconcile` cases | close, and open only once the close has filled; a short fill stops |
+| flatten arm | 16 lock × clock × heartbeat cases, normal and early close; `flatten` against a real held lock | acts when no loop holds `live.lock`, or on a running loop's stale or missing heartbeat, and nowhere else — **not** at 15:58 beside a live loop. While acting it holds the lock itself |
+| heartbeat | every position read in the busy day | the heartbeat already holds that poll's clock: written as a poll starts, so a hung poll goes stale |
+
+4. **Online, read-only.** Against the paper account:
+   - the adapter reads the paper base URL, equity, and a 404 position as 0;
+   - the account refuses real-time SIP, and `run` exits 1 on that before reaching the loop.
+
+   Offline, against a scripted `TradingClient`, the adapter:
+   - signs a short negative under either qty convention;
+   - reads a 404 as flat and raises on a 500;
+   - cancels and settles open orders before the position read;
+   - sends a sell as a sell with a negative fill;
+   - cancels after `ORDER_WAIT` and returns the fill so far, and raises if an order is still
+     open after the cancel.
+
+**Measured:** `parity` now prints the whole-share book every run, **−0.33% / −0.13%** of gross
+at $50,000 a leg. Every Unit 12a headline is unchanged: 3,958,490 / 3,937,717 trades, 83.3% /
+82.4%.
+
+**Mutation pass.** The first pass killed **56 of 58**. Both survivors taught something:
+
+- ⚑ **"A bar from before today is read" survived because it is harmless.** `Book` is flat on
+  every ungated bar, and its 120-minute span gate stays shut across the overnight gap until
+  10:00. So yesterday's session, fed first, cannot move today's target. The `ts >= start`
+  filter was not doing any work, and it is deleted with that reason in the code.
+- ⚑ **"The loss limit is inclusive" survived because the boundary test never reached the
+  boundary.**
+  - `0.07 × 2 × 50,000` is 7000.000000000001, so a $7,000.00 loss sat an ulp *under* the
+    limit under either operator.
+  - The limit is now `MAX_DAY_LOSS = 700` bps, and `700 × 2 × NOTIONAL / 1e4` is exactly
+    7000.0. The test asserts that exact figure before it relies on it.
+
+The second pass drops the equivalent mutant and adds two for the fix below: **59 of 59**.
+
+⚑ **Mine, found reading alpaca-py while the pass ran: no request has a timeout.**
+`RESTClient._one_request` calls `Session.request` with no timeout, so one hung socket would
+stall the loop for the rest of the day. The watchdog would flatten, but the loop would never
+come back.
+
+- Both clients' sessions now carry `timeout=HTTP_TIMEOUT` (10 s), patched onto alpaca-py's
+  private `_session` and marked `ponytail:`.
+- A timeout raises like any other error, and the poll retries.
+- The online test pins the patch on both clients.
+
+**The third pass** runs after the review fixes below. It drops the watchdog mutants whose code
+is gone and adds 13 for the lock, the heartbeat's position in the poll, the blind day and the
+moved IS-mean refusal: **64 of 65**. The survivor, "the lock is never explicitly released", cannot be seen from a test: closing the file releases a Windows lock anyway. The explicit `LK_UNLCK` stays, because Microsoft documents the release on close as happening after a delay that depends on system resources, and a `flatten` should hand the lock back promptly.
+
+- ⚑ **The harness now runs its test sets unmutated first.** A rename of the watchdog test left
+  its old name in the harness, and a trial "killed" four mutants with `AttributeError`. They
+  were false kills, and a baseline that has to pass stops that from recurring.
+
+#### Adversarial review (PLAN §4) — 5 findings: 5 fixed
+
+The reviewer (Sonnet) re-ran everything that carries a number:
+
+- 131/131 and ruff;
+- both `parity` legs, bit for bit, including the new rounding line;
+- the tail's sha256, and `K` = 14;
+- the per-leg split of the 84 orders: SPY 42 with no reversal, QQQ 42 with 3.
+
+It also:
+
+- traced the cut and retry clamps and found no poll that can skip the cut or sleep negative;
+- worked `reconcile` over every sign case;
+- checked alpaca-py 0.43.4's source for the qty sign, `APIError.status_code`, the timeout
+  patch's keywords, and `TERMINAL`: the statuses it omits are unreachable for a plain market
+  DAY order.
+
+It touched no repository file, placed no order, and left the tail alone. **No BREAKING
+finding.**
+
+1. **Fixed — the watchdog raced a live loop in `[close − 2 min, close)`** (filed SEVERE).
+   - **The failure.** The rule was "always act from close − 2". But the suite's own
+     rejected-cut case shows the loop still retrying past 15:58, and two read-then-submit
+     flattens overshoot: +5 becomes −5. `session` would then exit 0 on its own fill
+     bookkeeping, holding the overshoot. The reviewer showed the mechanism standalone
+     (`review/race_probe.py`).
+   - **The root cause.** Clock windows were guessing at "is the loop running?", which the OS
+     can answer.
+   - **The fix.**
+     - `run` holds an exclusive lock on `live.lock` (`msvcrt`) for the session's whole life.
+     - `dead_loop` acts only when that lock is free, or when a running loop's heartbeat is
+       more than `WATCHDOG` old or missing.
+     - `flatten` holds the lock while it acts.
+     - The heartbeat is now written as each poll *starts*, so a hung poll goes stale and a
+       slow one does not.
+   - **The consequences.**
+     - A live loop is never raced at any hour, including after the loop has flattened and
+       exited: the lock is then free, and the watchdog's flatten is a no-op or clears a
+       residual.
+     - A second `run` refuses to start, which is a guard Rev 2 never had.
+     - A dead loop is flattened on the watchdog's next tick instead of 11 minutes later.
+   - **The re-scope's decision 11** ("at or after the cut, unconditionally; 12:58 and 15:58")
+     is superseded by this. The schedule is now simply every 5 minutes through the session
+     day.
+2. **Fixed — the `run` synopsis said "exit 1 is a flat day"** (MINOR). Exit 1 also means
+   "ended not flat". The synopsis above and `run`'s docstring now list all three causes.
+3. **Fixed — an IS mean ≤ 0 raised a traceback out of `session`** (MINOR). The check moved
+   into `load_params`, where a cost at or under `SLIP` is a refused file: a clean flat day,
+   with two more refusal cases in Unit 11's test.
+4. **Fixed — "N positions closed" overstated `close_all_positions`** (MINOR). That call sends
+   orders and does not wait for fills, so the message now reads "close orders sent".
+5. **Fixed — a day on which no bar was ever read exited 0, like a quiet day** (MINOR). It now
+   ends flat with exit 1 and names the blind leg; the test fails QQQ's feed all day.
+
+**Recorded, not changed:**
+
+- `session` still ends on its own fill reports, not a fresh position read. With the lock,
+  nothing else trades the account while the loop lives, and the watchdog's first tick after
+  the loop exits clears any residual.
+- The lock is Windows-only (`msvcrt`), marked `ponytail:`; `fcntl.flock` is the POSIX swap.
+- A synchronous short-sale reject (`submit_order` raising) is caught by `session`'s
+  `reconcile` handler like any other error. It could not be exercised without sending an
+  order.
+
+**Carried to Unit 13:**
+
+- **A paper session end to end.** It needs real-time SIP (§8-D, now a blocker) and market
+  hours.
+- **The poll offset and the cost of the delay.** The loop prints each bar as first seen and
+  each fill with its price; diff those against a later fetch and against the signal close.
+- **SPEC §3.2's fee model**, before real money.
+- **The real-money `NOTIONAL`**, and the edit away from `paper=True`.
+- **Registering the schedules** (Task Scheduler). Both are the user's to create; nothing here
+  created them:
+  - `live.py refit` on Saturday;
+  - `live.py run` before 08:00 on weekdays;
+  - `live.py flatten` every 5 minutes through each session day.
+- **The residual risk:** a dead host runs neither the loop nor the job. Decide on a broker-side
+  stop against its churn.
+
+#### The re-scope, as written before any code
+
+⚑ **Re-scoped before any code, from Unit 12a's "Carried to Unit 12b".** Rev 2 (kept below)
+drives one row into one position. What live runs is one `Book` per leg, each a target in combo
+units, and what reaches Alpaca is that target in whole shares.
+
+**Measured first**, by a scratch probe over the pre-tail sample (disclosed, as 12a's was; the
+tail is not read):
+
+- **The worst day.** The 50/50 book marked to market every bar, net of netted cost: worst
+  intraday low **−345.5 bps** of gross notional on 2025-04-07, then 2020-03-12 −261.6 and
+  2020-02-28 −215.1, over 2,529 sessions (legs alone: SPY −319.5, QQQ −371.5, same day).
+- **Rounding.** At $50,000 a leg (~73 SPY, ~81 QQQ shares for a full book), the whole-share
+  book's gross is **−0.33% / −0.13%** off the fractional book's. The weekly gap has sd
+  **0.34 / 0.38 bps**, against a weekly sd of 55 / 72, and turnover is unchanged to three
+  decimals.
+- **Churn.** The share target changes on **41% / 42%** of gated bars, about 145 times a week
+  per leg (21 weeks sampled). It crosses zero on 1.3%.
+- **The account.** Paper, $100,000, 4× multiplier, shorting enabled. ⚠ **No real-time SIP:**
+  a bar request ending inside the last 15 minutes is refused ("subscription does not permit
+  querying recent SIP data"). §8-D's paid subscription is now a **blocker for Unit 13**, no
+  longer just a budget line.
+
+**Decisions**, each answering a carried item or a Rev 2 line:
+
+1. **Sizing uses the IS mean, not Friday's close.**
+   - A full book is `size = NOTIONAL / window_notional(cost)` shares. The target is
+     `round(size · units / 1620)`.
+   - The IS mean is known on Friday night, just as the close is. It is exactly the
+     denominator of the backtest's bps, so live's bps *are* the backtest's bps.
+   - Unit 10 measured the choice as immaterial to `t` (2.7726 against 2.7744).
+   - `NOTIONAL` is **$50,000 a leg**, 1× gross on the paper account. The real-money figure
+     is Unit 13's; $25,000 at 4× (§1.3's PDT floor) is the same gross.
+2. **Rounding is to the nearest share**, with Python's `round`: half-to-even, so long and
+   short are symmetric. It is immaterial (above), and `parity` now reports it on every run so
+   it stays measured.
+3. **The fee model moves to Unit 13, before real money.** SPEC §3.2 required it "before any
+   live order" because `cost` selected the row. No live decision reads `cost` now:
+   - `Book` reads `xmult` only.
+   - `cost` sizes (through its exact inverse, not its fee content) and scores.
+   - Paper orders pay nothing, and Unit 13 compares realised fees with the model.
+4. **A restart replays today from 08:00, then reconciles.** Every poll fetches today's
+   session and feeds `Book` the closed bars it has not seen. In a fresh process that is all
+   of them, so a restart reconciles on its first poll, not at the next bar.
+5. **The cut belongs to the clock.** At `now ≥ close − 5 min` the target is 0, whatever the
+   book holds, and the loop exits once flat. Normally `Book`'s own 15:50 flatten lands on the
+   same poll. This closes 12a's SPY 2019-08-12 overnight hold.
+6. **A stale bar flattens; it does not halt.**
+   - The trigger: the bar after the last one fed is still missing `STALE` after its close.
+   - The target is then 0 until a bar arrives, and the book decides from there, as the
+     backtest's gate does. A real gap means blackout and flat; a feed that was only late
+     returns to the book's position.
+   - This is 12a's answer to Unit 4's either/or, applied on the flatten side.
+7. **A daily loss flattens and halts for the day.**
+   - The trigger: `last_equity − equity > 700 bps × 2·NOTIONAL` ($7,000), twice the worst
+     session the backtest ever marked.
+   - It never fires on the pre-tail sample, so it is a stop for bugs and catastrophes, not a
+     strategy change. When it does fire, the parity break is stated.
+8. **A notional cap flattens and halts.**
+   - The trigger: `|target| · close > 1.5 · NOTIONAL`.
+   - By construction this cannot happen (`|units| ≤ 1620`, and the IS mean drifts −10..+26%
+     from Friday), so it catches a corrupted size.
+   - A size that is not positive and finite refuses at the start.
+9. **Refused params mean no loop** (`load_params`, unchanged): a flat week.
+10. **Reconciliation, not events.** Per leg, per poll:
+    - Cancel open orders, read the position, and submit the difference as a market DAY order.
+    - Wait for a terminal status; after `ORDER_WAIT`, cancel.
+    - A move across zero is two orders, close then open. The open goes only once the close
+      has filled, so the loop never depends on whether Alpaca accepts a flip in one order.
+    - A partial fill or a reject is just the next poll's difference.
+11. ⚑ **Out-of-process safety changes from Rev 2: no broker-side GTC stop.**
+    - Why: a stop sized to a target that changes on 41% of gated bars would be cancelled and
+      re-placed ~145 times a week per leg, each time racing the market order it brackets.
+    - Replacement: one `python live.py flatten` arm, scheduled by the user outside the process
+      every 5 minutes, and at 12:58 and 15:58.
+    - It flattens both legs at or after the cut. Inside the gated window it flattens when the
+      loop's heartbeat is older than `WATCHDOG`.
+    - ⚠ Residual: a dead **host** runs neither. The exposure is one session's move on at most
+      1× notional. Unit 13 decides whether a broker-side stop is worth its churn.
+12. **The poll offset is 15 s after each bar close — a starting value, not a measurement.**
+    This account cannot read real-time SIP, so the offset cannot be measured here.
+    - The loop prints every bar as first seen and every fill price.
+    - Unit 13 diffs the bars against a later fetch (amendments) and the fills against the
+      signal close (delay cost). That is how the offset and its cost get charged.
+13. **`paper=True` is hard-coded.** Real money is Unit 13's go/no-go, made by editing the
+    code rather than passing a flag.
+14. **`run` checks at startup that real-time SIP is readable**, and refuses with the reason
+    if it is not.
+
+**Do** in `live.py`:
+
+- `NOTIONAL` and `shares()`.
+- `Alpaca`, the loop's only network: SIP bars in, paper orders out.
+- `reconcile()`, and `session()` for one trading day, with the clock and sleep injected.
+- The `run` and `flatten` arms, a `heartbeat` file (gitignored), and the rounding line in
+  `parity`.
+
+**Done when**, offline, with a simulated broker and clock over real cached sessions:
+
+1. **A day through `session`** holds `shares(book)` after every poll, and the simulated
+   broker's gross equals the whole-share book's.
+2. **A kill at 11:02 and a restart:** the position equals the uninterrupted run's at the
+   restart's first poll and at every poll after it.
+3. **Every guard has a test that fires it and asserts the position afterwards:**
+   - the clock cut, with a 15:50 bar that never comes;
+   - stale, on 2020-03-18's missing 13:00 and 13:05: flat within `STALE`, then back in on
+     the blackout's reopen, bar for bar with the book;
+   - daily loss: flat, and still flat after the book wants in again;
+   - the notional cap;
+   - refused params: no order sent;
+   - a reversal: two orders;
+   - a rejected order: retried on the next poll;
+   - a transient fetch error: the loop survives;
+   - the flatten arm: acts only past the cut or on a stale heartbeat.
+4. **Online, read-only:** the adapter reads position 0, no open orders, and equity off the
+   paper account, and `run` refuses on the missing SIP subscription.
+
+**Not this unit:** a paper session end to end. It needs real-time SIP and market hours, so it
+belongs to Unit 13.
+
+**Review focus:**
+
+- the bar-close race and the restart replay;
+- partial fills, rejected orders and short-sale rejects;
+- the cut under a rejected order;
+- 429/5xx/timeout on the poll path.
+
+#### Rev 2's Unit 12b, superseded — kept for the record
+
+⚑ *(Pre-re-scope pointer:)* **Needs the same re-scope as 12a before it starts.** The text below
+still assumes one row and one position; start from Unit 12a's "Carried to Unit 12b", which also
+answers the stale-bar guard's halt question and adds the clock-driven flatten.
 
 **Do**
 
@@ -2184,6 +2496,10 @@ flatten under a rejected order; 429/5xx/timeout handling on the poll path.
 ---
 
 ### Unit 13 — Paper soak and go/no-go
+
+⚑ **Start from Unit 12b's "Carried to Unit 13".** Real-time SIP comes first, because nothing
+can run without it. The same list holds the poll offset and delay cost, the fee model, the
+real-money `NOTIONAL`, the `flatten` schedule, and the dead-host residual.
 
 Run paper for at least 4 weeks. Compare realized weekly net profit against the Unit 9
 distribution. Log every divergence between expected and actual fill.
@@ -2265,7 +2581,9 @@ Adding any of these requires a reason written down first.
 | IEX unusable for live | Decided at Unit 1 as a gate, before 12 units are built on it |
 | Gap contamination of RMedV | Fixed structurally in §1.3 (full-session series); halts gated |
 | Costs swamp edge | Costs and SEC/TAF in from Unit 5; power check before Unit 10 |
-| Process death holding a position | Broker-side GTC stop + external 15:58 flatten job (Unit 12b) |
+| Process death holding a position | ⚑ Unit 12b: an external `live.py flatten` job every 5 minutes — flattens when no loop holds `live.lock` or the loop's heartbeat is stale, and never races a live loop. No broker-side GTC stop (the target changes on 41% of bars); a dead **host** is the residual, Unit 13's call |
+| Two loops trading one account | Unit 12b: `run` refuses while `live.lock` is held |
+| A hung HTTP request stalls the loop | Unit 12b: `HTTP_TIMEOUT` on both alpaca-py sessions |
 | PDT restriction | Minimum capital pinned in §1.3 |
 
 ---
@@ -2277,6 +2595,6 @@ Adding any of these requires a reason written down first.
 | A | History depth | ✅ **Resolved (Unit 1): 2016-01-04 → 2026-08-31 — 257,217 bars / 2,680 sessions / 10.7 yr.** Meyers notes 10 yr is his own bias and shorter may do better; each re-look increments the comparison counter, so testing a shorter span is a deliberate spend. |
 | B | `mLTr` sign convention (§1.5) | Evidence points to negative storage → "smallest" = deepest. Run both in Unit 8. |
 | C | ⚑ `r2` vs `r` in the CL4 screen (§1.5) | Unresolvable from the papers. Run both; decisive for CL4. |
-| D | **Data feed** | ✅ **Resolved (Unit 1): SIP only; IEX is unusable.** 57% of 5-min buckets missing, and where present a median 2.50¢ error = 13.9% of an 18¢ bar move, 76.5% of bars off by ≥1¢. **Live needs a paid SIP subscription — budget for it before go-live.** |
+| D | **Data feed** | ✅ **Resolved (Unit 1): SIP only; IEX is unusable.** 57% of 5-min buckets missing, and where present a median 2.50¢ error = 13.9% of an 18¢ bar move, 76.5% of bars off by ≥1¢. **Live needs a paid SIP subscription — budget for it before go-live.** ⚑ Unit 12b: the paper account is refused any SIP request ending inside the last 15 minutes, so this is now a **blocker for Unit 13's paper soak**, not only for go-live; `live.py run` refuses at startup on it. |
 | E | Long-only or long/short? | Long/short per the paper. Needs a margin account; SPY is trivially shortable. |
 | F | ⚑ The 2025 erratum (§1.2) — include overnight trades? | Not in v1. Under §1.3 the RMedV series already spans the full session, so this is a gate change later, not a rewrite. |

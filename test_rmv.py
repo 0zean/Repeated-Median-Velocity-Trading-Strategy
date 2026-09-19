@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -5302,7 +5303,9 @@ def test_unit11_params_refuse_anything_but_their_own_week() -> None:
         for k, v in (("xmult", float("nan")), ("xmult", -1.0), ("xmult", 0.0),
                      ("xmult", "2.5"), ("xmult", 3), ("xmult", None), ("cost", float("inf")),
                      ("is_bars", -999), ("is_bars", 0), ("is_bars", "2111"),
-                     ("is_bars", 2111.0), ("is_bars", None), ("is_bars", True)):
+                     ("is_bars", 2111.0), ("is_bars", None), ("is_bars", True),
+                     # Unit 12b sizes on the IS mean a cost implies: at or under SLIP it is <= 0.
+                     ("cost", pwfo.SLIP), ("cost", pwfo.SLIP / 2)):
             bad.append((f"{k} = {v!r}", {"legs": {**legs, "QQQ": {**legs["QQQ"], k: v}}}))
         bad.append(("no cost", {"legs": {**legs, "QQQ": {"xmult": 1.0, "is_bars": 9}}}))
         bad.append(("no is_bars", {"legs": {**legs, "QQQ": {"xmult": 1.0, "cost": 0.02}}}))
@@ -5455,6 +5458,9 @@ def test_unit12a_replay_matches_unit7_trade_for_trade() -> None:
         assert r["trades"] > 0 and r["excluded"] > 0, (sym, r)
         # Netting is real, and in the direction Unit 10 recorded: the backtest over-charges.
         assert 0 < r["turnover"] < r["charged"], (sym, r["turnover"], r["charged"])
+        # Unit 12b's whole-share book at `live.NOTIONAL` a leg: a real gap, and a small one --
+        # ~$10 over eight weeks against a book that moves hundreds (PLAN §3 Unit 12b).
+        assert 0 < abs(r["rounded"] - r["exact"]) < 50 < abs(r["exact"]), (sym, r)
         checked += r["trades"]
     print(f"    ({checked} trades over {len(U12A_WEEKS)} weeks x 2 legs, all identical)", end="")
 
@@ -5498,6 +5504,645 @@ def test_unit12a_book_crosses_on_equality_like_the_kernel() -> None:
     # than read one past `close` (Unit 12a review, #1).
     assert states[59, k] == 1
     _refused(lambda: live.trades(states[:60], close[:60], 0.03), "a combo open on the last bar")
+
+
+# ================================================= Unit 12b: the Alpaca loop (live.py)
+
+class _SimAlpaca:
+    """`live.Alpaca` on a simulated clock, over real cached bars. `bars` serves everything up to
+    `hi` from its open, whatever `lo` says -- the previous session and the bar still forming
+    included -- so the loop has to drop both itself. An order fills in full at the last closed
+    bar's close unless `reject(symbol, t)`; `fail(what, t)` raises, for `what` a symbol's bars,
+    `"<symbol> position"` or `"equity"`."""
+
+    def __init__(self, feed: dict, clock: list, reject=None, fail=None, shock=(0, 0, 0.0)):
+        self.feed, self.clock = feed, clock
+        self.reject = reject or (lambda s, t: False)
+        self.fail = fail or (lambda s, t: False)
+        self.shock = shock  # (from, until, dollars): a loss the book did not make
+        self.beat = None  # a heartbeat path to check on every position read
+        self.pos = dict.fromkeys(feed, 0)
+        self.cash = self.last_equity = 100_000.0
+        self.orders: list[tuple] = []  # (t, symbol, qty, filled, price)
+
+    def _price(self, s: str) -> float:
+        ts, close = self.feed[s]
+        k = np.searchsorted(ts + data.BAR_NS, self.clock[0], "right") - 1
+        assert k >= 0, f"{s}: priced before any bar closed"
+        return float(close[k])
+
+    def bars(self, s: str, lo: int, hi: int):
+        if self.fail(s, self.clock[0]):
+            raise ConnectionError("simulated 503")
+        ts, close = self.feed[s]
+        k = ts <= hi
+        return ts[k], close[k]
+
+    def position(self, s: str) -> int:
+        if self.fail(f"{s} position", self.clock[0]):
+            raise ConnectionError("simulated 429")
+        if self.beat is not None:  # written as the poll starts, so a hung poll goes stale
+            assert self.beat.read_text(encoding="utf-8") == str(self.clock[0]), "heartbeat late"
+        return self.pos[s]
+
+    def order(self, s: str, qty: int) -> int:
+        assert qty != 0
+        filled = 0 if self.reject(s, self.clock[0]) else qty
+        p = self._price(s)
+        self.pos[s] += filled
+        self.cash -= filled * p
+        self.orders.append((self.clock[0], s, qty, filled, p))
+        return filled
+
+    def equity(self) -> tuple[float, float]:
+        if self.fail("equity", self.clock[0]):
+            raise TimeoutError("simulated timeout")
+        marked = self.cash + sum(q * self._price(s) for s, q in self.pos.items() if q)
+        lo, hi, loss = self.shock
+        return marked - (loss if lo <= self.clock[0] < hi else 0.0), self.last_equity
+
+    def flatten(self) -> list:
+        return [self.order(s, -q) for s, q in list(self.pos.items()) if q]
+
+
+class _Killed(Exception):
+    pass
+
+
+def _u12b_day(day: str, drop: tuple = ()):
+    """Both legs' cached session bars for the session before `day` and for `day`, less the
+    `drop` bar times (HH:MM) on `day`; a `params.json` for Unit 7's window that week; and each
+    leg's book target in shares bar by bar -- 0 on the day before, `live.replay` through a
+    fresh `Book` on `day`, which is what `session` has to hold. None when a cache is missing."""
+    d = np.datetime64(day)
+    friday = live.last_friday(d)
+    lo = pd.Timestamp(day, tz=data.ET)
+    cal = data.load_calendar((d - 7).item(), d.item(), refresh=False)
+    feed, legs, want = {}, {}, {}
+    for s in live.LEGS:
+        w = live.stored(s, friday)
+        if w is None or not data._cache_paths(s, "sip")[0].exists():
+            return None
+        b = data.load_bars(s, (lo - pd.Timedelta(days=5)).to_pydatetime(),
+                           (lo + pd.Timedelta(days=1)).to_pydatetime(), refresh=False)
+        today = data.to_et(b.ts).strftime("%Y-%m-%d") == day
+        before = np.flatnonzero(~today)
+        before = before[data.to_et(b.ts[before]).date == data.to_et(b.ts[before[-1:]]).date[0]]
+        keep = today & ~np.isin(data.to_et(b.ts).strftime("%H:%M"), drop)
+        ts, close = b.ts[keep], b.close[keep]
+        states, _, _ = live.replay(live.Book(w, cal), ts, close)
+        size = live.NOTIONAL / pwfo.window_notional(w["cost"])
+        feed[s] = np.concatenate([b.ts[before], ts]), np.concatenate([b.close[before], close])
+        legs[s] = {k: w[k] for k in ("xmult", "cost", "is_bars")}
+        # Rounded here, not by `live.shares`, so a broken `shares` cannot agree with itself.
+        want[s] = np.concatenate([np.zeros(before.size, np.int64), [
+            round(size * int(u) / states.shape[1]) for u in states.sum(1)]])
+    params = {"as_of": str(friday), "region": list(pwfo.REGION), "legs": legs}
+    return feed, params, cal, want
+
+
+U12B_LOCK = Path(tempfile.gettempdir()) / "rmv_test_live.lock"  # never the repo's own
+
+
+def _u12b_run(sim: _SimAlpaca, day: str, params, kill: int | None = None, beat=None):
+    """`live.run` for `day` on `sim`'s clock. Returns `(exit, polls, log)`: exit is None when
+    killed at `kill`, and `polls` maps each poll's time to the position it left."""
+    polls = {}
+
+    def sleep(ns: int) -> None:
+        assert ns > 0, f"a {ns} ns sleep at {live._hms(sim.clock[0])}: the loop would spin"
+        polls[sim.clock[0]] = dict(sim.pos)
+        sim.clock[0] += ns
+        if kill is not None and sim.clock[0] >= kill:
+            sim.clock[0] = kill
+            raise _Killed
+
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        try:
+            code = live.run(sim, np.datetime64(day), params, lambda: sim.clock[0], sleep, beat,
+                            U12B_LOCK)
+            polls[sim.clock[0]] = dict(sim.pos)
+        except _Killed:
+            code = None
+    return code, polls, log.getvalue()
+
+
+def _u12b_expect(feed: dict, want: dict, s: str, t: int, cut: int) -> int:
+    """What `session` holds on leg `s` after a poll at `t`: the book's target in shares as of
+    the last bar settled by `t`; 0 before any, from the cut on, and while the bar after it is
+    `STALE` past its own close."""
+    k = _u12b_last(feed, s, t)
+    if t >= cut or k < 0 or t >= feed[s][0][k] + 2 * data.BAR_NS + live.STALE:
+        return 0
+    return int(want[s][k])
+
+
+def _u12b_last(feed: dict, s: str, t: int) -> int:
+    """Index of the last bar of leg `s` the loop may have read by `t`, or -1."""
+    return int(np.searchsorted(feed[s][0] + data.BAR_NS + live.POLL_OFFSET, t, "right")) - 1
+
+
+def _u12b_check(polls: dict, feed: dict, want: dict, cut: int, skip=lambda t: False) -> int:
+    """Every poll's position is `_u12b_expect`'s, on both legs. Returns how many were held."""
+    held = 0
+    for t, pos in polls.items():
+        for s in live.LEGS:
+            if skip(t):
+                continue
+            e = _u12b_expect(feed, want, s, t, cut)
+            assert pos[s] == e, (s, live._hms(t), pos[s], e)
+            held += e != 0
+    return held
+
+
+def test_unit12b_session_holds_the_book_in_shares_and_restarts_onto_it() -> None:
+    """PLAN §3 Unit 12b done-when 1 and 2, on a busy day of both legs (~40 target changes each,
+    three QQQ reversals).
+
+    After every poll the broker holds the book's target in shares, and the gross off the fills
+    is the whole-share book's exactly -- integer shares times a float32 close, summed by
+    `fsum`. One order per change, two per reversal. Killed at 11:02 and flattened behind its
+    back, the restart replays the session from 08:00 and is back on the book at its own first
+    poll, then on the same schedule.
+    """
+    day = "2025-07-15"
+    got = _u12b_day(day)
+    if got is None:
+        print("    (skipped: no cache or tables)", end="")
+        return
+    feed, params, _, want = got
+    t0, cut = live._ns(day, 7 * 60 + 50), live._ns(day, 15 * 60 + 55)
+    sim = _SimAlpaca(feed, [t0])
+    with tempfile.TemporaryDirectory() as tmp:
+        beat = sim.beat = Path(tmp) / "heartbeat"
+        code, polls, log = _u12b_run(sim, day, params, beat=beat)
+        assert beat.read_text(encoding="utf-8") == str(cut)  # the last poll's clock
+    assert code == 0, log[-500:]
+    held = _u12b_check(polls, feed, want, cut)
+    assert held > 100, held
+    # Polls land on bar close + offset, bar-close races excluded by construction; the cut is
+    # the clock's, to the nanosecond, and the loop ends on it flat.
+    assert all((t - live.POLL_OFFSET) % data.BAR_NS == 0 for t in polls if t not in (t0, cut))
+    assert max(polls) == cut and not any(polls[cut].values()), polls[cut]
+    flips = 0
+    for s in live.LEGS:
+        fills = [(q, p) for _, x, _, q, p in sim.orders if x == s]
+        c = feed[s][1].astype(np.float64)
+        prev = np.concatenate([[0], want[s][:-1]])
+        flips += np.count_nonzero(prev * want[s] < 0)
+        assert len(fills) == np.count_nonzero(want[s] != prev) + np.count_nonzero(
+            prev * want[s] < 0), (s, len(fills))
+        assert math.fsum(-q * p for q, p in fills) == math.fsum(want[s][:-1] * np.diff(c)), s
+    assert flips == 3, flips
+
+    kill = live._ns(day, 11 * 60 + 2)
+    sim2 = _SimAlpaca(feed, [t0])
+    code, before, _ = _u12b_run(sim2, day, params, kill=kill)
+    assert code is None and sim2.clock[0] == kill
+    assert any(sim2.pos.values()), "precondition: holding when killed"
+    assert before == {t: p for t, p in polls.items() if t < kill}
+    sim2.flatten()  # the watchdog, say, while the loop is down
+    code, after, _ = _u12b_run(sim2, day, params)
+    assert code == 0 and min(after) == kill
+    last = max(t for t in polls if t < kill)
+    assert after[kill] == polls[last] and any(after[kill].values()), (after[kill], polls[last])
+    assert {t: p for t, p in after.items() if t > kill} == \
+        {t: p for t, p in polls.items() if t > kill}
+    print(f"    ({len(polls)} polls, {len(sim.orders)} orders; restart converged at 11:02)",
+          end="")
+
+
+def test_unit12b_the_cut_is_the_clocks_and_a_stale_bar_flattens() -> None:
+    """The two guards that need no bar to fire, each where a bar did not come.
+
+    - A normal day whose 15:50 bar never arrives: flat at 15:55:00 exactly, where the stale
+      guard alone would still hold until 15:56. And 2024-11-29, a 13:00 close: done at 12:55.
+    - SPY 2019-08-12, whose feed stops at 15:30 (Unit 12a held it overnight): flat once the
+      15:35 bar is `STALE` late, and still flat through the cut. QQQ trades on.
+    - 2020-03-18, 13:00 and 13:05 never print on either leg: held at 13:05:55, flat at
+      13:06:00, and from the 13:10 bar on, bar for bar with the book again -- through the
+      blackout and its reopen at 15:10. Flatten, not halt (PLAN §3 Unit 12a).
+    """
+    cases = (("2025-07-14", ("15:50",)), ("2024-11-29", ()), ("2019-08-12", ()),
+             ("2020-03-18", ()))
+    for day, drop in cases:
+        got = _u12b_day(day, drop)
+        if got is None:
+            print("    (skipped: no cache or tables)", end="")
+            return
+        feed, params, cal, want = got
+        cut = live._ns(day, min(cal[day] - 5, 955))
+        sim = _SimAlpaca(feed, [live._ns(day, 7 * 60 + 50)])
+        code, polls, log = _u12b_run(sim, day, params)
+        assert code == 0 and max(polls) == cut and not any(polls[cut].values()), (day, log[-300:])
+        _u12b_check(polls, feed, want, cut)
+
+        def book(s, t):  # the book's own target at `t`, no guard applied
+            return int(want[s][_u12b_last(feed, s, t)])
+
+        # Each case proves something only where the book held and the guard made it flat.
+        if day == "2025-07-14":
+            assert any(book(s, cut) for s in live.LEGS), "precondition: holding into the cut"
+            assert cut - 60 * live.SEC not in polls and "STALE" not in log
+        if day == "2024-11-29":
+            assert cut == live._ns(day, 12 * 60 + 55) and any(book(s, cut - 1) for s in live.LEGS)
+        if day == "2019-08-12":
+            t = live._ns(day, 15 * 60 + 41)
+            assert book("SPY", t) and polls[t]["SPY"] == 0 and "SPY STALE" in log
+            assert polls[t - live.RETRY]["SPY"] == book("SPY", t)
+            assert any(polls[x]["QQQ"] for x in polls if x > t) and "QQQ STALE" not in log
+        if day == "2020-03-18":
+            t = live._ns(day, 13 * 60 + 6)
+            for s in live.LEGS:
+                assert book(s, t) and polls[t - live.RETRY][s] == book(s, t) != 0, s
+                assert polls[t][s] == 0, s
+                ts = feed[s][0]
+                reopen = (ts >= live._ns(day, 15 * 60 + 10)) & (ts < cut)
+                assert want[s][reopen].any(), f"{s}: no position after the reopen"
+                assert any(polls[x][s] for x in polls if x > live._ns(day, 15 * 60 + 10)), s
+
+
+def test_unit12b_daily_loss_and_the_notional_cap_halt_flat() -> None:
+    """Both halts: flat on the poll that finds them, and flat for the rest of the day while the
+    book still wants in.
+
+    - Flat before 10:00, a loss of exactly `MAX_DAY_LOSS` of the gross does not fire and the
+      day trades; a cent more fires, and the day stays flat after the loss has gone.
+    - A $8,000 loss arriving at 11:00 while holding: flat at 11:00:15, and never back in.
+    - QQQ sized on a $0.01 IS mean: its first non-zero target breaches the cap, which halts
+      both legs before a QQQ order is sent. An IS mean of 0, or below, is a refused
+      `params.json` -- exit 1, no order (Unit 12b review: it used to raise from `session`).
+    """
+    day = "2025-07-14"
+    got = _u12b_day(day)
+    if got is None:
+        print("    (skipped: no cache or tables)", end="")
+        return
+    feed, params, _, want = got
+    t0, cut = live._ns(day, 7 * 60 + 50), live._ns(day, 955)
+    ten = live._ns(day, 600)
+    limit = live.MAX_DAY_LOSS * 2 * live.NOTIONAL / 1e4
+    assert limit == 7_000.0  # exactly, or the boundary below is not the boundary
+
+    def halted_at(log):
+        m = re.search(r"⚑ (\d\d:\d\d:\d\d) HALTED", log)
+        return live._ns(day, 0) + pd.Timedelta(m.group(1)).value
+
+    sim = _SimAlpaca(feed, [t0], shock=(t0, ten, limit))
+    code, polls, log = _u12b_run(sim, day, params)
+    assert code == 0 and "HALTED" not in log and _u12b_check(polls, feed, want, cut) > 100
+    sim = _SimAlpaca(feed, [t0], shock=(t0, ten, limit + 0.01))
+    code, polls, log = _u12b_run(sim, day, params)
+    assert code == 0 and sim.orders == [] and "daily loss" in log and halted_at(log) == t0
+
+    shock = live._ns(day, 11 * 60)
+    sim = _SimAlpaca(feed, [t0], shock=(shock, 2**62, 8_000.0))
+    code, polls, log = _u12b_run(sim, day, params)
+    first = shock + live.POLL_OFFSET
+    assert code == 0 and "daily loss" in log and halted_at(log) == first
+    _u12b_check(polls, feed, want, cut, skip=lambda t: t >= first)
+    assert any(polls[first - 5 * 60 * live.SEC].values()), "precondition: holding"
+    assert all(not any(p.values()) for t, p in polls.items() if t >= first)
+    assert any(_u12b_expect(feed, want, s, t, cut) for s in live.LEGS for t in polls
+               if t > first), "precondition: the book wanted back in"
+
+    fat = json.loads(json.dumps(params))
+    fat["legs"]["QQQ"]["cost"] = pwfo.SLIP + pwfo.SEC_TAF_PER_DOLLAR * 0.01
+    sim = _SimAlpaca(feed, [t0])
+    code, polls, log = _u12b_run(sim, day, fat)
+    assert code == 0 and "notional cap: QQQ" in log, log[-300:]
+    h = halted_at(log)
+    assert h >= live._ns(day, 605) and not [o for o in sim.orders if o[1] == "QQQ"]
+    _u12b_check(polls, feed, {**want, "QQQ": 0 * want["QQQ"]}, cut, skip=lambda t: t >= h)
+    assert all(not any(p.values()) for t, p in polls.items() if t >= h)
+    for cost in (pwfo.SLIP, pwfo.SLIP / 2):  # an IS mean of 0, and a negative one
+        fat["legs"]["QQQ"]["cost"] = cost
+        sim = _SimAlpaca(feed, [t0])
+        code, polls, log = _u12b_run(sim, day, fat)
+        assert code == 1 and sim.orders == [] and "IS mean close <= 0" in log, (cost, log)
+        assert polls == {t0: {"SPY": 0, "QQQ": 0}}
+
+
+def test_unit12b_rejects_and_errors_are_retried_not_fatal() -> None:
+    """The poll path outlives its failures, and every retry is the next poll's difference.
+
+    - SPY orders rejected 11:05-11:20: tried again every `RETRY`, on the book at 11:20.
+    - QQQ's bar fetch, SPY's position read and the account read fail 11:00:15-11:00:30: QQQ
+      holds its 10:50 target, then catches up on the 10:55 bar at 11:00:30.
+    - Every order rejected for 20 s from the cut: flat at 15:55:20 and not a poll later.
+      Rejected until the close, the loop gives up at 16:00 with exit 1, for the external job.
+    """
+    day = "2025-07-14"
+    got = _u12b_day(day)
+    if got is None:
+        print("    (skipped: no cache or tables)", end="")
+        return
+    feed, params, _, want = got
+    t0, cut = live._ns(day, 7 * 60 + 50), live._ns(day, 955)
+    r0, r1 = live._ns(day, 11 * 60 + 5), live._ns(day, 11 * 60 + 20)
+    f0 = live._ns(day, 11 * 60) + live.POLL_OFFSET
+    f1 = f0 + 15 * live.SEC
+
+    def reject(s, t):
+        return (s == "SPY" and r0 <= t < r1) or cut <= t < cut + 20 * live.SEC
+
+    def fail(s, t):
+        return s in ("QQQ", "SPY position", "equity") and f0 <= t < f1
+
+    sim = _SimAlpaca(feed, [t0], reject=reject, fail=fail)
+    code, polls, log = _u12b_run(sim, day, params)
+    assert code == 0, log[-300:]
+    _u12b_check(polls, feed, want, cut,
+                skip=lambda t: r0 <= t < r1 or f0 <= t < f1 or t >= cut)
+    refused = [t for t, s, _, filled, _ in sim.orders if not filled and s == "SPY" and t < r1]
+    assert refused[0] == r0 + live.POLL_OFFSET and refused[-1] == r1 - live.RETRY, refused
+    assert np.all(np.diff(refused) == live.RETRY)
+    assert polls[r1]["SPY"] != polls[r0 + live.POLL_OFFSET]["SPY"]
+    for what in ("QQQ bars failed", "equity failed", "SPY reconcile failed"):
+        assert what in log, what
+    k50 = _u12b_last(feed, "QQQ", f0 - 5 * 60 * live.SEC)  # the 10:50 bar, read at 10:55:15
+    assert polls[f0]["QQQ"] == want["QQQ"][k50] != want["QQQ"][k50 + 1], "precondition"
+    for t in range(f0, f1, live.RETRY):
+        assert polls[t]["QQQ"] == want["QQQ"][k50], live._hms(t)
+    assert polls[f1]["QQQ"] == _u12b_expect(feed, want, "QQQ", f1, cut) == want["QQQ"][k50 + 1]
+    assert sorted(t for t in polls if t >= cut) == [cut + k * live.RETRY for k in range(5)]
+    assert not any(polls[cut + 20 * live.SEC].values())
+    assert any(polls[cut].values()), "precondition: the rejected cut left a position"
+
+    sim = _SimAlpaca(feed, [t0], reject=lambda s, t: t >= cut)
+    code, polls, log = _u12b_run(sim, day, params)
+    close = live._ns(day, 16 * 60)
+    assert code == 1 and "not flat" in log and max(polls) == close, (code, log[-300:])
+    assert polls[close] == polls[cut] and any(polls[close].values())
+
+    # A feed that fails all day is flat and blind -- exit 1, not a quiet day's 0 (review).
+    sim = _SimAlpaca(feed, [t0], fail=lambda s, t: s == "QQQ")
+    code, polls, log = _u12b_run(sim, day, params)
+    assert code == 1 and "no bar was ever read for ['QQQ']" in log, log[-300:]
+    assert not any(p["QQQ"] for p in polls.values()) and any(p["SPY"] for p in polls.values())
+
+
+def test_unit12b_reconcile_never_crosses_zero_in_one_order() -> None:
+    """Close, then open, and the open only once the close has filled; a short fill stops it."""
+
+    class Script:
+        def __init__(self, pos, *fills):
+            self.p, self.fills, self.sent = pos, list(fills), []
+
+        def position(self, s):
+            return self.p
+
+        def order(self, s, q):
+            f = self.fills.pop(0)(q) if self.fills else q
+            self.sent.append(q)
+            self.p += f
+            return f
+
+    none, part = (lambda q: 0), (lambda q: q // abs(q) * 2)
+    for pos, target, fills, sent, left in (
+            (5, -3, (), [-5, -3], -3), (-4, 2, (), [4, 2], 2), (5, -3, (none,), [-5], 5),
+            (5, -3, (part,), [-5], 3), (5, -3, ((lambda q: q), part), [-5, -3], -2),
+            (5, 0, (), [-5], 0), (0, 4, (), [4], 4), (5, 2, (), [-3], 2), (5, 5, (), [], 5),
+            (5, 9, (), [4], 9), (-5, -9, (), [-4], -9), (0, 0, (), [], 0)):
+        b = Script(pos, *fills)
+        assert live.reconcile(b, "SPY", target) == left == b.p, (pos, target, b.p)
+        assert b.sent == sent, (pos, target, b.sent)
+
+
+def test_unit12b_flatten_arm_leaves_a_live_loop_alone() -> None:
+    """The out-of-process guard, on a session day: flatten when no loop holds the lock, or
+    when the running one's heartbeat is more than `WATCHDOG` old or unreadable -- and at no
+    hour otherwise, the cut and the close included, so it never races the loop's own flatten
+    (Unit 12b review: the old "always from close - 2 min" rule did, against a loop still
+    retrying a rejected cut). Never on a closed day. The lock is real: held here, `flatten`
+    sees a running loop; released, it does not."""
+    cal = data.load_calendar(datetime(2024, 11, 1).date(), datetime(2025, 7, 31).date(),
+                             refresh=False)
+    if "2025-07-14" not in cal or cal.get("2024-11-29") != 780:
+        print("    (skipped: no calendar)", end="")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        beat, lock = Path(tmp) / "heartbeat", Path(tmp) / "live.lock"
+        W = live.WATCHDOG
+        for day, hhmm, alive, age, want in (
+                ("2025-07-14", 700, False, 0, "no loop"), ("2025-07-14", 420, False, None, "no loop"),
+                ("2025-07-14", 957, False, 0, "no loop"), ("2025-07-14", 1200, False, W, "no loop"),
+                ("2025-07-14", 420, True, 0, None), ("2025-07-14", 700, True, W, None),
+                ("2025-07-14", 700, True, W + 1, "heartbeat"), ("2025-07-14", 958, True, 0, None),
+                ("2025-07-14", 959, True, 4 * live.SEC, None), ("2025-07-14", 958, True, W + 1, "heartbeat"),
+                ("2025-07-14", 700, True, None, "a running loop"),
+                ("2025-07-14", 700, True, "x", "a running loop"),
+                ("2025-07-13", 700, False, None, None), ("2025-07-13", 700, True, W + 1, None),
+                ("2024-11-29", 778, True, 0, None), ("2024-11-29", 778, False, 0, "no loop")):
+            t = live._ns(day, hhmm)
+            if age is None:
+                beat.unlink(missing_ok=True)
+            else:
+                beat.write_text("x" if age == "x" else str(t - age), encoding="utf-8")
+            why = live.dead_loop(day, cal, t, beat, alive)
+            assert (why is None) if want is None else (why or "").startswith(want), \
+                (day, live._hms(t), alive, age, why)
+
+        day = "2025-07-14"
+        got = _u12b_day(day)
+        if got is None:
+            return
+        t = live._ns(day, 958)
+        free = Path(tmp) / "free.lock"
+        for held, age, force, flat in ((True, 0, False, False), (True, W + 1, False, True),
+                                       (True, 0, True, True), (False, 0, False, True)):
+            beat.write_text(str(t - age), encoding="utf-8")
+            sim = _SimAlpaca(got[0], [t])
+            sim.pos = {"SPY": 7, "QQQ": -3}
+            used = lock if held else free
+            seen = []
+
+            def flat_under_lock(orig=sim.flatten, used=used, seen=seen):
+                with live._exclusive(used) as mine:  # a loop starting now would get this
+                    seen.append(mine)
+                return orig()
+
+            sim.flatten = flat_under_lock
+            with live._exclusive(lock) as mine, contextlib.redirect_stdout(io.StringIO()):
+                assert mine  # this block is the running loop
+                assert live.flatten(sim, force=force, t=t, beat=beat, lock=used) == 0
+            assert (sim.pos == {"SPY": 0, "QQQ": 0}) == flat, (held, age, force, sim.pos)
+            assert seen == ([False] if flat else []), (held, force, seen)
+
+
+def test_unit12b_run_refuses_before_any_order() -> None:
+    """A closed day, a `params.json` for another week, an account that cannot read real-time
+    SIP, and a lock another loop holds each stop `run` before its first poll. A plain 503 on
+    the startup probe does not."""
+    day = "2025-07-14"
+    got = _u12b_day(day)
+    if got is None:
+        print("    (skipped: no cache or tables)", end="")
+        return
+    feed, params, _, _ = got
+    t0 = live._ns(day, 7 * 60 + 50)
+    sim = _SimAlpaca(feed, [t0])
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        assert live.run(sim, np.datetime64("2025-07-13"), {}, None, None, None) == 0
+    assert "not a session" in log.getvalue() and sim.orders == []
+    stale = dict(params, as_of="2025-07-04")  # last week's Friday
+    sub = "subscription does not permit querying recent SIP data"
+    for p, fail, code, text in ((stale, None, 1, "params.json refused"),
+                                (params, sub, 1, "real-time SIP"),
+                                (params, "HTTP 503", 0, "")):
+        calls = []
+
+        def boom(s, t, msg=fail):
+            calls.append(t)
+            if msg and len(calls) == 1:
+                raise RuntimeError(msg)
+            return False
+
+        sim = _SimAlpaca(feed, [t0], fail=boom)
+        got_code, polls, log = _u12b_run(sim, day, p)
+        assert got_code == code and text in log, (fail, got_code, log[-300:])
+        assert bool(sim.orders) == (code == 0), (fail, len(sim.orders))
+        assert code == 0 or polls == {t0: {"SPY": 0, "QQQ": 0}}, polls  # never slept
+
+    with live._exclusive(U12B_LOCK) as mine:  # a loop already running
+        sim = _SimAlpaca(feed, [t0])
+        code, polls, log = _u12b_run(sim, day, params)
+    assert mine and code == 1 and "is held" in log and sim.orders == [], log
+    assert polls == {t0: {"SPY": 0, "QQQ": 0}}
+
+
+def test_unit12b_adapter_signs_settles_and_reads_404_as_flat() -> None:
+    """`live.Alpaca` against a scripted `TradingClient`, offline.
+
+    - A short reads negative whichever way Alpaca signs its qty.
+    - A 404 is flat; any other error is raised.
+    - Open orders are cancelled and settled before the position is read.
+    - A sell is sent as a sell of the absolute qty, and its fill comes back negative.
+    - An order still open after `ORDER_WAIT` is cancelled, and the fill so far is returned.
+    - An order still open after the cancel as well raises.
+    """
+
+    class Client:
+        def __init__(self, position=None, error=None, open_=(), status=None):
+            self.calls, self.p, self.error, self.open = [], position, error, list(open_)
+            self.status = status or (lambda c: ("filled", None))
+            self.cancelled = False
+
+        def get_orders(self, req):
+            self.calls.append(("orders", tuple(req.symbols), req.status.value))
+            return [SimpleNamespace(id=i) for i in self.open]
+
+        def cancel_order_by_id(self, oid):
+            self.calls.append(("cancel", oid))
+            self.cancelled = True
+
+        def get_order_by_id(self, oid):
+            status, filled = self.status(self)
+            return SimpleNamespace(status=SimpleNamespace(value=status), filled_qty=filled,
+                                   filled_avg_price="1.5")
+
+        def get_open_position(self, s):
+            self.calls.append(("position", s))
+            if self.error:
+                raise self.error
+            return self.p
+
+        def submit_order(self, req):
+            self.calls.append(("submit", req.symbol, req.qty, req.side.value,
+                               req.time_in_force.value, req.type.value))
+            return SimpleNamespace(id="o1")
+
+        def get_account(self):
+            return SimpleNamespace(equity="99000.5", last_equity="100000")
+
+        def close_all_positions(self, cancel_orders=None):
+            self.calls.append(("close all", cancel_orders))
+            return ["x"]
+
+    def alpaca(client):
+        a = live.Alpaca.__new__(live.Alpaca)
+        a.trading = client
+        return a
+
+    def api(code):
+        return live.APIError('{"code": 1, "message": "m"}',
+                             SimpleNamespace(response=SimpleNamespace(status_code=code)))
+
+    short, long_ = live.PositionSide.SHORT, live.PositionSide.LONG
+    for p, want in ((SimpleNamespace(qty="5", side=short), -5),
+                    (SimpleNamespace(qty="-5", side=short), -5),
+                    (SimpleNamespace(qty="7", side=long_), 7)):
+        assert alpaca(Client(p)).position("SPY") == want, (p, want)
+    assert alpaca(Client(error=api(404))).position("SPY") == 0
+    try:
+        alpaca(Client(error=api(500))).position("SPY")
+        raise AssertionError("a 500 read as a position")
+    except live.APIError:
+        pass
+    c = Client(SimpleNamespace(qty="2", side=long_), open_=("a", "b"),
+               status=lambda c: ("canceled", "0"))
+    assert alpaca(c).position("QQQ") == 2
+    assert c.calls == [("orders", ("QQQ",), "open"), ("cancel", "a"), ("cancel", "b"),
+                       ("position", "QQQ")], c.calls
+
+    wait = live.ORDER_WAIT
+    live.ORDER_WAIT = 50_000_000  # 50 ms: the cancel path without a 10 s test
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            c = Client(status=lambda c: ("filled", "3"))
+            assert alpaca(c).order("SPY", 3) == 3
+            assert c.calls == [("submit", "SPY", 3, "buy", "day", "market")], c.calls
+            c = Client(status=lambda c: ("filled", "4"))
+            assert alpaca(c).order("QQQ", -4) == -4
+            assert c.calls == [("submit", "QQQ", 4, "sell", "day", "market")], c.calls
+            c = Client(status=lambda c: ("canceled", "2") if c.cancelled else ("new", "1"))
+            assert alpaca(c).order("SPY", -5) == -2 and ("cancel", "o1") in c.calls
+            c = Client(status=lambda c: ("pending_cancel", "0"))
+            try:
+                alpaca(c).order("SPY", 1)
+                raise AssertionError("an order that never settles returned")
+            except TimeoutError:
+                assert c.calls.count(("cancel", "o1")) == 1
+    finally:
+        live.ORDER_WAIT = wait
+    c = Client()
+    assert alpaca(c).equity() == (99000.5, 100000.0)
+    assert alpaca(c).flatten() == ["x"] and c.calls == [("close all", True)]
+
+
+def test_unit12b_online_adapter_reads_the_paper_account() -> None:
+    """⚑ Hits Alpaca, read-only: no order is sent. The adapter reads equity, a 404 position as
+    0, and -- the premise of `run`'s refusal -- whether real-time SIP is readable."""
+    a = live.Alpaca()
+    assert "paper-api" in a.trading._base_url, a.trading._base_url
+    for c in (a.trading, a.market):
+        assert c._session.request.keywords == {"timeout": live.HTTP_TIMEOUT}
+    eq, prev = a.equity()
+    assert eq > 0 and prev > 0, (eq, prev)
+    held = {p.symbol for p in a.trading.get_all_positions()}
+    free = next(s for s in ("GLD", "IWM", "TLT", "SPY", "QQQ") if s not in held)
+    assert a.position(free) == 0
+    t = time.time_ns()
+    try:
+        ts, _ = a.bars("SPY", t - 30 * 60 * live.SEC, t)
+        print(f"    (real-time SIP readable: {ts.size} bars; run's refusal not exercised)", end="")
+        return
+    except Exception as e:
+        assert "subscription" in str(e), e
+    day = live.today_et()
+    cal = data.load_calendar(day.item() - pd.Timedelta(days=10).to_pytimedelta(), day.item())
+    session_day = np.datetime64(max(d for d in cal if d <= str(day)))
+    friday = live.last_friday(session_day)
+    legs = {s: {"xmult": 1.0, "cost": 0.03, "is_bars": 1} for s in live.LEGS}
+    p = {"as_of": str(friday), "region": list(pwfo.REGION), "legs": legs}
+
+    def no_sleep(ns):
+        raise AssertionError("run reached the loop on an account it should refuse")
+
+    with contextlib.redirect_stdout(io.StringIO()) as log:
+        assert live.run(a, session_day, p, time.time_ns, no_sleep, beat=None,
+                        lock=U12B_LOCK) == 1
+    assert "real-time SIP" in log.getvalue(), log.getvalue()
 
 
 def main() -> int:

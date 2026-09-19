@@ -7,3 +7,5 @@ cache/
 pwfo/
 pwfo_*/
 params.json
+heartbeat
+live.lock

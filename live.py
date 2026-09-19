@@ -1,4 +1,5 @@
-"""Weekly refit for the region portfolio. PLAN §3 Unit 11.
+"""The live side of the region portfolio: weekly refit (PLAN §3 Unit 11), the offline parity
+harness (12a) and the intraday Alpaca loop with its guards (12b).
 
 ⚑ Unit 10 cancelled parameter selection, so this is not the refit PLAN Rev 2 wrote. The
 strategy is every combo in `pwfo.REGION`, equal weight, on SPY and QQQ at 50/50 notional,
@@ -12,22 +13,30 @@ filter, nothing consumes its 4312 rows.
                                       compare to Unit 7's stored window; never writes
     python live.py parity [SYM ...]   replay every pre-tail OOS week bar by bar and check
                                       it against Unit 7 trade for trade; offline
-
-Unit 12b adds the intraday loop here (PLAN §2).
+    python live.py run                trade today's session on the paper account (Unit 12b)
+    python live.py flatten [now]      the out-of-process guard: flatten both legs when no
+                                      loop is running or its heartbeat is stale
 """
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import math
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from alpaca.common.exceptions import APIError
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide, PositionSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 
 import data
 import pwfo
@@ -160,6 +169,9 @@ def load_params(path: Path | str | dict = PARAMS, today: np.datetime64 | None = 
                 if isinstance(v, bool) or not (isinstance(v, kind) and math.isfinite(v)
                                                and v > 0):
                     raise ValueError(f"{sym} {k} = {v!r}")
+            # Unit 12b sizes each leg on the IS mean this cost implies (review, Unit 12b).
+            if pwfo.window_notional(leg["cost"]) <= 0:
+                raise ValueError(f"{sym} cost = {leg['cost']!r} implies an IS mean close <= 0")
     except (OSError, KeyError, TypeError, ValueError) as e:
         raise ValueError(f"params.json refused, trade nothing this week: {e}") from None
     return p
@@ -332,7 +344,7 @@ def parity(symbol: str, fridays: list[str] | None = None) -> dict:
     _, oos, wins = pwfo.load_tables([], pwfo.sym_dir(symbol))
     combos = np.flatnonzero(pwfo.region_mask())
     out = {"weeks": 0, "trades": 0, "excluded": 0, "sessions": [], "differ": [],
-           "turnover": 0, "charged": 0}
+           "turnover": 0, "charged": 0, "exact": 0.0, "rounded": 0.0}
     for w in wins:
         if fridays is not None and w["friday"] not in fridays:
             continue
@@ -380,6 +392,14 @@ def parity(symbol: str, fridays: list[str] | None = None) -> dict:
             raise AssertionError(f"{where}: the broker does not hold the book (position "
                                  f"{broker.position}, turnover {turnover}, {len(live)} trades)")
 
+        # Unit 12b's rounding, measured where the states are: the whole-share book against the
+        # fractional one, at the size the loop trades. Starts and ends flat, so the position
+        # held over each bar times its move is the fills' gross, by parts.
+        size = NOTIONAL / pwfo.window_notional(w["cost"])
+        sh = np.array([shares(int(u), size, states.shape[1]) for u in states.sum(1)], np.float64)
+        out["exact"] += gross * size / states.shape[1]
+        out["rounded"] += math.fsum(sh[:-1] * np.diff(c64))
+
         out["weeks"] += 1
         out["trades"] += int(np.count_nonzero(~skip_r))
         out["excluded"] += int(np.count_nonzero(skip_r))
@@ -390,6 +410,305 @@ def parity(symbol: str, fridays: list[str] | None = None) -> dict:
     return out
 
 
+# ------------------------------------------------------------ Unit 12b: the Alpaca loop
+
+# PLAN §3 Unit 12b's decisions. Constants, so that changing one is an edit, not an argument.
+NOTIONAL = 50_000.0  # $ a leg at a full book: 1x gross on the $100,000 paper account
+MAX_DAY_LOSS = 700  # bps of 2 * NOTIONAL, $7,000.00 exactly: twice the worst pre-tail session
+MAX_GROSS = 1.5  # x NOTIONAL a leg. Unreachable by construction, so reaching it is a bug
+SEC = 1_000_000_000
+# ⚠ A starting value, not a measurement: this account cannot read real-time SIP. The loop
+# prints every bar as first seen and every fill, and Unit 13 prices the delay from those.
+POLL_OFFSET = 15 * SEC  # after each bar's close
+RETRY = 5 * SEC  # while a due bar is missing, after an error, or past the cut and not flat
+STALE = 60 * SEC  # past the close of the bar after the last one fed: flat until one comes
+ORDER_WAIT = 10 * SEC  # a market order still open by then is cancelled
+WATCHDOG = 11 * 60 * SEC  # two missed polls and a minute: the loop is dead
+HTTP_TIMEOUT = 10  # s a request; alpaca-py sets none, and a hung socket would stall the day
+HEARTBEAT = ROOT / "heartbeat"
+LOCK = ROOT / "live.lock"
+TERMINAL = {"filled", "canceled", "expired", "rejected", "done_for_day", "replaced"}
+
+
+def shares(units: int, size: float, combos: int) -> int:
+    """A book's target in whole shares. Nearest, half to even, so long and short round alike."""
+    return round(size * units / combos)
+
+
+def _ns(day: str, minute: int) -> int:
+    return pd.Timestamp(f"{day} {minute // 60:02d}:{minute % 60:02d}", tz=data.ET).value
+
+
+def _hms(t: int) -> str:
+    return datetime.fromtimestamp(t // SEC, ET).strftime("%H:%M:%S")
+
+
+class Alpaca:
+    """The loop's only network: SIP bars in, paper orders out.
+
+    ⚑ `paper=True` is hard-coded. Real money is Unit 13's go/no-go and an edit, not a flag.
+    """
+
+    def __init__(self) -> None:
+        key, secret = data._credentials()
+        self.trading = TradingClient(key, secret, paper=True)
+        self.market = data._client()
+        for c in (self.trading, self.market):
+            # ponytail: patches alpaca-py's private `_session`, which `_one_request` calls
+            # with no timeout. A timeout then raises like any other error and the poll retries.
+            c._session.request = functools.partial(c._session.request, timeout=HTTP_TIMEOUT)
+
+    def bars(self, symbol: str, lo: int, hi: int) -> tuple[np.ndarray, np.ndarray]:
+        return data.fetch(symbol, data._as_utc(lo), data._as_utc(hi), client=self.market)
+
+    def position(self, symbol: str) -> int:
+        """Signed shares, read only once nothing is open: a position read beside a live
+        order is not the one the next order should be the difference from."""
+        for o in self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN,
+                                                          symbols=[symbol])):
+            self.trading.cancel_order_by_id(o.id)
+            self._settle(o.id)
+        try:
+            p = self.trading.get_open_position(symbol)
+        except APIError as e:
+            if e.status_code == 404:  # Alpaca's "position does not exist"
+                return 0
+            raise
+        q = abs(int(float(p.qty)))
+        return -q if p.side == PositionSide.SHORT else q
+
+    def order(self, symbol: str, qty: int) -> int:
+        """A market DAY order for `qty` signed shares, settled. Returns the signed fill."""
+        o = self.trading.submit_order(MarketOrderRequest(
+            symbol=symbol, qty=abs(qty), side=OrderSide.BUY if qty > 0 else OrderSide.SELL,
+            time_in_force=TimeInForce.DAY))
+        o = self._settle(o.id)
+        filled = int(float(o.filled_qty or 0))
+        print(f"    order {symbol} {qty:+d}: {o.status.value}, {filled} @ {o.filled_avg_price}")
+        return filled if qty > 0 else -filled
+
+    def _settle(self, oid):
+        """Poll an order to a terminal status, cancelling it once `ORDER_WAIT` has passed."""
+        end, cancelled = time.monotonic() + ORDER_WAIT / SEC, False
+        while True:
+            o = self.trading.get_order_by_id(oid)
+            if o.status.value in TERMINAL:
+                return o
+            if time.monotonic() >= end:
+                if cancelled:
+                    raise TimeoutError(f"order {oid} still {o.status.value} after a cancel")
+                self.trading.cancel_order_by_id(oid)
+                end, cancelled = time.monotonic() + ORDER_WAIT / SEC, True
+            time.sleep(0.25)
+
+    def equity(self) -> tuple[float, float]:
+        """`(equity, last_equity)`: now, and at the previous session's close."""
+        a = self.trading.get_account()
+        return float(a.equity), float(a.last_equity)
+
+    def flatten(self) -> list:
+        return self.trading.close_all_positions(cancel_orders=True)
+
+
+def reconcile(broker, symbol: str, target: int) -> int:
+    """Read the position, submit the difference, return the position that leaves.
+
+    Never one order across zero: close first, and open only once the close has filled, so
+    nothing depends on whether Alpaca takes a flip in one order. A partial fill or a reject
+    stops here, and the next poll's difference is the retry.
+    """
+    pos = broker.position(symbol)
+    if pos * target < 0:
+        pos += broker.order(symbol, -pos)
+    if pos * target >= 0 and pos != target:
+        pos += broker.order(symbol, target - pos)
+    return pos
+
+
+def session(broker, day: str, params: dict, calendar: dict[str, int], now, sleep,
+            beat: Path | None = HEARTBEAT) -> int:
+    """One trading day of both legs. PLAN §3 Unit 12b. 0 once flat after the cut, else 1.
+
+    Each poll feeds every leg's `Book` the closed session bars it has not seen, then
+    reconciles the broker to the target in shares. A fresh process mid-session sees all of
+    today's bars on its first poll, so a restart is this same loop and converges on that poll.
+    Guards, in the order they win: the clock's cut, a halt (daily loss, notional cap) and a
+    stale bar all make the target 0; only the halt lasts. `now() -> ns` and `sleep(ns)` are
+    injected so a test can run a day on a simulated clock.
+    """
+    close_min = calendar[day]
+    start, end = _ns(day, data.SESSION_START_MIN), _ns(day, close_min)
+    cut = _ns(day, min(close_min - data.EXIT_BEFORE_CLOSE_MIN, data.GATE_CLOSE_MIN))
+    books = {s: Book(params["legs"][s], calendar) for s in LEGS}
+    # `load_params` has refused any cost whose IS mean is not positive.
+    size = {s: NOTIONAL / pwfo.window_notional(params["legs"][s]["cost"]) for s in LEGS}
+    units, last, price = dict.fromkeys(LEGS, 0), dict.fromkeys(LEGS, 0), dict.fromkeys(LEGS, 0.0)
+    held: dict[str, int | None] = dict.fromkeys(LEGS)
+    halted = None
+    while True:
+        t = now()
+        if beat is not None:  # first, so a poll that hangs goes stale
+            data._atomic_write(beat, str(t))
+        retry, was = False, halted
+        want = {}
+        for s in LEGS:
+            if start + data.BAR_NS <= t < cut:
+                try:
+                    ts, close = broker.bars(s, start, t)
+                    # Settled bars only, on a retry poll too: closed `POLL_OFFSET` ago or more.
+                    # Nothing reads a bar at or past 15:55, so no session mask; and a bar from
+                    # before `start` cannot move today's target -- `Book` is flat on every
+                    # ungated bar and its span gate stays shut until 10:00 (mutation-checked).
+                    new = (ts > last[s]) & (ts + data.BAR_NS + POLL_OFFSET <= t)
+                    for x, c in zip(ts[new].tolist(), close[new].tolist()):
+                        units[s] = books[s].on_bar(x, c)
+                        print(f"{_hms(t)} {s} bar {_hms(x)[:5]} {c!r} units {units[s]:+d}")
+                    if new.any():
+                        last[s], price[s] = int(ts[new][-1]), float(close[new][-1])
+                except Exception as e:  # the poll path must outlive any one bad request
+                    print(f"{_hms(t)} {s} bars failed: {type(e).__name__}: {e}")
+                    retry = True
+                due = (t - POLL_OFFSET - data.BAR_NS) // data.BAR_NS * data.BAR_NS
+                retry |= start <= due and last[s] < due
+            want[s] = shares(units[s], size[s], books[s].pos.size)
+            if not halted and abs(want[s]) * price[s] > MAX_GROSS * NOTIONAL:
+                halted = f"notional cap: {s} {want[s]:+d} shares at {price[s]}"
+        if not halted:
+            try:
+                eq, prev = broker.equity()
+                if prev - eq > MAX_DAY_LOSS * 2 * NOTIONAL / 1e4:
+                    halted = f"daily loss {prev - eq:,.2f} on {prev:,.2f}"
+            except Exception as e:
+                print(f"{_hms(t)} equity failed: {type(e).__name__}: {e}")
+        if halted != was:
+            print(f"⚑ {_hms(t)} HALTED for the day, flattening: {halted}")
+        for s in LEGS:
+            # A missing bar only matters while holding; the book decides again when one comes.
+            stale = t >= last[s] + 2 * data.BAR_NS + STALE
+            target = 0 if t >= cut or halted or stale else want[s]
+            if want[s] and target == 0 and not halted and t < cut:
+                print(f"⚑ {_hms(t)} {s} STALE: no bar after {_hms(last[s])[:5]}, flat")
+            try:
+                held[s] = reconcile(broker, s, target)
+            except Exception as e:
+                print(f"{_hms(t)} {s} reconcile failed: {type(e).__name__}: {e}")
+                held[s], retry = None, True
+            if held[s] != target:
+                retry = True
+        if t >= cut and all(h == 0 for h in held.values()):
+            if not all(last.values()):  # flat, but blind: not the same as a quiet day
+                print(f"⚑ {_hms(t)} flat, but no bar was ever read for "
+                      f"{[s for s in LEGS if not last[s]]}")
+                return 1
+            return 0
+        if t >= end:
+            print(f"⚑ {_hms(t)} the session has closed and {held} is not flat; "
+                  f"`python live.py flatten now`")
+            return 1
+        nxt = (t - POLL_OFFSET) // data.BAR_NS * data.BAR_NS + data.BAR_NS + POLL_OFFSET
+        if retry:  # past the cut, any leg not yet flat has set it
+            nxt = min(nxt, t + RETRY)
+        if t < cut:
+            nxt = min(nxt, cut)  # the cut is the clock's: no bar is needed to know it
+        sleep(nxt - now())
+
+
+@contextlib.contextmanager
+def _exclusive(path: Path):
+    """Yields whether this process now holds `path`'s lock, held until the block exits.
+
+    The loop holds it for its whole life and `flatten` for its own. The OS drops a dead
+    holder's lock, so "is the loop running?" is the OS's answer rather than a clock's guess --
+    which is what keeps the watchdog from racing a live loop's own flatten (Unit 12b review).
+    ponytail: `msvcrt`, Windows, where this is scheduled; `fcntl.flock` is the POSIX swap.
+    """
+    import msvcrt
+
+    with open(path, "a+") as f:
+        f.seek(0)
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def dead_loop(day: str, calendar: dict[str, int], t: int, beat: Path,
+              alive: bool) -> str | None:
+    """Why the out-of-process guard should flatten at `t`, or None.
+
+    On a session day: when no loop is running (`alive` is the lock's answer) -- before it
+    starts, after it has finished flat, or after it died -- and when a running loop's
+    heartbeat, written as each poll starts, is older than `WATCHDOG`: stuck, not slow. A
+    running loop with a fresh heartbeat is left alone at any hour, the cut included, so no
+    two flattens race.
+    """
+    if not calendar.get(day):
+        return None
+    if not alive:
+        return "no loop running"
+    try:
+        seen = int(beat.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "a running loop with no heartbeat"
+    return f"heartbeat {(t - seen) / 60 / SEC:.1f} min old" if t - seen > WATCHDOG else None
+
+
+def flatten(broker=None, force: bool = False, t: int | None = None,
+            beat: Path = HEARTBEAT, lock: Path = LOCK) -> int:
+    """`python live.py flatten [now]`. Holds the lock while it acts, so a loop cannot start
+    under it. `now` flattens even beside a live loop -- that is the operator's call."""
+    t = time.time_ns() if t is None else t
+    day = datetime.fromtimestamp(t // SEC, ET).date()
+    with _exclusive(lock) as free:
+        why = "forced" if force else dead_loop(str(day), data.load_calendar(day, day), t, beat,
+                                               alive=not free)
+        if why is None:
+            print(f"{day} {_hms(t)}: the loop is running; nothing to do")
+            return 0
+        sent = (broker or Alpaca()).flatten()
+    print(f"⚑ {day} {_hms(t)} FLATTENING ({why}): {len(sent)} close orders sent")
+    return 0
+
+
+def run(broker=None, today: np.datetime64 | None = None, path: Path | str | dict = PARAMS,
+        now=time.time_ns, sleep=None, beat: Path | None = HEARTBEAT, lock: Path = LOCK) -> int:
+    """Today's session. 0 once flat after the cut, or on a closed day; 1 when it refused to
+    trade -- a flat day -- or ended not flat, or blind."""
+    day = today_et() if today is None else today
+    d = day.item()
+    calendar = data.load_calendar(d, d)
+    if not calendar.get(str(day)):
+        print(f"{day}: not a session")
+        return 0
+    try:
+        params = load_params(path, day)
+    except ValueError as e:
+        print(f"⚑ {e}")
+        return 1
+    broker = broker or Alpaca()
+    t = now()
+    try:
+        broker.bars(LEGS[0], t - 30 * 60 * SEC, t)
+    except Exception as e:
+        # Only the subscription refusal is fatal; a 503 at 07:55 is the loop's to retry.
+        if "subscription" in str(e):
+            print(f"⚑ real-time SIP is not readable on this account, so nothing can trade "
+                  f"(PLAN §8-D): {e}")
+            return 1
+    with _exclusive(lock) as mine:
+        if not mine:
+            print(f"⚑ {lock.name} is held: another loop, or a flatten, is running")
+            return 1
+        return session(broker, str(day), params, calendar, now,
+                       sleep or (lambda ns: time.sleep(max(ns, 0) / SEC)), beat)
+
+
 def main(argv: list[str], today: np.datetime64 | None = None, client=None,
          path: Path | str = PARAMS) -> int:
     if argv[:1] == ["parity"]:
@@ -398,10 +717,16 @@ def main(argv: list[str], today: np.datetime64 | None = None, client=None,
             print(f"  {s}  {r['weeks']} weeks: {r['trades']} trades identical over "
                   f"{int(pwfo.region_mask().sum())} combos, every stored row reproduced; "
                   f"{r['excluded']} on unknowable {r['sessions']} excluded; netted turnover "
-                  f"{r['turnover'] / r['charged']:.1%} of what the backtest charges")
+                  f"{r['turnover'] / r['charged']:.1%} of what the backtest charges; in whole "
+                  f"shares at ${NOTIONAL:,.0f} a leg, gross {r['rounded'] / r['exact'] - 1:+.2%}")
         return 0
+    if argv == ["run"]:
+        return run(today=today, path=path)
+    if argv in (["flatten"], ["flatten", "now"]):
+        return flatten(force=len(argv) == 2)
     if not argv or argv[0] != "refit" or len(argv) > 2:
-        print("usage: python live.py refit [YYYY-MM-DD] | parity [SYM ...]", file=sys.stderr)
+        print("usage: python live.py refit [YYYY-MM-DD] | parity [SYM ...] | run | "
+              "flatten [now]", file=sys.stderr)
         return 2
     today = today_et() if today is None else today
     dry = len(argv) == 2
